@@ -11,6 +11,12 @@ type PreviewFields = {
   vertical_main: string;
 };
 
+type GenerationAsset = {
+  kind: string;
+  file_path: string;
+  mime_type: string | null;
+};
+
 const OPTION_TINTS = [
   "from-emerald-200 to-emerald-50",
   "from-amber-200 to-amber-50",
@@ -49,14 +55,51 @@ function readPreview(output: unknown): PreviewFields {
   };
 }
 
+function toBrowserAssetUrl(filePath: string): string {
+  const trimmed = filePath.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("/")) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith("public/uploads/")) {
+    return `/${trimmed.slice("public/".length)}`;
+  }
+
+  if (trimmed.startsWith("uploads/")) {
+    return `/${trimmed}`;
+  }
+
+  return `/${trimmed}`;
+}
+
+function getPreviewImageUrl(assets: GenerationAsset[]): string {
+  const previewAsset = assets.find((asset) => asset.kind.toLowerCase() === "preview");
+  if (previewAsset) {
+    return toBrowserAssetUrl(previewAsset.file_path);
+  }
+
+  const firstImageAsset = assets.find((asset) => (asset.mime_type || "").toLowerCase().startsWith("image/"));
+  if (firstImageAsset) {
+    return toBrowserAssetUrl(firstImageAsset.file_path);
+  }
+
+  return "";
+}
+
 function PlaceholderPane({
   label,
-  asset,
+  placeholderAsset,
+  imageUrl,
   aspectClass,
   tintClass
 }: {
   label: string;
-  asset: string;
+  placeholderAsset: string;
+  imageUrl: string;
   aspectClass: string;
   tintClass: string;
 }) {
@@ -65,7 +108,11 @@ function PlaceholderPane({
       <span className="absolute left-2 top-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-700">
         {label}
       </span>
-      <span className="absolute bottom-2 right-2 max-w-[85%] truncate text-[10px] text-slate-600">{asset || "stub"}</span>
+      {imageUrl ? (
+        <img src={imageUrl} alt={`Preview ${label}`} className="h-full w-full object-contain" />
+      ) : (
+        <span className="absolute bottom-2 right-2 max-w-[85%] truncate text-[10px] text-slate-600">{placeholderAsset || "stub"}</span>
+      )}
     </div>
   );
 }
@@ -134,6 +181,13 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
           name: true,
           subtitle: true,
           key: true
+        }
+      },
+      assets: {
+        select: {
+          kind: true,
+          file_path: true,
+          mime_type: true
         }
       }
     },
@@ -206,6 +260,7 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                   const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
                   const preview = readPreview(generation.output);
+                  const previewImageUrl = getPreviewImageUrl(generation.assets);
                   const isApprovedFinal =
                     project.finalDesign?.generationId === generation.id ||
                     (project.finalDesign?.round === round && project.finalDesign.optionKey === optionKey);
@@ -224,14 +279,27 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                       </div>
 
                       <div className="grid grid-cols-3 gap-2">
-                        <PlaceholderPane label="Square" asset={preview.square_main} aspectClass="aspect-square" tintClass={tintClass} />
+                        <PlaceholderPane
+                          label="Square"
+                          placeholderAsset={preview.square_main}
+                          imageUrl={previewImageUrl}
+                          aspectClass="aspect-square"
+                          tintClass={tintClass}
+                        />
                         <PlaceholderPane
                           label="Widescreen"
-                          asset={preview.widescreen_main}
+                          placeholderAsset={preview.widescreen_main}
+                          imageUrl={previewImageUrl}
                           aspectClass="aspect-[16/9]"
                           tintClass={tintClass}
                         />
-                        <PlaceholderPane label="Vertical" asset={preview.vertical_main} aspectClass="aspect-[9/16]" tintClass={tintClass} />
+                        <PlaceholderPane
+                          label="Vertical"
+                          placeholderAsset={preview.vertical_main}
+                          imageUrl={previewImageUrl}
+                          aspectClass="aspect-[9/16]"
+                          tintClass={tintClass}
+                        />
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
