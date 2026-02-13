@@ -7,7 +7,7 @@ import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { buildFinalDesignDoc } from "@/lib/design-doc";
+import { buildFallbackDesignDoc, buildFinalDesignDoc } from "@/lib/design-doc";
 import { requireSession } from "@/lib/auth";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
@@ -192,14 +192,39 @@ function readSelectedPresetKeysFromInput(input: unknown): string[] {
   return getUniqueStrings(selectedPresetKeys);
 }
 
-function buildStubOutput(optionIndex: number) {
+function buildGenerationOutput(params: {
+  project: {
+    series_title: string;
+    series_subtitle: string | null;
+    scripture_passages: string | null;
+    series_description: string | null;
+    brandKit: {
+      paletteJson: string;
+      logoPath: string | null;
+    } | null;
+  };
+  input: unknown;
+  round: number;
+  optionIndex: number;
+}) {
+  const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
+  const designDoc = buildFallbackDesignDoc({
+    output: null,
+    input: params.input,
+    round: params.round,
+    optionIndex: params.optionIndex,
+    project: {
+      seriesTitle: params.project.series_title,
+      seriesSubtitle: params.project.series_subtitle,
+      scripturePassages: params.project.scripture_passages,
+      seriesDescription: params.project.series_description,
+      logoPath: params.project.brandKit?.logoPath || null,
+      palette
+    }
+  });
+
   return {
-    preview: {
-      square_main: `/placeholders/square_main_${optionIndex}.png`,
-      widescreen_main: `/placeholders/widescreen_main_${optionIndex}.png`,
-      vertical_main: `/placeholders/vertical_main_${optionIndex}.png`
-    },
-    notes: "stub"
+    designDoc
   };
 }
 
@@ -413,7 +438,12 @@ export async function generateRoundOneAction(
           round: 1,
           status: "COMPLETED",
           input,
-          output: buildStubOutput(index + 1)
+          output: buildGenerationOutput({
+            project,
+            input,
+            round: 1,
+            optionIndex: index
+          })
         }
       })
     )
@@ -526,7 +556,12 @@ export async function generateRoundTwoAction(
           round,
           status: "COMPLETED",
           input,
-          output: buildStubOutput(index + 1)
+          output: buildGenerationOutput({
+            project,
+            input,
+            round,
+            optionIndex: index
+          })
         }
       })
     )

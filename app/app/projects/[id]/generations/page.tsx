@@ -12,6 +12,12 @@ type PreviewFields = {
   vertical_main: string;
 };
 
+type GenerationAssetRecord = {
+  kind: "IMAGE" | "ZIP" | "OTHER";
+  slot: string | null;
+  file_path: string;
+};
+
 const OPTION_TINTS = [
   "from-emerald-200 to-emerald-50",
   "from-amber-200 to-amber-50",
@@ -21,39 +27,67 @@ const OPTION_TINTS = [
   "from-slate-300 to-slate-100"
 ];
 
-function readPreview(output: unknown): PreviewFields {
-  if (!output || typeof output !== "object" || Array.isArray(output)) {
-    return {
-      square_main: "",
-      widescreen_main: "",
-      vertical_main: ""
-    };
+function normalizeAssetUrl(filePath: string): string {
+  const trimmed = filePath.trim();
+  if (!trimmed) {
+    return "";
   }
 
-  const preview = (output as { preview?: unknown }).preview;
-  if (!preview || typeof preview !== "object" || Array.isArray(preview)) {
-    return {
-      square_main: "",
-      widescreen_main: "",
-      vertical_main: ""
-    };
+  if (/^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed.replace(/^\/+/, "")}`;
+}
+
+function readAssetPreview(assets: GenerationAssetRecord[]): PreviewFields {
+  const resolved = {
+    square_main: "",
+    widescreen_main: "",
+    vertical_main: ""
+  };
+
+  const imageAssets = assets.filter((asset) => asset.kind === "IMAGE" && Boolean(asset.file_path?.trim()));
+  const fallback = imageAssets[0] ? normalizeAssetUrl(imageAssets[0].file_path) : "";
+
+  for (const asset of imageAssets) {
+    const slot = asset.slot?.trim().toLowerCase();
+    const filePath = normalizeAssetUrl(asset.file_path);
+    if (!filePath) {
+      continue;
+    }
+
+    if (slot === "square" || slot === "square_main") {
+      resolved.square_main = filePath;
+      continue;
+    }
+
+    if (slot === "wide" || slot === "widescreen" || slot === "widescreen_main") {
+      resolved.widescreen_main = filePath;
+      continue;
+    }
+
+    if (slot === "tall" || slot === "vertical" || slot === "vertical_main") {
+      resolved.vertical_main = filePath;
+    }
   }
 
   return {
-    square_main: typeof (preview as { square_main?: unknown }).square_main === "string" ? (preview as { square_main: string }).square_main : "",
-    widescreen_main:
-      typeof (preview as { widescreen_main?: unknown }).widescreen_main === "string"
-        ? (preview as { widescreen_main: string }).widescreen_main
-        : "",
-    vertical_main:
-      typeof (preview as { vertical_main?: unknown }).vertical_main === "string" ? (preview as { vertical_main: string }).vertical_main : ""
+    square_main: resolved.square_main || fallback,
+    widescreen_main: resolved.widescreen_main || fallback,
+    vertical_main: resolved.vertical_main || fallback
   };
 }
 
-type PreviewSlot = "square" | "widescreen" | "vertical";
+type PreviewShape = "square" | "wide" | "tall";
 
-function getGenerationPreviewUrl(projectId: string, generationId: string, slot: PreviewSlot): string {
-  return `/api/projects/${projectId}/generations/${generationId}/preview/png?slot=${slot}`;
+function getGenerationPreviewUrl(projectId: string, generationId: string, shape: PreviewShape, updatedAt: Date, assetUrl?: string): string {
+  if (assetUrl) {
+    const separator = assetUrl.includes("?") ? "&" : "?";
+    return `${assetUrl}${separator}v=${updatedAt.getTime()}`;
+  }
+
+  return `/api/projects/${projectId}/generations/${generationId}/preview?shape=${shape}&v=${updatedAt.getTime()}`;
 }
 
 function DeliverableDownloadLink({
@@ -119,11 +153,19 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
       round: true,
       output: true,
       createdAt: true,
+      updatedAt: true,
       preset: {
         select: {
           name: true,
           subtitle: true,
           key: true
+        }
+      },
+      assets: {
+        select: {
+          kind: true,
+          slot: true,
+          file_path: true
         }
       }
     },
@@ -195,7 +237,7 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                   const optionKey = String.fromCharCode(65 + optionIndex);
                   const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
-                  const preview = readPreview(generation.output);
+                  const preview = readAssetPreview(generation.assets);
                   const isApprovedFinal =
                     project.finalDesign?.generationId === generation.id ||
                     (project.finalDesign?.round === round && project.finalDesign.optionKey === optionKey);
@@ -216,24 +258,27 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                       <div className="grid grid-cols-3 gap-2">
                         <GenerationPreviewPane
                           label="Square"
-                          placeholderAsset={preview.square_main}
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "square")}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, preview.square_main)}
                           aspectClass="aspect-square"
                           tintClass={tintClass}
+                          width={1080}
+                          height={1080}
                         />
                         <GenerationPreviewPane
                           label="Widescreen"
-                          placeholderAsset={preview.widescreen_main}
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "widescreen")}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "wide", generation.updatedAt, preview.widescreen_main)}
                           aspectClass="aspect-[16/9]"
                           tintClass={tintClass}
+                          width={1920}
+                          height={1080}
                         />
                         <GenerationPreviewPane
                           label="Vertical"
-                          placeholderAsset={preview.vertical_main}
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "vertical")}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "tall", generation.updatedAt, preview.vertical_main)}
                           aspectClass="aspect-[9/16]"
                           tintClass={tintClass}
+                          width={1080}
+                          height={1920}
                         />
                       </div>
 
