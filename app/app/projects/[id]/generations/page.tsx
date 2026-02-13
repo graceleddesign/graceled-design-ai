@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireSession } from "@/lib/auth";
+import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 
 type PreviewFields = {
@@ -9,7 +10,6 @@ type PreviewFields = {
   vertical_main: string;
 };
 
-const OPTION_LETTERS = ["A", "B", "C", "D", "E", "F"];
 const OPTION_TINTS = [
   "from-emerald-200 to-emerald-50",
   "from-amber-200 to-amber-50",
@@ -18,15 +18,6 @@ const OPTION_TINTS = [
   "from-violet-200 to-violet-50",
   "from-slate-300 to-slate-100"
 ];
-
-function formatOptionLabel(index: number): string {
-  const letterLabel = OPTION_LETTERS[index];
-  if (letterLabel) {
-    return `Option ${letterLabel}`;
-  }
-
-  return `Option ${index + 1}`;
-}
 
 function readPreview(output: unknown): PreviewFields {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -121,7 +112,10 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
     rounds.set(generation.round, existing);
   }
 
-  const roundEntries = Array.from(rounds.entries());
+  const roundEntries = Array.from(rounds.entries()).map(([round, roundGenerations]) => [
+    round,
+    [...roundGenerations].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+  ] as const);
 
   return (
     <section className="space-y-6">
@@ -152,14 +146,14 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
 
               <div className="grid gap-4 md:grid-cols-3">
                 {roundGenerations.map((generation, optionIndex) => {
-                  const optionLabel = formatOptionLabel(optionIndex);
+                  const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
                   const preview = readPreview(generation.output);
 
                   return (
                     <article key={generation.id} className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                       <div>
-                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{optionLabel}</p>
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p>
                         <h3 className="text-base font-semibold text-slate-900">{generation.preset?.name || "Custom direction"}</h3>
                         <p className="text-sm text-slate-600">{generation.preset?.subtitle || generation.preset?.key || "Preset unavailable"}</p>
                       </div>
