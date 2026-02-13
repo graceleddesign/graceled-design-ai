@@ -10,8 +10,9 @@ export async function GET(_: Request, context: { params: Promise<{ id: string }>
   }
 
   const pptxBuffer = await buildFinalPptx(finalDesign.designDoc);
+  const responseBody = new Uint8Array(pptxBuffer);
 
-  return new Response(pptxBuffer, {
+  return new Response(responseBody, {
     status: 200,
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
