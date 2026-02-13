@@ -1,0 +1,27 @@
+{
+  "safe_margins": {
+    "square": 96,
+    "widescreen": 140,
+    "vertical": 120
+  },
+  "veil_strength": {
+    "default": 0.35
+  },
+  "grain": {
+    "default": 0.08
+  },
+  "color_block": {
+    "opacity": {
+      "default": 0.88
+    }
+  },
+  "abstract": {
+    "calm_zone": {
+      "default_position": "lower_middle",
+      "default_width_ratio": 0.62,
+      "default_height_ratio": 0.36,
+      "noise_threshold_max": 0.28,
+      "edge_feather": 0.12
+    }
+  }
+}

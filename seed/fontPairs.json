@@ -1,0 +1,26 @@
+{
+  "sans_sans_modern": {
+    "label": "Sans + Sans Modern",
+    "headline": "Placeholder Sans Display",
+    "body": "Placeholder Sans Text",
+    "fallback": ["Arial", "Helvetica", "sans-serif"]
+  },
+  "serif_sans_editorial": {
+    "label": "Serif + Sans Editorial",
+    "headline": "Placeholder Serif Display",
+    "body": "Placeholder Sans Text",
+    "fallback": ["Georgia", "Helvetica", "sans-serif"]
+  },
+  "mono_sans_brutalist": {
+    "label": "Mono + Sans Brutalist",
+    "headline": "Placeholder Mono Display",
+    "body": "Placeholder Sans Text",
+    "fallback": ["Courier New", "Helvetica", "sans-serif"]
+  },
+  "sans_serif_contemporary": {
+    "label": "Sans + Serif Contemporary",
+    "headline": "Placeholder Sans Display",
+    "body": "Placeholder Serif Text",
+    "fallback": ["Helvetica", "Times New Roman", "serif"]
+  }
+}

@@ -1,0 +1,703 @@
+{
+  "schema_version": "1.0.0",
+  "collections": [
+    "Essentials",
+    "Photo",
+    "Abstract & Texture",
+    "Illustration",
+    "Seasonal"
+  ],
+  "template_ids": ["T1", "T2", "T3", "T4", "P1", "P2", "P3", "A1", "A2", "K1"],
+  "output_slots": [
+    "square_main",
+    "square_weekly",
+    "square_podcast",
+    "widescreen_main",
+    "widescreen_weekly",
+    "vertical_main",
+    "vertical_weekly"
+  ],
+  "presets": [
+    {
+      "key": "type_clean_min_v1",
+      "ui": {
+        "name": "Clean Minimal",
+        "subtitle": "Simple sans hierarchy with generous breathing room.",
+        "tags": ["type", "clean", "minimal"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T1",
+        "square_weekly": "T2",
+        "square_podcast": "K1",
+        "widescreen_main": "T1",
+        "widescreen_weekly": "T2",
+        "vertical_main": "T3",
+        "vertical_weekly": "T4"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "type_editorial_v1",
+      "ui": {
+        "name": "Editorial Serif",
+        "subtitle": "Serif headline tone with clean supporting text.",
+        "tags": ["type", "editorial", "serif"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T1",
+        "square_weekly": "T2",
+        "square_podcast": "K1",
+        "widescreen_main": "T3",
+        "widescreen_weekly": "T4",
+        "vertical_main": "T1",
+        "vertical_weekly": "T2"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "serif_sans_editorial",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "type_swiss_grid_v1",
+      "ui": {
+        "name": "Modern Poster Grid",
+        "subtitle": "Grid-based type rhythm for strong structure.",
+        "tags": ["type", "grid", "modern"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T3",
+        "square_weekly": "T4",
+        "square_podcast": "K1",
+        "widescreen_main": "T3",
+        "widescreen_weekly": "T4",
+        "vertical_main": "T1",
+        "vertical_weekly": "T2"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "type_brutalist_v1",
+      "ui": {
+        "name": "Bold Type Stack",
+        "subtitle": "Heavy contrast type stack for assertive messaging.",
+        "tags": ["type", "bold", "stack"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T3",
+        "square_weekly": "T4",
+        "square_podcast": "K1",
+        "widescreen_main": "T1",
+        "widescreen_weekly": "T2",
+        "vertical_main": "T3",
+        "vertical_weekly": "T4"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "mono_sans_brutalist",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "type_bw_high_contrast_v1",
+      "ui": {
+        "name": "Black & White",
+        "subtitle": "Monochrome typography with high contrast hierarchy.",
+        "tags": ["type", "black-white", "contrast"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T1",
+        "square_weekly": "T2",
+        "square_podcast": "K1",
+        "widescreen_main": "T1",
+        "widescreen_weekly": "T2",
+        "vertical_main": "T1",
+        "vertical_weekly": "T2"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "mono_sans_brutalist",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "type_text_system_v1",
+      "ui": {
+        "name": "Text-Only System",
+        "subtitle": "Pure text composition for fast and repeatable weekly use.",
+        "tags": ["type", "system", "text-only"],
+        "collection": "Essentials"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "T3",
+        "square_weekly": "T4",
+        "square_podcast": "K1",
+        "widescreen_main": "T3",
+        "widescreen_weekly": "T4",
+        "vertical_main": "T3",
+        "vertical_weekly": "T4"
+      },
+      "background_rules": {
+        "mode": "none",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "photo_veil_cinematic_v1",
+      "ui": {
+        "name": "Cinematic Photo Overlay",
+        "subtitle": "Dramatic photo background with readable veil treatment.",
+        "tags": ["photo", "veil", "cinematic"],
+        "collection": "Photo"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "P1",
+        "square_weekly": "P2",
+        "square_podcast": "K1",
+        "widescreen_main": "P1",
+        "widescreen_weekly": "P2",
+        "vertical_main": "P1",
+        "vertical_weekly": "P2"
+      },
+      "background_rules": {
+        "mode": "photo",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_serif_contemporary",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "photo_color_block_v1",
+      "ui": {
+        "name": "Photo + Color Block",
+        "subtitle": "Photo compositions stabilized by bold color-block typography.",
+        "tags": ["photo", "color-block", "contrast"],
+        "collection": "Photo"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "P3",
+        "square_weekly": "P2",
+        "square_podcast": "K1",
+        "widescreen_main": "P3",
+        "widescreen_weekly": "P2",
+        "vertical_main": "P1",
+        "vertical_weekly": "P2"
+      },
+      "background_rules": {
+        "mode": "photo",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "photo_mono_accent_v1",
+      "ui": {
+        "name": "Mono Photo + Accent",
+        "subtitle": "Near-monochrome photos with a focused accent system.",
+        "tags": ["photo", "mono", "accent"],
+        "collection": "Photo"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "P1",
+        "square_weekly": "P2",
+        "square_podcast": "K1",
+        "widescreen_main": "P1",
+        "widescreen_weekly": "P2",
+        "vertical_main": "P3",
+        "vertical_weekly": "P2"
+      },
+      "background_rules": {
+        "mode": "photo",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "mono_sans_brutalist",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "photo_warm_film_v1",
+      "ui": {
+        "name": "Warm Film Photo",
+        "subtitle": "Soft warm tonality with editorial type overlays.",
+        "tags": ["photo", "warm", "film"],
+        "collection": "Photo"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "P1",
+        "square_weekly": "P2",
+        "square_podcast": "K1",
+        "widescreen_main": "P1",
+        "widescreen_weekly": "P2",
+        "vertical_main": "P1",
+        "vertical_weekly": "P2"
+      },
+      "background_rules": {
+        "mode": "photo",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "serif_sans_editorial",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "photo_landscape_min_v1",
+      "ui": {
+        "name": "Landscape Minimal Photo",
+        "subtitle": "Low-noise landscape photos with restrained type.",
+        "tags": ["photo", "landscape", "minimal"],
+        "collection": "Photo"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "P1",
+        "square_weekly": "P2",
+        "square_podcast": "K1",
+        "widescreen_main": "P3",
+        "widescreen_weekly": "P2",
+        "vertical_main": "P1",
+        "vertical_weekly": "P2"
+      },
+      "background_rules": {
+        "mode": "photo",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_serif_contemporary",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "abstract_gradient_modern_v1",
+      "ui": {
+        "name": "Modern Gradient",
+        "subtitle": "Smooth gradient fields with clean central typography.",
+        "tags": ["abstract", "gradient", "modern"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "abstract",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "abstract_flow_field_v1",
+      "ui": {
+        "name": "Liquid Abstract",
+        "subtitle": "Fluid abstract motion with balanced type overlays.",
+        "tags": ["abstract", "flow", "liquid"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "abstract",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_serif_contemporary",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "texture_stone_modern_v1",
+      "ui": {
+        "name": "Stone / Marble Modern",
+        "subtitle": "Textured stone-inspired fields with contemporary type.",
+        "tags": ["texture", "stone", "marble"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "texture",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "serif_sans_editorial",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "texture_print_riso_v1",
+      "ui": {
+        "name": "Print Texture",
+        "subtitle": "Riso-inspired grain and print feel for bold themes.",
+        "tags": ["texture", "print", "riso"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "texture",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "mono_sans_brutalist",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "geo_shapes_negative_v1",
+      "ui": {
+        "name": "Geometric Shapes",
+        "subtitle": "Negative-space geometry with structured type overlays.",
+        "tags": ["abstract", "geometric", "shapes"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "abstract",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "mark_icon_abstract_v1",
+      "ui": {
+        "name": "Abstract Series Mark",
+        "subtitle": "Mark-led abstract system with compact podcast lockup.",
+        "tags": ["abstract", "mark", "icon"],
+        "collection": "Abstract & Texture"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "A1",
+        "widescreen_weekly": "A2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "abstract",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_serif_contemporary",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": true,
+        "podcast_prefer_title": false,
+        "mark_required": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "illus_flat_min_v1",
+      "ui": {
+        "name": "Minimal Illustration",
+        "subtitle": "Simple illustrated scenes with clean title treatment.",
+        "tags": ["illustration", "minimal", "flat"],
+        "collection": "Illustration"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "T1",
+        "widescreen_weekly": "T2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "abstract",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "sans_sans_modern",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "illus_engraved_v1",
+      "ui": {
+        "name": "Engraved Illustration",
+        "subtitle": "Etching-inspired illustration look with editorial text.",
+        "tags": ["illustration", "engraved", "vintage"],
+        "collection": "Illustration"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "T3",
+        "widescreen_weekly": "T4",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "texture",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "serif_sans_editorial",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": false,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    },
+    {
+      "key": "seasonal_liturgical_v1",
+      "ui": {
+        "name": "Seasonal Liturgical",
+        "subtitle": "Season-aware palette and motif system for church calendar moments.",
+        "tags": ["seasonal", "liturgical", "church-calendar"],
+        "collection": "Seasonal"
+      },
+      "enabled": true,
+      "version": 1,
+      "templates": {
+        "square_main": "A1",
+        "square_weekly": "A2",
+        "square_podcast": "K1",
+        "widescreen_main": "T1",
+        "widescreen_weekly": "T2",
+        "vertical_main": "A1",
+        "vertical_weekly": "A2"
+      },
+      "background_rules": {
+        "mode": "texture",
+        "inherit_for_podcast_from": "square_main"
+      },
+      "typography_pair_key": "serif_sans_editorial",
+      "do_not": ["bevel", "glow", "lens flare", "clipart symbols"],
+      "mark_policy": {
+        "allow_mark": true,
+        "podcast_prefer_title": true
+      },
+      "text_fit": {
+        "policy": "auto_resize_with_floors",
+        "emphasis_toggle": true
+      }
+    }
+  ]
+}
