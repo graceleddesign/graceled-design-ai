@@ -80,7 +80,9 @@ export async function loginAction(_: AuthActionState, formData: FormData): Promi
         }
       },
       include: {
-        memberships: true
+        memberships: {
+          include: { organization: true }
+        }
       }
     });
 
