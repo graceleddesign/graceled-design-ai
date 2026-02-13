@@ -1,4 +1,4 @@
-import { buildFinalBundle } from "@/lib/final-deliverables";
+import { buildFinalPng } from "@/lib/final-deliverables";
 import { loadAuthorizedFinalDesign } from "@/lib/final-deliverables-api";
 
 export async function GET(_: Request, context: { params: Promise<{ id: string }> }) {
@@ -9,14 +9,14 @@ export async function GET(_: Request, context: { params: Promise<{ id: string }>
     return finalDesign.response;
   }
 
-  const zipBuffer = await buildFinalBundle(finalDesign.designDoc);
-  const responseBody = new Uint8Array(zipBuffer);
+  const pngBuffer = await buildFinalPng(finalDesign.designDoc);
+  const responseBody = new Uint8Array(pngBuffer);
 
   return new Response(responseBody, {
     status: 200,
     headers: {
-      "Content-Type": "application/zip",
-      "Content-Disposition": 'attachment; filename="final-bundle.zip"',
+      "Content-Type": "image/png",
+      "Content-Disposition": 'attachment; filename="final.png"',
       "Cache-Control": "no-store"
     }
   });

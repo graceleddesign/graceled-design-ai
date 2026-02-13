@@ -2,6 +2,7 @@ import { access, readFile } from "fs/promises";
 import path from "path";
 import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
+import sharp from "sharp";
 import type { DesignDoc } from "@/lib/design-doc";
 
 const PX_PER_INCH = 96;
@@ -16,6 +17,23 @@ function pxToInches(px: number): number {
 
 function pxToPoints(px: number): number {
   return (px * 72) / PX_PER_INCH;
+}
+
+function normalizeDimension(value: number): number {
+  if (!Number.isFinite(value) || Number.isNaN(value)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.round(value));
+}
+
+function formatPdfNumber(value: number): string {
+  const rounded = Math.round(value * 1000) / 1000;
+  if (Number.isInteger(rounded)) {
+    return String(rounded);
+  }
+
+  return rounded.toFixed(3).replace(/\.?0+$/, "");
 }
 
 function escapeXml(input: string): string {
@@ -83,6 +101,97 @@ async function resolveSvgImageHref(src: string): Promise<string> {
   const bytes = await readFile(filePath);
   const mimeType = detectMimeType(filePath);
   return `data:${mimeType};base64,${bytes.toString("base64")}`;
+}
+
+async function buildFinalPngFromSvg(svg: string, width: number, height: number): Promise<Buffer> {
+  return sharp(Buffer.from(svg))
+    .resize({
+      width,
+      height,
+      fit: "fill"
+    })
+    .png()
+    .toBuffer();
+}
+
+function buildSinglePagePdfFromJpeg(jpegBuffer: Buffer, widthPx: number, heightPx: number): Buffer {
+  const widthPt = pxToPoints(widthPx);
+  const heightPt = pxToPoints(heightPx);
+  const contentStream = `q
+${formatPdfNumber(widthPt)} 0 0 ${formatPdfNumber(heightPt)} 0 0 cm
+/Im0 Do
+Q
+`;
+  const contentBuffer = Buffer.from(contentStream, "utf-8");
+  const objectOffsets: number[] = [];
+  const chunks: Buffer[] = [];
+  let currentOffset = 0;
+
+  const pushChunk = (chunk: string | Buffer) => {
+    const bufferChunk = typeof chunk === "string" ? Buffer.from(chunk, "binary") : chunk;
+    chunks.push(bufferChunk);
+    currentOffset += bufferChunk.length;
+  };
+
+  const beginObject = (objectId: number) => {
+    objectOffsets[objectId] = currentOffset;
+    pushChunk(`${objectId} 0 obj\n`);
+  };
+
+  pushChunk("%PDF-1.4\n%\xFF\xFF\xFF\xFF\n");
+
+  beginObject(1);
+  pushChunk("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+  beginObject(2);
+  pushChunk("<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+  beginObject(3);
+  pushChunk(
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${formatPdfNumber(widthPt)} ${formatPdfNumber(heightPt)}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n`
+  );
+
+  beginObject(4);
+  pushChunk(
+    `<< /Type /XObject /Subtype /Image /Width ${widthPx} /Height ${heightPx} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBuffer.length} >>\nstream\n`
+  );
+  pushChunk(jpegBuffer);
+  pushChunk("\nendstream\nendobj\n");
+
+  beginObject(5);
+  pushChunk(`<< /Length ${contentBuffer.length} >>\nstream\n`);
+  pushChunk(contentBuffer);
+  pushChunk("endstream\nendobj\n");
+
+  const xrefOffset = currentOffset;
+  const objectCount = 5;
+
+  pushChunk(`xref\n0 ${objectCount + 1}\n`);
+  pushChunk("0000000000 65535 f \n");
+
+  for (let objectId = 1; objectId <= objectCount; objectId += 1) {
+    const offset = objectOffsets[objectId] ?? 0;
+    pushChunk(`${String(offset).padStart(10, "0")} 00000 n \n`);
+  }
+
+  pushChunk(`trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+  return Buffer.concat(chunks);
+}
+
+async function buildFinalPdfFromSvg(svg: string, width: number, height: number): Promise<Buffer> {
+  const jpegBuffer = await sharp(Buffer.from(svg))
+    .resize({
+      width,
+      height,
+      fit: "fill"
+    })
+    .jpeg({
+      quality: 100,
+      chromaSubsampling: "4:4:4"
+    })
+    .toBuffer();
+
+  return buildSinglePagePdfFromJpeg(jpegBuffer, width, height);
 }
 
 export async function buildFinalPptx(designDoc: DesignDoc): Promise<Buffer> {
@@ -223,12 +332,35 @@ export async function buildFinalSvg(designDoc: DesignDoc): Promise<string> {
   return svgParts.join("\n");
 }
 
+export async function buildFinalPng(designDoc: DesignDoc): Promise<Buffer> {
+  const svg = await buildFinalSvg(designDoc);
+  const width = normalizeDimension(designDoc.width);
+  const height = normalizeDimension(designDoc.height);
+  return buildFinalPngFromSvg(svg, width, height);
+}
+
+export async function buildFinalPdf(designDoc: DesignDoc): Promise<Buffer> {
+  const svg = await buildFinalSvg(designDoc);
+  const width = normalizeDimension(designDoc.width);
+  const height = normalizeDimension(designDoc.height);
+  return buildFinalPdfFromSvg(svg, width, height);
+}
+
 export async function buildFinalBundle(designDoc: DesignDoc): Promise<Buffer> {
-  const [pptxBuffer, svgString] = await Promise.all([buildFinalPptx(designDoc), buildFinalSvg(designDoc)]);
+  const width = normalizeDimension(designDoc.width);
+  const height = normalizeDimension(designDoc.height);
+  const svgString = await buildFinalSvg(designDoc);
+  const [pptxBuffer, pngBuffer, pdfBuffer] = await Promise.all([
+    buildFinalPptx(designDoc),
+    buildFinalPngFromSvg(svgString, width, height),
+    buildFinalPdfFromSvg(svgString, width, height)
+  ]);
   const zip = new JSZip();
 
   zip.file("final.pptx", pptxBuffer);
   zip.file("final.svg", svgString);
+  zip.file("final.png", pngBuffer);
+  zip.file("final.pdf", pdfBuffer);
 
   return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
 }
