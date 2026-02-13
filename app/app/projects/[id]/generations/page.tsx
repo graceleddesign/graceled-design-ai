@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { approveFinalDesignAction } from "@/app/app/projects/actions";
+import { GenerationPreviewPane } from "@/components/generation-preview-pane";
 import { requireSession } from "@/lib/auth";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
@@ -9,12 +10,6 @@ type PreviewFields = {
   square_main: string;
   widescreen_main: string;
   vertical_main: string;
-};
-
-type GenerationAsset = {
-  kind: string;
-  file_path: string;
-  mime_type: string | null;
 };
 
 const OPTION_TINTS = [
@@ -55,66 +50,10 @@ function readPreview(output: unknown): PreviewFields {
   };
 }
 
-function toBrowserAssetUrl(filePath: string): string {
-  const trimmed = filePath.trim();
-  if (!trimmed) {
-    return "";
-  }
+type PreviewSlot = "square" | "widescreen" | "vertical";
 
-  if (trimmed.startsWith("/")) {
-    return trimmed;
-  }
-
-  if (trimmed.startsWith("public/uploads/")) {
-    return `/${trimmed.slice("public/".length)}`;
-  }
-
-  if (trimmed.startsWith("uploads/")) {
-    return `/${trimmed}`;
-  }
-
-  return `/${trimmed}`;
-}
-
-function getPreviewImageUrl(assets: GenerationAsset[]): string {
-  const previewAsset = assets.find((asset) => asset.kind.toLowerCase() === "preview");
-  if (previewAsset) {
-    return toBrowserAssetUrl(previewAsset.file_path);
-  }
-
-  const firstImageAsset = assets.find((asset) => (asset.mime_type || "").toLowerCase().startsWith("image/"));
-  if (firstImageAsset) {
-    return toBrowserAssetUrl(firstImageAsset.file_path);
-  }
-
-  return "";
-}
-
-function PlaceholderPane({
-  label,
-  placeholderAsset,
-  imageUrl,
-  aspectClass,
-  tintClass
-}: {
-  label: string;
-  placeholderAsset: string;
-  imageUrl: string;
-  aspectClass: string;
-  tintClass: string;
-}) {
-  return (
-    <div className={`relative overflow-hidden rounded-md border border-slate-200 bg-gradient-to-br ${tintClass} ${aspectClass}`}>
-      <span className="absolute left-2 top-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-700">
-        {label}
-      </span>
-      {imageUrl ? (
-        <img src={imageUrl} alt={`Preview ${label}`} className="h-full w-full object-contain" />
-      ) : (
-        <span className="absolute bottom-2 right-2 max-w-[85%] truncate text-[10px] text-slate-600">{placeholderAsset || "stub"}</span>
-      )}
-    </div>
-  );
+function getGenerationPreviewUrl(projectId: string, generationId: string, slot: PreviewSlot): string {
+  return `/api/projects/${projectId}/generations/${generationId}/preview/png?slot=${slot}`;
 }
 
 function DeliverableDownloadLink({
@@ -175,19 +114,16 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
     where: {
       projectId: project.id
     },
-    include: {
+    select: {
+      id: true,
+      round: true,
+      output: true,
+      createdAt: true,
       preset: {
         select: {
           name: true,
           subtitle: true,
           key: true
-        }
-      },
-      assets: {
-        select: {
-          kind: true,
-          file_path: true,
-          mime_type: true
         }
       }
     },
@@ -260,7 +196,6 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                   const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
                   const preview = readPreview(generation.output);
-                  const previewImageUrl = getPreviewImageUrl(generation.assets);
                   const isApprovedFinal =
                     project.finalDesign?.generationId === generation.id ||
                     (project.finalDesign?.round === round && project.finalDesign.optionKey === optionKey);
@@ -279,24 +214,24 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                       </div>
 
                       <div className="grid grid-cols-3 gap-2">
-                        <PlaceholderPane
+                        <GenerationPreviewPane
                           label="Square"
                           placeholderAsset={preview.square_main}
-                          imageUrl={previewImageUrl}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "square")}
                           aspectClass="aspect-square"
                           tintClass={tintClass}
                         />
-                        <PlaceholderPane
+                        <GenerationPreviewPane
                           label="Widescreen"
                           placeholderAsset={preview.widescreen_main}
-                          imageUrl={previewImageUrl}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "widescreen")}
                           aspectClass="aspect-[16/9]"
                           tintClass={tintClass}
                         />
-                        <PlaceholderPane
+                        <GenerationPreviewPane
                           label="Vertical"
                           placeholderAsset={preview.vertical_main}
-                          imageUrl={previewImageUrl}
+                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "vertical")}
                           aspectClass="aspect-[9/16]"
                           tintClass={tintClass}
                         />
