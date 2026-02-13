@@ -4,18 +4,20 @@ import { useEffect, useState } from "react";
 
 type GenerationPreviewPaneProps = {
   label: string;
-  placeholderAsset: string;
   imageUrl: string;
   aspectClass: string;
   tintClass: string;
+  width: number;
+  height: number;
 };
 
 export function GenerationPreviewPane({
   label,
-  placeholderAsset,
   imageUrl,
   aspectClass,
-  tintClass
+  tintClass,
+  width,
+  height
 }: GenerationPreviewPaneProps) {
   const [showPlaceholder, setShowPlaceholder] = useState(!imageUrl);
 
@@ -29,11 +31,15 @@ export function GenerationPreviewPane({
         {label}
       </span>
       {showPlaceholder ? (
-        <span className="absolute bottom-2 right-2 max-w-[85%] truncate text-[10px] text-slate-600">{placeholderAsset || "stub"}</span>
+        <span className="absolute bottom-2 left-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">Preview unavailable</span>
       ) : (
         <img
           src={imageUrl}
           alt={`Preview ${label}`}
+          loading="lazy"
+          decoding="async"
+          width={width}
+          height={height}
           className="h-full w-full object-contain"
           onError={() => setShowPlaceholder(true)}
         />
