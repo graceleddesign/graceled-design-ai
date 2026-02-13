@@ -1,0 +1,167 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum TypographyDirection {
+  match_site
+  graceled_defaults
+}
+
+enum GenerationStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum AssetKind {
+  IMAGE
+  ZIP
+  OTHER
+}
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  passwordHash  String
+  name          String?
+  memberships   Membership[]
+  sessions      Session[]
+  projects      Project[]    @relation("ProjectCreatedBy")
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+model Organization {
+  id            String       @id @default(cuid())
+  name          String
+  slug          String       @unique
+  memberships   Membership[]
+  projects      Project[]
+  brandKits     BrandKit[]
+  presets       Preset[]
+  sessions      Session[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+model Membership {
+  id              String          @id @default(cuid())
+  userId          String
+  organizationId  String
+  role            MembershipRole  @default(MEMBER)
+  createdAt       DateTime        @default(now())
+
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+}
+
+model Session {
+  id              String        @id @default(cuid())
+  token           String        @unique
+  userId          String
+  organizationId  String
+  expiresAt       DateTime
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model Project {
+  id                  String        @id @default(cuid())
+  organizationId      String
+  createdById         String
+  series_title        String
+  series_subtitle     String?
+  scripture_passages  String?
+  series_description  String?
+  brandKit            BrandKit?
+  generations         Generation[]
+  assets              Asset[]
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  organization        Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy           User          @relation("ProjectCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+}
+
+model BrandKit {
+  id                  String              @id @default(cuid())
+  organizationId      String
+  projectId           String              @unique
+  websiteUrl          String
+  logoPath            String?
+  paletteJson         String
+  typographyDirection TypographyDirection
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  organization        Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project             Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Preset {
+  id              String        @id @default(cuid())
+  organizationId  String?
+  key             String        @unique
+  name            String
+  subtitle        String?
+  collection      String?
+  tags            Json
+  enabled         Boolean       @default(true)
+  version         Int           @default(1)
+  config          Json
+  generations     Generation[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  organization    Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model Generation {
+  id            String            @id @default(cuid())
+  projectId     String
+  presetId      String?
+  round         Int               @default(1)
+  status        GenerationStatus  @default(QUEUED)
+  input         Json?
+  output        Json?
+  assets        Asset[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  project       Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  preset        Preset?           @relation(fields: [presetId], references: [id], onDelete: SetNull)
+}
+
+model Asset {
+  id            String      @id @default(cuid())
+  projectId     String
+  generationId  String?
+  kind          AssetKind   @default(IMAGE)
+  slot          String?
+  file_path     String
+  mime_type     String?
+  width         Int?
+  height        Int?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  project       Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  generation    Generation? @relation(fields: [generationId], references: [id], onDelete: SetNull)
+}

@@ -11,7 +11,11 @@ GraceLed Design AI generates ministry-ready series graphics and weekly variants 
 - Approve one option and export a full output package.
 
 ## User Flow
-Create Project -> Brand Confirm -> Round 1 (3 options) -> Feedback -> Round 2 (3 options) -> Approve -> Export
+Create Project (Step 1 of 2) -> Brand Kit (Step 2 of 2) -> Round 1 (3 options) -> Feedback -> Round 2 (3 options) -> Approve -> Export
+
+### New Project Setup
+- Step 1 (`/app/projects/new`): collect required series info and create the project record.
+- Step 2 (`/app/projects/[id]/brand`): collect website URL, optional logo upload, palette hex values, and typography direction.
 
 ## Output Package Spec (7 Outputs)
 - `square_main` - 1080x1080
