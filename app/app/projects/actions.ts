@@ -3,9 +3,13 @@
 import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
+import { Prisma } from "@prisma/client";
+import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
+import { buildFinalDesignDoc } from "@/lib/design-doc";
 import { requireSession } from "@/lib/auth";
+import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 
 export type ProjectActionState = {
@@ -215,7 +219,8 @@ async function getProjectForGeneration(projectId: string, organizationId: string
         select: {
           websiteUrl: true,
           typographyDirection: true,
-          paletteJson: true
+          paletteJson: true,
+          logoPath: true
         }
       }
     }
@@ -528,4 +533,94 @@ export async function generateRoundTwoAction(
   );
 
   redirect(`/app/projects/${projectId}/generations`);
+}
+
+export async function approveFinalDesignAction(projectId: string, generationId: string, optionKeyRaw: string): Promise<void> {
+  const session = await requireSession();
+  const normalizedOptionKey = optionKeyRaw.trim().toUpperCase().slice(0, 1);
+
+  if (!/^[A-Z]$/.test(normalizedOptionKey)) {
+    return;
+  }
+
+  const project = await prisma.project.findFirst({
+    where: {
+      id: projectId,
+      organizationId: session.organizationId
+    },
+    select: {
+      id: true,
+      series_title: true,
+      series_subtitle: true,
+      scripture_passages: true,
+      series_description: true,
+      brandKit: {
+        select: {
+          logoPath: true,
+          paletteJson: true
+        }
+      }
+    }
+  });
+
+  if (!project) {
+    return;
+  }
+
+  const generation = await prisma.generation.findFirst({
+    where: {
+      id: generationId,
+      projectId: project.id
+    },
+    select: {
+      id: true,
+      round: true,
+      input: true,
+      output: true
+    }
+  });
+
+  if (!generation) {
+    return;
+  }
+
+  const optionIndex = Math.max(0, normalizedOptionKey.charCodeAt(0) - 65);
+  const palette = project.brandKit ? parsePaletteJson(project.brandKit.paletteJson) : [];
+  const designDoc = buildFinalDesignDoc({
+    output: generation.output,
+    input: generation.input,
+    round: generation.round,
+    optionIndex,
+    project: {
+      seriesTitle: project.series_title,
+      seriesSubtitle: project.series_subtitle,
+      scripturePassages: project.scripture_passages,
+      seriesDescription: project.series_description,
+      logoPath: project.brandKit?.logoPath || null,
+      palette
+    }
+  });
+
+  await prisma.finalDesign.upsert({
+    where: {
+      projectId: project.id
+    },
+    create: {
+      projectId: project.id,
+      generationId: generation.id,
+      round: generation.round,
+      optionKey: normalizedOptionKey,
+      optionLabel: optionLabel(optionIndex),
+      designJson: designDoc as Prisma.InputJsonValue
+    },
+    update: {
+      generationId: generation.id,
+      round: generation.round,
+      optionKey: normalizedOptionKey,
+      optionLabel: optionLabel(optionIndex),
+      designJson: designDoc as Prisma.InputJsonValue
+    }
+  });
+
+  revalidatePath(`/app/projects/${project.id}/generations`);
 }

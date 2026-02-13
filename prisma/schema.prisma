@@ -92,6 +92,7 @@ model Project {
   series_description  String?
   brandKit            BrandKit?
   generations         Generation[]
+  finalDesign         FinalDesign?
   assets              Asset[]
   createdAt           DateTime      @default(now())
   updatedAt           DateTime      @updatedAt
@@ -141,12 +142,30 @@ model Generation {
   status        GenerationStatus  @default(QUEUED)
   input         Json?
   output        Json?
+  finalDesigns  FinalDesign[]
   assets        Asset[]
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 
   project       Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
   preset        Preset?           @relation(fields: [presetId], references: [id], onDelete: SetNull)
+}
+
+model FinalDesign {
+  id           String      @id @default(cuid())
+  projectId    String      @unique
+  generationId String?
+  round        Int
+  optionKey    String
+  optionLabel  String
+  designJson   Json
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  project      Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  generation   Generation? @relation(fields: [generationId], references: [id], onDelete: SetNull)
+
+  @@index([generationId])
 }
 
 model Asset {
