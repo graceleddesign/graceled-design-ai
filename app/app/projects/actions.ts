@@ -7,10 +7,15 @@ import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { MissingOpenAiApiKeyError } from "@/lib/ai/openai-images";
+import {
+  buildBackgroundPrompt,
+  generateBackgroundPng,
+  normalizeAiImageQuality,
+  type AiImageSize,
+  writeUpload
+} from "@/lib/ai-images";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { createGenerationPreviewAssets } from "@/lib/generation-assets";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 import { buildTemplateDesignDoc, type TemplateShape } from "@/lib/templates";
@@ -65,6 +70,40 @@ const PREVIEW_DIMENSIONS: Record<TemplateShape, { width: number; height: number 
   wide: { width: 1920, height: 1080 },
   tall: { width: 1080, height: 1920 }
 };
+const AI_SUPPORTED_PRESET_KEYS = new Set(["type_clean_min_v1"]);
+const AI_PREVIEW_VARIANTS: Array<{
+  shape: TemplateShape;
+  slot: "square_main" | "widescreen_main" | "vertical_main";
+  fileSuffix: "square" | "wide" | "tall";
+  size: AiImageSize;
+  width: number;
+  height: number;
+}> = [
+  {
+    shape: "square",
+    slot: "square_main",
+    fileSuffix: "square",
+    size: "1024x1024",
+    width: 1024,
+    height: 1024
+  },
+  {
+    shape: "wide",
+    slot: "widescreen_main",
+    fileSuffix: "wide",
+    size: "1536x1024",
+    width: 1536,
+    height: 1024
+  },
+  {
+    shape: "tall",
+    slot: "vertical_main",
+    fileSuffix: "tall",
+    size: "1024x1536",
+    width: 1024,
+    height: 1536
+  }
+];
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -166,6 +205,32 @@ function parsePaletteJson(raw: string): string[] {
   } catch {
     return [];
   }
+}
+
+function isAiBackgroundPresetKey(presetKey: string): boolean {
+  return AI_SUPPORTED_PRESET_KEYS.has(presetKey);
+}
+
+function toPublicAssetUrl(filePath: string): string {
+  const trimmed = filePath.trim().replace(/^\/+/, "");
+  return `/${trimmed}`;
+}
+
+function addBackgroundImageLayer(designDoc: DesignDoc, backgroundUrl: string): DesignDoc {
+  return {
+    ...designDoc,
+    layers: [
+      {
+        type: "image",
+        x: 0,
+        y: 0,
+        w: designDoc.width,
+        h: designDoc.height,
+        src: backgroundUrl
+      },
+      ...designDoc.layers
+    ]
+  };
 }
 
 function getUniqueStrings(values: readonly unknown[]): string[] {
@@ -397,24 +462,116 @@ type PlannedGeneration = {
   draft: GenerationDraft;
 };
 
-async function createSavedPreviewAssetsForPlannedGenerations(params: {
-  projectId: string;
+async function createAiBackgroundAssetsForPlannedGenerations(params: {
+  project: GenerationProjectContext & { id: string };
   plannedGenerations: PlannedGeneration[];
 }): Promise<void> {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    return;
+  }
+
+  const quality = normalizeAiImageQuality(process.env.AI_IMAGE_QUALITY?.trim() || process.env.OPENAI_IMAGE_QUALITY?.trim());
+  const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
+
   for (const plannedGeneration of params.plannedGenerations) {
+    if (!isAiBackgroundPresetKey(plannedGeneration.preset.key)) {
+      continue;
+    }
+
     try {
-      await createGenerationPreviewAssets({
-        projectId: params.projectId,
-        generationId: plannedGeneration.id
+      const prompt = buildBackgroundPrompt({
+        presetKey: plannedGeneration.preset.key,
+        project: {
+          seriesTitle: params.project.series_title,
+          seriesSubtitle: params.project.series_subtitle,
+          scripturePassages: params.project.scripture_passages,
+          seriesDescription: params.project.series_description
+        },
+        palette
       });
-    } catch (error) {
-      if (error instanceof MissingOpenAiApiKeyError) {
-        console.warn("OPENAI_API_KEY is not configured; generation previews will use fallback rendering.");
-        return;
+
+      const preview = {
+        square_main: "",
+        widescreen_main: "",
+        vertical_main: ""
+      };
+      const filenames: string[] = [];
+      const slots = AI_PREVIEW_VARIANTS.map((variant) => variant.slot);
+      const assetRows: Prisma.AssetCreateManyInput[] = [];
+      const designDocByShape: Record<TemplateShape, DesignDoc> = {
+        square: plannedGeneration.draft.designDocByShape.square,
+        wide: plannedGeneration.draft.designDocByShape.wide,
+        tall: plannedGeneration.draft.designDocByShape.tall
+      };
+
+      for (const variant of AI_PREVIEW_VARIANTS) {
+        const filename = `${plannedGeneration.id}-${variant.fileSuffix}.png`;
+        const backgroundPng = await generateBackgroundPng({
+          prompt,
+          size: variant.size,
+          quality
+        });
+        const { filePath } = await writeUpload(backgroundPng, filename);
+        const publicUrl = toPublicAssetUrl(filePath);
+
+        filenames.push(filename);
+        designDocByShape[variant.shape] = addBackgroundImageLayer(designDocByShape[variant.shape], publicUrl);
+
+        if (variant.slot === "square_main") {
+          preview.square_main = publicUrl;
+        } else if (variant.slot === "widescreen_main") {
+          preview.widescreen_main = publicUrl;
+        } else {
+          preview.vertical_main = publicUrl;
+        }
+
+        assetRows.push({
+          projectId: params.project.id,
+          generationId: plannedGeneration.id,
+          kind: "IMAGE",
+          slot: variant.slot,
+          file_path: filePath,
+          mime_type: "image/png",
+          width: variant.width,
+          height: variant.height
+        });
       }
 
+      await prisma.$transaction([
+        prisma.asset.deleteMany({
+          where: {
+            generationId: plannedGeneration.id,
+            slot: {
+              in: slots
+            }
+          }
+        }),
+        prisma.asset.createMany({
+          data: assetRows
+        }),
+        prisma.generation.update({
+          where: {
+            id: plannedGeneration.id
+          },
+          data: {
+            status: "COMPLETED",
+            output: {
+              ...plannedGeneration.draft.output,
+              designDoc: designDocByShape.square,
+              designDocByShape,
+              preview
+            } as Prisma.InputJsonValue
+          }
+        })
+      ]);
+
+      console.log(
+        `[ai-backgrounds] generation ${plannedGeneration.id}: generated 3 images (${filenames.join(", ")})`
+      );
+    } catch (error) {
       console.error(
-        `Preview asset generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
+        `AI background generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
         error
       );
     }
@@ -659,8 +816,8 @@ export async function generateRoundOneAction(
     )
   );
 
-  await createSavedPreviewAssetsForPlannedGenerations({
-    projectId: project.id,
+  await createAiBackgroundAssetsForPlannedGenerations({
+    project,
     plannedGenerations
   });
 
@@ -796,8 +953,8 @@ export async function generateRoundTwoAction(
     )
   );
 
-  await createSavedPreviewAssetsForPlannedGenerations({
-    projectId: project.id,
+  await createAiBackgroundAssetsForPlannedGenerations({
+    project,
     plannedGenerations
   });
 
