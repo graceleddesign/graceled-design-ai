@@ -7,10 +7,10 @@ import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { generateBackgroundPng } from "@/lib/ai-image";
+import { MissingOpenAiApiKeyError } from "@/lib/ai/openai-images";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { renderPreviewPng } from "@/lib/final-preview";
+import { createGenerationPreviewAssets } from "@/lib/generation-assets";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 import { buildTemplateDesignDoc, type TemplateShape } from "@/lib/templates";
@@ -64,11 +64,6 @@ const PREVIEW_DIMENSIONS: Record<TemplateShape, { width: number; height: number 
   square: { width: 1080, height: 1080 },
   wide: { width: 1920, height: 1080 },
   tall: { width: 1080, height: 1920 }
-};
-const PREVIEW_SLOT_BY_SHAPE: Record<TemplateShape, string> = {
-  square: "square_main",
-  wide: "widescreen_main",
-  tall: "vertical_main"
 };
 
 function normalizeWebsiteUrl(input: string): string | null {
@@ -402,91 +397,24 @@ type PlannedGeneration = {
   draft: GenerationDraft;
 };
 
-function hasOpenAiImageConfig(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY?.trim());
-}
-
-async function createHybridAssetsForGeneration(params: {
+async function createSavedPreviewAssetsForPlannedGenerations(params: {
   projectId: string;
-  generationId: string;
-  presetKey: string;
-  project: GenerationProjectContext;
-  designDocByShape: Record<TemplateShape, DesignDoc>;
-}): Promise<void> {
-  const uploadDirectory = path.join(process.cwd(), "public", "uploads");
-  await mkdir(uploadDirectory, { recursive: true });
-  const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-  const createdAt = new Date();
-  const assetRows: Prisma.AssetCreateManyInput[] = [];
-
-  for (const shape of PREVIEW_SHAPES) {
-    const backgroundPngBuffer = await generateBackgroundPng({
-      presetKey: params.presetKey,
-      shape,
-      seriesTitle: params.project.series_title,
-      seriesSubtitle: params.project.series_subtitle,
-      scripture: params.project.scripture_passages,
-      palette
-    });
-    const dimensions = PREVIEW_DIMENSIONS[shape];
-    const previewPngBuffer = await renderPreviewPng({
-      designDoc: params.designDocByShape[shape],
-      backgroundPngBuffer,
-      outputWidth: dimensions.width,
-      outputHeight: dimensions.height
-    });
-    const filename = `${params.generationId}-${shape}-${Date.now()}-${randomUUID()}.png`;
-    const filePath = path.join(uploadDirectory, filename);
-    const publicPath = `/uploads/${filename}`;
-
-    await writeFile(filePath, previewPngBuffer);
-
-    assetRows.push({
-      projectId: params.projectId,
-      generationId: params.generationId,
-      kind: "IMAGE",
-      slot: PREVIEW_SLOT_BY_SHAPE[shape],
-      file_path: publicPath,
-      mime_type: "image/png",
-      width: dimensions.width,
-      height: dimensions.height,
-      createdAt,
-      updatedAt: createdAt
-    });
-  }
-
-  await prisma.$transaction([
-    prisma.asset.createMany({
-      data: assetRows
-    }),
-    prisma.generation.update({
-      where: { id: params.generationId },
-      data: { updatedAt: new Date() }
-    })
-  ]);
-}
-
-async function createHybridAssetsForPlannedGenerations(params: {
-  projectId: string;
-  project: GenerationProjectContext;
   plannedGenerations: PlannedGeneration[];
 }): Promise<void> {
-  if (!hasOpenAiImageConfig()) {
-    return;
-  }
-
   for (const plannedGeneration of params.plannedGenerations) {
     try {
-      await createHybridAssetsForGeneration({
+      await createGenerationPreviewAssets({
         projectId: params.projectId,
-        generationId: plannedGeneration.id,
-        presetKey: plannedGeneration.preset.key,
-        project: params.project,
-        designDocByShape: plannedGeneration.draft.designDocByShape
+        generationId: plannedGeneration.id
       });
     } catch (error) {
+      if (error instanceof MissingOpenAiApiKeyError) {
+        console.warn("OPENAI_API_KEY is not configured; generation previews will use fallback rendering.");
+        return;
+      }
+
       console.error(
-        `Hybrid asset generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
+        `Preview asset generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
         error
       );
     }
@@ -731,9 +659,8 @@ export async function generateRoundOneAction(
     )
   );
 
-  await createHybridAssetsForPlannedGenerations({
+  await createSavedPreviewAssetsForPlannedGenerations({
     projectId: project.id,
-    project,
     plannedGenerations
   });
 
@@ -869,9 +796,8 @@ export async function generateRoundTwoAction(
     )
   );
 
-  await createHybridAssetsForPlannedGenerations({
+  await createSavedPreviewAssetsForPlannedGenerations({
     projectId: project.id,
-    project,
     plannedGenerations
   });
 
