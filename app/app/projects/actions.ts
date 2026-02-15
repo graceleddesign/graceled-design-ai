@@ -7,10 +7,13 @@ import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { buildFallbackDesignDoc, buildFinalDesignDoc } from "@/lib/design-doc";
+import { generateBackgroundPng } from "@/lib/ai-image";
 import { requireSession } from "@/lib/auth";
+import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { renderPreviewPng } from "@/lib/final-preview";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
+import { buildTemplateDesignDoc, type TemplateShape } from "@/lib/templates";
 
 export type ProjectActionState = {
   error?: string;
@@ -55,6 +58,18 @@ const generateRoundTwoSchema = z.object({
   expressiveness: z.coerce.number().int().min(0).max(100),
   temperature: z.coerce.number().int().min(0).max(100)
 });
+const MIN_ROUND_ONE_PRESETS = 3;
+const PREVIEW_SHAPES: readonly TemplateShape[] = ["square", "wide", "tall"];
+const PREVIEW_DIMENSIONS: Record<TemplateShape, { width: number; height: number }> = {
+  square: { width: 1080, height: 1080 },
+  wide: { width: 1920, height: 1080 },
+  tall: { width: 1080, height: 1920 }
+};
+const PREVIEW_SLOT_BY_SHAPE: Record<TemplateShape, string> = {
+  square: "square_main",
+  wide: "widescreen_main",
+  tall: "vertical_main"
+};
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -192,23 +207,93 @@ function readSelectedPresetKeysFromInput(input: unknown): string[] {
   return getUniqueStrings(selectedPresetKeys);
 }
 
-function buildGenerationOutput(params: {
-  project: {
-    series_title: string;
-    series_subtitle: string | null;
-    scripture_passages: string | null;
-    series_description: string | null;
-    brandKit: {
-      paletteJson: string;
-      logoPath: string | null;
-    } | null;
-  };
+type GenerationProjectContext = {
+  series_title: string;
+  series_subtitle: string | null;
+  scripture_passages: string | null;
+  series_description: string | null;
+  brandKit: {
+    paletteJson: string;
+    logoPath: string | null;
+  } | null;
+};
+
+type BuildGenerationDraftParams = {
+  projectId: string;
+  presetKey: string;
+  project: GenerationProjectContext;
   input: unknown;
   round: number;
   optionIndex: number;
-}) {
+};
+
+type GenerationDraft = {
+  output: {
+    designDoc: DesignDoc;
+    designDocByShape: Record<TemplateShape, DesignDoc>;
+    notes: string;
+  };
+  designDocByShape: Record<TemplateShape, DesignDoc>;
+};
+
+function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, targetHeight: number): DesignDoc {
+  if (designDoc.width <= 0 || designDoc.height <= 0) {
+    return designDoc;
+  }
+
+  const scaleX = targetWidth / designDoc.width;
+  const scaleY = targetHeight / designDoc.height;
+  const textScale = Math.min(scaleX, scaleY);
+
+  const layers = designDoc.layers.map((layer) => {
+    if (layer.type === "text") {
+      return {
+        ...layer,
+        x: layer.x * scaleX,
+        y: layer.y * scaleY,
+        w: layer.w * scaleX,
+        h: layer.h * scaleY,
+        fontSize: Math.max(8, layer.fontSize * textScale)
+      };
+    }
+
+    return {
+      ...layer,
+      x: layer.x * scaleX,
+      y: layer.y * scaleY,
+      w: layer.w * scaleX,
+      h: layer.h * scaleY
+    };
+  });
+
+  return {
+    width: targetWidth,
+    height: targetHeight,
+    background: designDoc.background,
+    layers
+  };
+}
+
+function buildGenerationDraft(params: BuildGenerationDraftParams): GenerationDraft {
   const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-  const designDoc = buildFallbackDesignDoc({
+  const seed = `${params.projectId}|${params.presetKey}|${params.round}|${params.optionIndex}`;
+  const templateParams = {
+    presetKey: params.presetKey,
+    optionIndex: params.optionIndex,
+    round: params.round,
+    seed,
+    project: {
+      title: params.project.series_title,
+      subtitle: params.project.series_subtitle,
+      passage: params.project.scripture_passages,
+      description: params.project.series_description
+    },
+    brand: {
+      palette,
+      logoPath: params.project.brandKit?.logoPath || null
+    }
+  } as const;
+  const fallbackDesignDoc = buildFallbackDesignDoc({
     output: null,
     input: params.input,
     round: params.round,
@@ -222,9 +307,38 @@ function buildGenerationOutput(params: {
       palette
     }
   });
+  let usedFallback = false;
+  const designDocByShape = {} as Record<TemplateShape, DesignDoc>;
+
+  for (const shape of PREVIEW_SHAPES) {
+    try {
+      const templateDesignDoc = buildTemplateDesignDoc({ ...templateParams, shape });
+      if (templateDesignDoc) {
+        designDocByShape[shape] = templateDesignDoc;
+        continue;
+      }
+    } catch {
+      // Falls back to normalized fallback layout.
+    }
+
+    usedFallback = true;
+    const shapeDimensions = PREVIEW_DIMENSIONS[shape];
+    designDocByShape[shape] = adaptDesignDocToDimensions(
+      fallbackDesignDoc,
+      shapeDimensions.width,
+      shapeDimensions.height
+    );
+  }
 
   return {
-    designDoc
+    output: {
+      designDoc: designDocByShape.square,
+      designDocByShape,
+      notes: usedFallback
+        ? `Template+fallback layout blend: ${params.presetKey} | variant ${params.optionIndex % 3}`
+        : `Template layout: ${params.presetKey} | variant ${params.optionIndex % 3}`
+    },
+    designDocByShape
   };
 }
 
@@ -278,6 +392,107 @@ function buildGenerationInput(
   };
 }
 
+type PlannedGeneration = {
+  id: string;
+  preset: {
+    id: string;
+    key: string;
+  };
+  optionIndex: number;
+  draft: GenerationDraft;
+};
+
+function hasOpenAiImageConfig(): boolean {
+  return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+async function createHybridAssetsForGeneration(params: {
+  projectId: string;
+  generationId: string;
+  presetKey: string;
+  project: GenerationProjectContext;
+  designDocByShape: Record<TemplateShape, DesignDoc>;
+}): Promise<void> {
+  const uploadDirectory = path.join(process.cwd(), "public", "uploads");
+  await mkdir(uploadDirectory, { recursive: true });
+  const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
+  const createdAt = new Date();
+  const assetRows: Prisma.AssetCreateManyInput[] = [];
+
+  for (const shape of PREVIEW_SHAPES) {
+    const backgroundPngBuffer = await generateBackgroundPng({
+      presetKey: params.presetKey,
+      shape,
+      seriesTitle: params.project.series_title,
+      seriesSubtitle: params.project.series_subtitle,
+      scripture: params.project.scripture_passages,
+      palette
+    });
+    const dimensions = PREVIEW_DIMENSIONS[shape];
+    const previewPngBuffer = await renderPreviewPng({
+      designDoc: params.designDocByShape[shape],
+      backgroundPngBuffer,
+      outputWidth: dimensions.width,
+      outputHeight: dimensions.height
+    });
+    const filename = `${params.generationId}-${shape}-${Date.now()}-${randomUUID()}.png`;
+    const filePath = path.join(uploadDirectory, filename);
+    const publicPath = `/uploads/${filename}`;
+
+    await writeFile(filePath, previewPngBuffer);
+
+    assetRows.push({
+      projectId: params.projectId,
+      generationId: params.generationId,
+      kind: "IMAGE",
+      slot: PREVIEW_SLOT_BY_SHAPE[shape],
+      file_path: publicPath,
+      mime_type: "image/png",
+      width: dimensions.width,
+      height: dimensions.height,
+      createdAt,
+      updatedAt: createdAt
+    });
+  }
+
+  await prisma.$transaction([
+    prisma.asset.createMany({
+      data: assetRows
+    }),
+    prisma.generation.update({
+      where: { id: params.generationId },
+      data: { updatedAt: new Date() }
+    })
+  ]);
+}
+
+async function createHybridAssetsForPlannedGenerations(params: {
+  projectId: string;
+  project: GenerationProjectContext;
+  plannedGenerations: PlannedGeneration[];
+}): Promise<void> {
+  if (!hasOpenAiImageConfig()) {
+    return;
+  }
+
+  for (const plannedGeneration of params.plannedGenerations) {
+    try {
+      await createHybridAssetsForGeneration({
+        projectId: params.projectId,
+        generationId: plannedGeneration.id,
+        presetKey: plannedGeneration.preset.key,
+        project: params.project,
+        designDocByShape: plannedGeneration.draft.designDocByShape
+      });
+    } catch (error) {
+      console.error(
+        `Hybrid asset generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
+        error
+      );
+    }
+  }
+}
+
 export async function createProjectAction(
   _: ProjectActionState,
   formData: FormData
@@ -307,6 +522,59 @@ export async function createProjectAction(
   });
 
   redirect(`/app/projects/${project.id}/brand`);
+}
+
+export async function deleteProjectAction(projectId: string): Promise<void> {
+  const session = await requireSession();
+
+  const project = await prisma.project.findFirst({
+    where: {
+      id: projectId,
+      organizationId: session.organizationId
+    },
+    select: {
+      id: true
+    }
+  });
+
+  if (!project) {
+    redirect("/app/projects");
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.asset.deleteMany({
+      where: {
+        projectId: project.id
+      }
+    });
+
+    await tx.finalDesign.deleteMany({
+      where: {
+        projectId: project.id
+      }
+    });
+
+    await tx.generation.deleteMany({
+      where: {
+        projectId: project.id
+      }
+    });
+
+    await tx.brandKit.deleteMany({
+      where: {
+        projectId: project.id
+      }
+    });
+
+    await tx.project.delete({
+      where: {
+        id: project.id
+      }
+    });
+  });
+
+  revalidatePath("/app/projects");
+  redirect("/app/projects");
 }
 
 export async function saveBrandKitAction(
@@ -402,8 +670,8 @@ export async function generateRoundOneAction(
   }
 
   const selectedPresetKeys = getUniqueStrings(formData.getAll("selectedPresetKeys"));
-  if (selectedPresetKeys.length !== 3) {
-    return { error: "Select exactly 3 preset lanes." };
+  if (selectedPresetKeys.length < MIN_ROUND_ONE_PRESETS) {
+    return { error: `Select at least ${MIN_ROUND_ONE_PRESETS} preset lanes.` };
   }
 
   const selectedPresets = await prisma.preset.findMany({
@@ -423,31 +691,51 @@ export async function generateRoundOneAction(
     .map((key) => presetByKey.get(key))
     .filter((preset): preset is { id: string; key: string } => Boolean(preset));
 
-  if (orderedPresets.length !== 3) {
+  if (orderedPresets.length !== selectedPresetKeys.length) {
     return { error: "One or more selected presets are unavailable." };
   }
 
   const input = buildGenerationInput(project, project.brandKit, selectedPresetKeys);
 
+  const plannedGenerations: PlannedGeneration[] = orderedPresets.map((preset, index) => {
+    const generationId = randomUUID();
+
+    return {
+      id: generationId,
+      preset,
+      optionIndex: index,
+      draft: buildGenerationDraft({
+        projectId: project.id,
+        presetKey: preset.key,
+        project,
+        input,
+        round: 1,
+        optionIndex: index
+      })
+    };
+  });
+
   await prisma.$transaction(
-    orderedPresets.map((preset, index) =>
+    plannedGenerations.map(({ id: generationId, preset, draft }) =>
       prisma.generation.create({
         data: {
+          id: generationId,
           projectId: project.id,
           presetId: preset.id,
           round: 1,
           status: "COMPLETED",
           input,
-          output: buildGenerationOutput({
-            project,
-            input,
-            round: 1,
-            optionIndex: index
-          })
+          output: draft.output
         }
       })
     )
   );
+
+  await createHybridAssetsForPlannedGenerations({
+    projectId: project.id,
+    project,
+    plannedGenerations
+  });
 
   redirect(`/app/projects/${projectId}/generations`);
 }
@@ -547,25 +835,45 @@ export async function generateRoundTwoAction(
 
   const round = parsed.data.currentRound + 1;
 
+  const plannedGenerations: PlannedGeneration[] = selectedPresets.map((preset, index) => {
+    const generationId = randomUUID();
+
+    return {
+      id: generationId,
+      preset,
+      optionIndex: index,
+      draft: buildGenerationDraft({
+        projectId: project.id,
+        presetKey: preset.key,
+        project,
+        input,
+        round,
+        optionIndex: index
+      })
+    };
+  });
+
   await prisma.$transaction(
-    selectedPresets.map((preset, index) =>
+    plannedGenerations.map(({ id: generationId, preset, draft }) =>
       prisma.generation.create({
         data: {
+          id: generationId,
           projectId: project.id,
           presetId: preset.id,
           round,
           status: "COMPLETED",
           input,
-          output: buildGenerationOutput({
-            project,
-            input,
-            round,
-            optionIndex: index
-          })
+          output: draft.output
         }
       })
     )
   );
+
+  await createHybridAssetsForPlannedGenerations({
+    projectId: project.id,
+    project,
+    plannedGenerations
+  });
 
   redirect(`/app/projects/${projectId}/generations`);
 }

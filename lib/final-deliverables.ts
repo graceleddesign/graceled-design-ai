@@ -45,6 +45,17 @@ function escapeXml(input: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function layerRotationTransform(layer: { x: number; y: number; w: number; h: number; rotation?: number }): string {
+  const rotation = typeof layer.rotation === "number" ? layer.rotation : 0;
+  if (!rotation) {
+    return "";
+  }
+
+  const cx = layer.x + layer.w / 2;
+  const cy = layer.y + layer.h / 2;
+  return ` transform="rotate(${rotation} ${cx} ${cy})"`;
+}
+
 function getPublicFilePath(assetPath: string): string | null {
   if (/^https?:\/\//i.test(assetPath)) {
     return null;
@@ -279,30 +290,43 @@ export async function buildFinalPptx(designDoc: DesignDoc): Promise<Buffer> {
   return Buffer.from(bufferLike);
 }
 
-export async function buildFinalSvg(designDoc: DesignDoc): Promise<string> {
+type BuildFinalSvgOptions = {
+  includeBackground?: boolean;
+  includeImages?: boolean;
+};
+
+export async function buildFinalSvg(designDoc: DesignDoc, options: BuildFinalSvgOptions = {}): Promise<string> {
+  const includeBackground = options.includeBackground ?? true;
+  const includeImages = options.includeImages ?? true;
   const svgParts: string[] = [];
 
   svgParts.push('<?xml version="1.0" encoding="UTF-8"?>');
   svgParts.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${designDoc.width}" height="${designDoc.height}" viewBox="0 0 ${designDoc.width} ${designDoc.height}">`
   );
-  svgParts.push(`<rect x="0" y="0" width="${designDoc.width}" height="${designDoc.height}" fill="${escapeXml(designDoc.background.color)}" />`);
+  if (includeBackground) {
+    svgParts.push(`<rect x="0" y="0" width="${designDoc.width}" height="${designDoc.height}" fill="${escapeXml(designDoc.background.color)}" />`);
+  }
 
   for (const [index, layer] of designDoc.layers.entries()) {
     svgParts.push(`<g id="layer-${index + 1}">`);
 
     if (layer.type === "shape") {
       svgParts.push(
-        `<rect x="${layer.x}" y="${layer.y}" width="${layer.w}" height="${layer.h}" fill="${escapeXml(layer.fill)}" stroke="${escapeXml(layer.stroke)}" stroke-width="${layer.strokeWidth}" />`
+        `<rect x="${layer.x}" y="${layer.y}" width="${layer.w}" height="${layer.h}" fill="${escapeXml(layer.fill)}" stroke="${escapeXml(layer.stroke)}" stroke-width="${layer.strokeWidth}"${layerRotationTransform(layer)} />`
       );
       svgParts.push("</g>");
       continue;
     }
 
     if (layer.type === "image") {
+      if (!includeImages) {
+        svgParts.push("</g>");
+        continue;
+      }
       const href = await resolveSvgImageHref(layer.src);
       svgParts.push(
-        `<image x="${layer.x}" y="${layer.y}" width="${layer.w}" height="${layer.h}" href="${escapeXml(href)}" preserveAspectRatio="xMidYMid meet" />`
+        `<image x="${layer.x}" y="${layer.y}" width="${layer.w}" height="${layer.h}" href="${escapeXml(href)}" preserveAspectRatio="xMidYMid meet"${layerRotationTransform(layer)} />`
       );
       svgParts.push("</g>");
       continue;
@@ -314,9 +338,7 @@ export async function buildFinalSvg(designDoc: DesignDoc): Promise<string> {
     const lineHeight = layer.fontSize * 1.25;
     const firstBaseline = layer.y + layer.fontSize;
 
-    svgParts.push(
-      `<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Arial")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}">`
-    );
+    svgParts.push(`<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Arial")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}"${layerRotationTransform(layer)}>`);
 
     for (const [lineIndex, line] of lines.entries()) {
       const lineY = lineIndex === 0 ? firstBaseline : firstBaseline + lineIndex * lineHeight;

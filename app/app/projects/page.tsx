@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { deleteProjectAction } from "@/app/app/projects/actions";
+import { DeleteProjectButton } from "@/components/delete-project-button";
 import { requireSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
@@ -29,17 +31,27 @@ export default async function ProjectsPage() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2">
           {projects.map((project) => (
-            <Link
-              key={project.id}
-              href={`/app/projects/${project.id}`}
-              className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm transition hover:shadow"
-            >
-              <h2 className="text-lg font-semibold">{project.series_title}</h2>
-              {project.series_subtitle ? <p className="mt-1 text-sm text-slate-600">{project.series_subtitle}</p> : null}
-              <p className="mt-3 text-xs text-slate-500">
-                Created {new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(project.createdAt)}
-              </p>
-            </Link>
+            <article key={project.id} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm transition hover:shadow">
+              <Link href={`/app/projects/${project.id}`} className="block">
+                <h2 className="text-lg font-semibold">{project.series_title}</h2>
+                {project.series_subtitle ? <p className="mt-1 text-sm text-slate-600">{project.series_subtitle}</p> : null}
+                <p className="mt-3 text-xs text-slate-500">
+                  Created {new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(project.createdAt)}
+                </p>
+              </Link>
+
+              <div className="mt-4 flex items-center justify-between gap-2">
+                <Link
+                  href={`/app/projects/${project.id}`}
+                  className="inline-flex rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Open
+                </Link>
+                <form action={deleteProjectAction.bind(null, project.id)}>
+                  <DeleteProjectButton projectTitle={project.series_title} />
+                </form>
+              </div>
+            </article>
           ))}
         </div>
       )}

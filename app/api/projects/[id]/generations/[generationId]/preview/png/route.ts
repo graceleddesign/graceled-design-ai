@@ -20,17 +20,26 @@ function parseSlot(value: string | null): PreviewSlot | null {
   return null;
 }
 
-function parseDesignDocFromOutput(output: unknown): DesignDoc | null {
-  const directDesignDoc = normalizeDesignDoc(output);
-  if (directDesignDoc) {
-    return directDesignDoc;
-  }
-
+function parseDesignDocFromOutput(output: unknown, slot: PreviewSlot): DesignDoc | null {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return null;
   }
 
-  return normalizeDesignDoc((output as { designDoc?: unknown }).designDoc);
+  const shapeDocs = (output as { designDocByShape?: unknown }).designDocByShape;
+  if (shapeDocs && typeof shapeDocs === "object" && !Array.isArray(shapeDocs)) {
+    const shapeKey = slot === "widescreen" ? "wide" : slot === "vertical" ? "tall" : "square";
+    const byShape = normalizeDesignDoc((shapeDocs as Record<string, unknown>)[shapeKey]);
+    if (byShape) {
+      return byShape;
+    }
+  }
+
+  const nestedDesignDoc = normalizeDesignDoc((output as { designDoc?: unknown }).designDoc);
+  if (nestedDesignDoc) {
+    return nestedDesignDoc;
+  }
+
+  return normalizeDesignDoc(output);
 }
 
 export async function GET(request: Request, context: { params: Promise<{ id: string; generationId: string }> }) {
@@ -70,7 +79,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     });
   }
 
-  const designDoc = parseDesignDocFromOutput(generation.output);
+  const designDoc = parseDesignDocFromOutput(generation.output, slot);
   if (!designDoc) {
     return new Response("Generation not found", {
       status: 404,

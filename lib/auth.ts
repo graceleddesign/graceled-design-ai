@@ -12,6 +12,7 @@ export type AppSession = {
   organizationId: string;
   email: string;
   organizationName: string;
+  role: "OWNER" | "ADMIN" | "MEMBER";
 };
 
 export async function hashPassword(password: string) {
@@ -76,11 +77,24 @@ export async function getSession(): Promise<AppSession | null> {
     return null;
   }
 
+  const membership = await prisma.membership.findUnique({
+    where: {
+      userId_organizationId: {
+        userId: session.userId,
+        organizationId: session.organizationId
+      }
+    },
+    select: {
+      role: true
+    }
+  });
+
   return {
     userId: session.userId,
     organizationId: session.organizationId,
     email: session.user.email,
-    organizationName: session.organization.name
+    organizationName: session.organization.name,
+    role: membership?.role || "MEMBER"
   };
 }
 
