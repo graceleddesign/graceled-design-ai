@@ -4,6 +4,33 @@ import { DesignDirectionsForm } from "@/components/design-directions-form";
 import { requireSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
+function readSelectedPresetKeysFromInput(input: unknown): string[] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return [];
+  }
+
+  const selectedPresetKeys = (input as { selectedPresetKeys?: unknown }).selectedPresetKeys;
+  if (!Array.isArray(selectedPresetKeys)) {
+    return [];
+  }
+
+  const deduped: string[] = [];
+  for (const value of selectedPresetKeys) {
+    if (typeof value !== "string") {
+      continue;
+    }
+
+    const key = value.trim();
+    if (!key || deduped.includes(key)) {
+      continue;
+    }
+
+    deduped.push(key);
+  }
+
+  return deduped;
+}
+
 export default async function ProjectDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const session = await requireSession();
   const { id } = await params;
@@ -29,6 +56,19 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
   if (!project) {
     notFound();
   }
+
+  const latestRoundOneGeneration = await prisma.generation.findFirst({
+    where: {
+      projectId: project.id,
+      round: 1
+    },
+    orderBy: {
+      createdAt: "desc"
+    },
+    select: {
+      input: true
+    }
+  });
 
   const presets = await prisma.preset.findMany({
     where: {
@@ -107,7 +147,11 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
         </div>
       </div>
 
-      <DesignDirectionsForm projectId={project.id} presets={presets} />
+      <DesignDirectionsForm
+        projectId={project.id}
+        presets={presets}
+        initialSelectedPresetKeys={readSelectedPresetKeysFromInput(latestRoundOneGeneration?.input)}
+      />
     </section>
   );
 }

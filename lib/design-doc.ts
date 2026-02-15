@@ -12,6 +12,7 @@ export type DesignTextLayer = {
   y: number;
   w: number;
   h: number;
+  rotation?: number;
   text: string;
   fontSize: number;
   fontFamily: string;
@@ -26,6 +27,7 @@ export type DesignImageLayer = {
   y: number;
   w: number;
   h: number;
+  rotation?: number;
   src: string;
 };
 
@@ -35,6 +37,7 @@ export type DesignShapeLayer = {
   y: number;
   w: number;
   h: number;
+  rotation?: number;
   shape: "rect";
   fill: string;
   stroke: string;
@@ -76,6 +79,22 @@ function clampNumber(input: unknown, fallback: number): number {
 
   if (input < 0) {
     return 0;
+  }
+
+  return input;
+}
+
+function normalizeRotation(input: unknown): number {
+  if (typeof input !== "number" || Number.isNaN(input) || !Number.isFinite(input)) {
+    return 0;
+  }
+
+  if (input > 360) {
+    return 360;
+  }
+
+  if (input < -360) {
+    return -360;
   }
 
   return input;
@@ -131,6 +150,7 @@ function normalizeTextLayer(input: Record<string, unknown>): DesignTextLayer | n
     y: clampNumber(input.y, 0),
     w: clampNumber(input.w, 400),
     h: clampNumber(input.h, 120),
+    rotation: normalizeRotation(input.rotation),
     text,
     fontSize: clampNumber(input.fontSize, 42),
     fontFamily: typeof input.fontFamily === "string" && input.fontFamily.trim() ? input.fontFamily.trim() : "Arial",
@@ -152,6 +172,7 @@ function normalizeImageLayer(input: Record<string, unknown>): DesignImageLayer |
     y: clampNumber(input.y, 0),
     w: clampNumber(input.w, 320),
     h: clampNumber(input.h, 320),
+    rotation: normalizeRotation(input.rotation),
     src
   };
 }
@@ -163,6 +184,7 @@ function normalizeShapeLayer(input: Record<string, unknown>): DesignShapeLayer {
     y: clampNumber(input.y, 0),
     w: clampNumber(input.w, 320),
     h: clampNumber(input.h, 200),
+    rotation: normalizeRotation(input.rotation),
     shape: "rect",
     fill: normalizeColor(input.fill, "#FFFFFF"),
     stroke: normalizeColor(input.stroke, "#000000"),

@@ -54,17 +54,43 @@ function parsePaletteJson(raw: string | null | undefined): string[] {
   }
 }
 
-function parseDesignDocFromOutput(output: unknown): DesignDoc | null {
-  const directDesignDoc = normalizeDesignDoc(output);
-  if (directDesignDoc) {
-    return directDesignDoc;
-  }
-
+function parseDesignDocByShapeFromOutput(output: unknown, shape: PreviewShape): DesignDoc | null {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return null;
   }
 
-  return normalizeDesignDoc((output as { designDoc?: unknown }).designDoc);
+  const shapeDocs = (output as { designDocByShape?: unknown }).designDocByShape;
+  if (!shapeDocs || typeof shapeDocs !== "object" || Array.isArray(shapeDocs)) {
+    return null;
+  }
+
+  const normalizedShape = normalizeDesignDoc((shapeDocs as Record<string, unknown>)[shape]);
+  if (normalizedShape) {
+    return normalizedShape;
+  }
+
+  if (shape === "wide") {
+    return normalizeDesignDoc((shapeDocs as Record<string, unknown>).widescreen);
+  }
+
+  if (shape === "tall") {
+    return normalizeDesignDoc((shapeDocs as Record<string, unknown>).vertical);
+  }
+
+  return null;
+}
+
+function parseDesignDocFromOutput(output: unknown): DesignDoc | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const nestedDesignDoc = normalizeDesignDoc((output as { designDoc?: unknown }).designDoc);
+  if (nestedDesignDoc) {
+    return nestedDesignDoc;
+  }
+
+  return normalizeDesignDoc(output);
 }
 
 function readSelectedPresetKeysFromInput(input: unknown): string[] {
@@ -105,6 +131,44 @@ function readOptionIndex(input: unknown, presetKey: string | null): number {
   const selectedPresetKeys = readSelectedPresetKeysFromInput(input);
   const index = selectedPresetKeys.findIndex((candidate) => candidate === presetKey);
   return index >= 0 ? index : 0;
+}
+
+function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, targetHeight: number): DesignDoc {
+  if (designDoc.width <= 0 || designDoc.height <= 0) {
+    return designDoc;
+  }
+
+  const scaleX = targetWidth / designDoc.width;
+  const scaleY = targetHeight / designDoc.height;
+  const textScale = Math.min(scaleX, scaleY);
+
+  const layers = designDoc.layers.map((layer) => {
+    if (layer.type === "text") {
+      return {
+        ...layer,
+        x: layer.x * scaleX,
+        y: layer.y * scaleY,
+        w: layer.w * scaleX,
+        h: layer.h * scaleY,
+        fontSize: Math.max(8, layer.fontSize * textScale)
+      };
+    }
+
+    return {
+      ...layer,
+      x: layer.x * scaleX,
+      y: layer.y * scaleY,
+      w: layer.w * scaleX,
+      h: layer.h * scaleY
+    };
+  });
+
+  return {
+    width: targetWidth,
+    height: targetHeight,
+    background: designDoc.background,
+    layers
+  };
 }
 
 export async function GET(request: Request, context: { params: Promise<{ id: string; generationId: string }> }) {
@@ -160,31 +224,37 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     return new Response("Generation not found", { status: 404, headers: noStoreHeaders() });
   }
 
-  // If output is missing or malformed, generate a deterministic fallback preview document.
-  const designDoc =
-    parseDesignDocFromOutput(generation.output) ||
-    buildFallbackDesignDoc({
-      output: null,
-      input: generation.input,
-      round: generation.round,
-      optionIndex: readOptionIndex(generation.input, generation.preset?.key || null),
-      project: {
-        seriesTitle: generation.project.series_title,
-        seriesSubtitle: generation.project.series_subtitle,
-        scripturePassages: generation.project.scripture_passages,
-        seriesDescription: generation.project.series_description,
-        logoPath: generation.project.brandKit?.logoPath || null,
-        palette: parsePaletteJson(generation.project.brandKit?.paletteJson)
-      }
-    });
-
-  const svg = await buildFinalSvg(designDoc);
   const { width, height } = SHAPE_DIMENSIONS[shape];
+  const shapedDesignDoc = parseDesignDocByShapeFromOutput(generation.output, shape);
+  const outputDesignDoc = parseDesignDocFromOutput(generation.output);
+  const sourceDesignDoc =
+    shapedDesignDoc ||
+    (outputDesignDoc ? adaptDesignDocToDimensions(outputDesignDoc, width, height) : null) ||
+    adaptDesignDocToDimensions(
+      buildFallbackDesignDoc({
+        output: generation.output,
+        input: generation.input,
+        round: generation.round,
+        optionIndex: readOptionIndex(generation.input, generation.preset?.key || null),
+        project: {
+          seriesTitle: generation.project.series_title,
+          seriesSubtitle: generation.project.series_subtitle,
+          scripturePassages: generation.project.scripture_passages,
+          seriesDescription: generation.project.series_description,
+          logoPath: generation.project.brandKit?.logoPath || null,
+          palette: parsePaletteJson(generation.project.brandKit?.paletteJson)
+        }
+      }),
+      width,
+      height
+    );
+
+  const svg = await buildFinalSvg(sourceDesignDoc);
   const pngBuffer = await sharp(Buffer.from(svg))
     .resize({
       width,
       height,
-      fit: "cover",
+      fit: "fill",
       position: "center"
     })
     .png()

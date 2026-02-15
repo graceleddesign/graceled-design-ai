@@ -1,8 +1,12 @@
+import { notFound } from "next/navigation";
 import { requireSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
 export default async function AdminPresetsPage() {
   const session = await requireSession();
+  if (session.role !== "OWNER" && session.role !== "ADMIN") {
+    notFound();
+  }
 
   const presets = await prisma.preset.findMany({
     where: {
