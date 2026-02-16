@@ -471,7 +471,7 @@ async function createAiBackgroundAssetsForPlannedGenerations(params: {
     return;
   }
 
-  const quality = normalizeAiImageQuality(process.env.AI_IMAGE_QUALITY?.trim() || process.env.OPENAI_IMAGE_QUALITY?.trim());
+  const quality = normalizeAiImageQuality(process.env.AI_IMAGE_QUALITY?.trim());
   const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
 
   for (const plannedGeneration of params.plannedGenerations) {

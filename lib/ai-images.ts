@@ -6,6 +6,12 @@ import OpenAI from "openai";
 
 export type AiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
 export type AiImageQuality = "low" | "medium" | "high" | "auto";
+type BackgroundProjectContext = {
+  seriesTitle: string;
+  seriesSubtitle: string | null;
+  scripturePassages: string | null;
+  seriesDescription: string | null;
+};
 
 let openAiClient: OpenAI | null = null;
 
@@ -30,12 +36,7 @@ function paletteHint(palette: string[]): string {
   return `Use this brand palette subtly: ${palette.join(", ")}.`;
 }
 
-function projectHints(project: {
-  seriesTitle: string;
-  seriesSubtitle: string | null;
-  scripturePassages: string | null;
-  seriesDescription: string | null;
-}): string {
+function projectHints(project: BackgroundProjectContext): string {
   const hints = [project.seriesTitle, project.seriesSubtitle, project.scripturePassages, project.seriesDescription]
     .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
     .join(" | ");
@@ -43,14 +44,22 @@ function projectHints(project: {
   return hints ? `Theme inspiration: ${hints}.` : "Theme inspiration: modern church sermon series.";
 }
 
+const PRESET_STYLE_BY_KEY: Record<string, string[]> = {
+  type_clean_min_v1: [
+    "Style: premium minimal editorial background.",
+    "Include subtle paper texture, one subtle geometric accent, and generous negative space.",
+    "Mood: modern church sermon series, polished and calm."
+  ]
+};
+
+const DEFAULT_STYLE_INSTRUCTIONS = [
+  "Style: premium modern editorial background with restrained geometric structure and negative space.",
+  "Mood: polished and calm."
+];
+
 export function buildBackgroundPrompt(params: {
   presetKey: string;
-  project: {
-    seriesTitle: string;
-    seriesSubtitle: string | null;
-    scripturePassages: string | null;
-    seriesDescription: string | null;
-  };
+  project: BackgroundProjectContext;
   palette: string[];
 }): string {
   const baseInstructions = [
@@ -58,21 +67,11 @@ export function buildBackgroundPrompt(params: {
     "Do not render text overlays.",
     "No text, letters, numbers, logos, watermarks, or word-like symbols."
   ];
-
-  if (params.presetKey === "type_clean_min_v1") {
-    return [
-      ...baseInstructions,
-      "Style: premium minimal editorial background.",
-      "Include subtle paper texture, one subtle geometric accent, and generous negative space.",
-      "Mood: modern church sermon series, polished and calm.",
-      paletteHint(params.palette),
-      projectHints(params.project)
-    ].join(" ");
-  }
+  const styleInstructions = PRESET_STYLE_BY_KEY[params.presetKey] || DEFAULT_STYLE_INSTRUCTIONS;
 
   return [
     ...baseInstructions,
-    "Style: premium modern editorial background with restrained geometric structure and negative space.",
+    ...styleInstructions,
     paletteHint(params.palette),
     projectHints(params.project)
   ].join(" ");
