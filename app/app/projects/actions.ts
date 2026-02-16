@@ -6,19 +6,14 @@ import path from "path";
 import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import sharp from "sharp";
 import { z } from "zod";
-import {
-  buildBackgroundPrompt,
-  generateBackgroundPng,
-  normalizeAiImageQuality,
-  type AiImageSize,
-  writeUpload
-} from "@/lib/ai-images";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { generatePngFromPrompt } from "@/lib/openai-image";
 import { optionLabel } from "@/lib/option-label";
+import { buildBackgroundPrompt } from "@/lib/preset-prompts";
 import { prisma } from "@/lib/prisma";
-import { buildTemplateDesignDoc, type TemplateShape } from "@/lib/templates";
 
 export type ProjectActionState = {
   error?: string;
@@ -64,46 +59,21 @@ const generateRoundTwoSchema = z.object({
   temperature: z.coerce.number().int().min(0).max(100)
 });
 const MIN_ROUND_ONE_PRESETS = 3;
-const PREVIEW_SHAPES: readonly TemplateShape[] = ["square", "wide", "tall"];
-const PREVIEW_DIMENSIONS: Record<TemplateShape, { width: number; height: number }> = {
+const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
+type PreviewShape = (typeof PREVIEW_SHAPES)[number];
+type PreviewAssetSlot = "square_main" | "widescreen_main" | "vertical_main";
+
+const PREVIEW_DIMENSIONS: Record<PreviewShape, { width: number; height: number }> = {
   square: { width: 1080, height: 1080 },
   wide: { width: 1920, height: 1080 },
   tall: { width: 1080, height: 1920 }
 };
-const AI_SUPPORTED_PRESET_KEYS = new Set(["type_clean_min_v1"]);
-const AI_PREVIEW_VARIANTS: Array<{
-  shape: TemplateShape;
-  slot: "square_main" | "widescreen_main" | "vertical_main";
-  fileSuffix: "square" | "wide" | "tall";
-  size: AiImageSize;
-  width: number;
-  height: number;
-}> = [
-  {
-    shape: "square",
-    slot: "square_main",
-    fileSuffix: "square",
-    size: "1024x1024",
-    width: 1024,
-    height: 1024
-  },
-  {
-    shape: "wide",
-    slot: "widescreen_main",
-    fileSuffix: "wide",
-    size: "1536x1024",
-    width: 1536,
-    height: 1024
-  },
-  {
-    shape: "tall",
-    slot: "vertical_main",
-    fileSuffix: "tall",
-    size: "1024x1536",
-    width: 1024,
-    height: 1536
-  }
-];
+const PREVIEW_ASSET_SLOTS: readonly PreviewAssetSlot[] = ["square_main", "widescreen_main", "vertical_main"];
+const PREVIEW_ASSET_DIMENSIONS: Record<PreviewAssetSlot, { width: number; height: number }> = {
+  square_main: { width: 1080, height: 1080 },
+  widescreen_main: { width: 1920, height: 1080 },
+  vertical_main: { width: 1080, height: 1920 }
+};
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -207,32 +177,6 @@ function parsePaletteJson(raw: string): string[] {
   }
 }
 
-function isAiBackgroundPresetKey(presetKey: string): boolean {
-  return AI_SUPPORTED_PRESET_KEYS.has(presetKey);
-}
-
-function toPublicAssetUrl(filePath: string): string {
-  const trimmed = filePath.trim().replace(/^\/+/, "");
-  return `/${trimmed}`;
-}
-
-function addBackgroundImageLayer(designDoc: DesignDoc, backgroundUrl: string): DesignDoc {
-  return {
-    ...designDoc,
-    layers: [
-      {
-        type: "image",
-        x: 0,
-        y: 0,
-        w: designDoc.width,
-        h: designDoc.height,
-        src: backgroundUrl
-      },
-      ...designDoc.layers
-    ]
-  };
-}
-
 function getUniqueStrings(values: readonly unknown[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -278,7 +222,7 @@ type GenerationProjectContext = {
   } | null;
 };
 
-type BuildGenerationDraftParams = {
+type BuildGenerationOutputParams = {
   projectId: string;
   presetKey: string;
   project: GenerationProjectContext;
@@ -287,13 +231,16 @@ type BuildGenerationDraftParams = {
   optionIndex: number;
 };
 
-type GenerationDraft = {
-  output: {
-    designDoc: DesignDoc;
-    designDocByShape: Record<TemplateShape, DesignDoc>;
-    notes: string;
+type GenerationOutputPayload = {
+  designDoc: DesignDoc;
+  designDocByShape: Record<PreviewShape, DesignDoc>;
+  notes: string;
+  promptUsed?: string;
+  preview?: {
+    square_main: string;
+    widescreen_main: string;
+    vertical_main: string;
   };
-  designDocByShape: Record<TemplateShape, DesignDoc>;
 };
 
 function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, targetHeight: number): DesignDoc {
@@ -334,25 +281,9 @@ function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, t
   };
 }
 
-function buildGenerationDraft(params: BuildGenerationDraftParams): GenerationDraft {
+function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): GenerationOutputPayload {
   const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-  const seed = `${params.projectId}|${params.presetKey}|${params.round}|${params.optionIndex}`;
-  const templateParams = {
-    presetKey: params.presetKey,
-    optionIndex: params.optionIndex,
-    round: params.round,
-    seed,
-    project: {
-      title: params.project.series_title,
-      subtitle: params.project.series_subtitle,
-      passage: params.project.scripture_passages,
-      description: params.project.series_description
-    },
-    brand: {
-      palette,
-      logoPath: params.project.brandKit?.logoPath || null
-    }
-  } as const;
+
   const fallbackDesignDoc = buildFallbackDesignDoc({
     output: null,
     input: params.input,
@@ -367,21 +298,9 @@ function buildGenerationDraft(params: BuildGenerationDraftParams): GenerationDra
       palette
     }
   });
-  let usedFallback = false;
-  const designDocByShape = {} as Record<TemplateShape, DesignDoc>;
 
+  const designDocByShape = {} as Record<PreviewShape, DesignDoc>;
   for (const shape of PREVIEW_SHAPES) {
-    try {
-      const templateDesignDoc = buildTemplateDesignDoc({ ...templateParams, shape });
-      if (templateDesignDoc) {
-        designDocByShape[shape] = templateDesignDoc;
-        continue;
-      }
-    } catch {
-      // Falls back to normalized fallback layout.
-    }
-
-    usedFallback = true;
     const shapeDimensions = PREVIEW_DIMENSIONS[shape];
     designDocByShape[shape] = adaptDesignDocToDimensions(
       fallbackDesignDoc,
@@ -391,14 +310,9 @@ function buildGenerationDraft(params: BuildGenerationDraftParams): GenerationDra
   }
 
   return {
-    output: {
-      designDoc: designDocByShape.square,
-      designDocByShape,
-      notes: usedFallback
-        ? `Template+fallback layout blend: ${params.presetKey} | variant ${params.optionIndex % 3}`
-        : `Template layout: ${params.presetKey} | variant ${params.optionIndex % 3}`
-    },
-    designDocByShape
+    designDoc: designDocByShape.square,
+    designDocByShape,
+    notes: `Fallback layout: ${params.presetKey} | variant ${params.optionIndex % 3}`
   };
 }
 
@@ -458,29 +372,111 @@ type PlannedGeneration = {
     id: string;
     key: string;
   };
+  round: number;
   optionIndex: number;
-  draft: GenerationDraft;
+  fallbackOutput: GenerationOutputPayload;
 };
 
-async function createAiBackgroundAssetsForPlannedGenerations(params: {
+function isOpenAiPreviewGenerationEnabled(): boolean {
+  const raw = process.env.OPENAI_IMAGE_PREVIEWS_ENABLED?.trim().toLowerCase();
+  if (!raw) {
+    return true;
+  }
+
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
+async function writeGenerationPreviewFiles(params: {
+  generationId: string;
+  squarePng: Buffer;
+}): Promise<{
+  squarePath: string;
+  widescreenPath: string;
+  verticalPath: string;
+}> {
+  const uploadDirectory = path.join(process.cwd(), "public", "uploads");
+  await mkdir(uploadDirectory, { recursive: true });
+
+  const squareFileName = `${params.generationId}-square.png`;
+  const wideFileName = `${params.generationId}-wide.png`;
+  const tallFileName = `${params.generationId}-tall.png`;
+
+  const squarePng = await sharp(params.squarePng).png().toBuffer();
+  const widePng = await sharp(squarePng)
+    .resize({
+      width: PREVIEW_ASSET_DIMENSIONS.widescreen_main.width,
+      height: PREVIEW_ASSET_DIMENSIONS.widescreen_main.height,
+      fit: "cover",
+      position: "center"
+    })
+    .png()
+    .toBuffer();
+  const tallPng = await sharp(squarePng)
+    .resize({
+      width: PREVIEW_ASSET_DIMENSIONS.vertical_main.width,
+      height: PREVIEW_ASSET_DIMENSIONS.vertical_main.height,
+      fit: "cover",
+      position: "center"
+    })
+    .png()
+    .toBuffer();
+
+  await Promise.all([
+    writeFile(path.join(uploadDirectory, squareFileName), squarePng),
+    writeFile(path.join(uploadDirectory, wideFileName), widePng),
+    writeFile(path.join(uploadDirectory, tallFileName), tallPng)
+  ]);
+
+  return {
+    squarePath: `/uploads/${squareFileName}`,
+    widescreenPath: `/uploads/${wideFileName}`,
+    verticalPath: `/uploads/${tallFileName}`
+  };
+}
+
+async function completeGenerationWithFallbackOutput(params: {
+  generationId: string;
+  output: GenerationOutputPayload;
+}): Promise<void> {
+  await prisma.$transaction([
+    prisma.asset.deleteMany({
+      where: {
+        generationId: params.generationId,
+        slot: {
+          in: [...PREVIEW_ASSET_SLOTS, "square", "wide", "tall"]
+        }
+      }
+    }),
+    prisma.generation.update({
+      where: { id: params.generationId },
+      data: {
+        status: "COMPLETED",
+        output: params.output as Prisma.InputJsonValue
+      }
+    })
+  ]);
+}
+
+async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   project: GenerationProjectContext & { id: string };
   plannedGenerations: PlannedGeneration[];
 }): Promise<void> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) {
-    return;
-  }
-
-  const quality = normalizeAiImageQuality(process.env.AI_IMAGE_QUALITY?.trim());
-  const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
+  const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
 
   for (const plannedGeneration of params.plannedGenerations) {
-    if (!isAiBackgroundPresetKey(plannedGeneration.preset.key)) {
+    const fallbackOutput = plannedGeneration.fallbackOutput;
+
+    if (!openAiEnabled) {
+      await completeGenerationWithFallbackOutput({
+        generationId: plannedGeneration.id,
+        output: fallbackOutput
+      });
       continue;
     }
 
     try {
-      const prompt = buildBackgroundPrompt({
+      const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
+      const promptUsed = buildBackgroundPrompt({
         presetKey: plannedGeneration.preset.key,
         project: {
           seriesTitle: params.project.series_title,
@@ -488,62 +484,51 @@ async function createAiBackgroundAssetsForPlannedGenerations(params: {
           scripturePassages: params.project.scripture_passages,
           seriesDescription: params.project.series_description
         },
-        palette
+        palette,
+        seed: plannedGeneration.id
       });
 
-      const preview = {
-        square_main: "",
-        widescreen_main: "",
-        vertical_main: ""
-      };
-      const filenames: string[] = [];
-      const slots = AI_PREVIEW_VARIANTS.map((variant) => variant.slot);
-      const assetRows: Prisma.AssetCreateManyInput[] = [];
-      const designDocByShape: Record<TemplateShape, DesignDoc> = {
-        square: plannedGeneration.draft.designDocByShape.square,
-        wide: plannedGeneration.draft.designDocByShape.wide,
-        tall: plannedGeneration.draft.designDocByShape.tall
-      };
+      const squarePng = await generatePngFromPrompt({
+        prompt: promptUsed,
+        size: "1024x1024"
+      });
+      const generatedAssets = await writeGenerationPreviewFiles({
+        generationId: plannedGeneration.id,
+        squarePng
+      });
 
-      for (const variant of AI_PREVIEW_VARIANTS) {
-        const filename = `${plannedGeneration.id}-${variant.fileSuffix}.png`;
-        const backgroundPng = await generateBackgroundPng({
-          prompt,
-          size: variant.size,
-          quality
-        });
-        const { filePath } = await writeUpload(backgroundPng, filename);
-        const publicUrl = toPublicAssetUrl(filePath);
-
-        filenames.push(filename);
-        designDocByShape[variant.shape] = addBackgroundImageLayer(designDocByShape[variant.shape], publicUrl);
-
-        if (variant.slot === "square_main") {
-          preview.square_main = publicUrl;
-        } else if (variant.slot === "widescreen_main") {
-          preview.widescreen_main = publicUrl;
-        } else {
-          preview.vertical_main = publicUrl;
+      const assetRows: Prisma.AssetCreateManyInput[] = PREVIEW_ASSET_SLOTS.map((slot) => ({
+        projectId: params.project.id,
+        generationId: plannedGeneration.id,
+        kind: "IMAGE",
+        slot,
+        file_path:
+          slot === "square_main"
+            ? generatedAssets.squarePath
+            : slot === "widescreen_main"
+              ? generatedAssets.widescreenPath
+              : generatedAssets.verticalPath,
+        mime_type: "image/png",
+        width: PREVIEW_ASSET_DIMENSIONS[slot].width,
+        height: PREVIEW_ASSET_DIMENSIONS[slot].height
+      }));
+      const completedOutput: GenerationOutputPayload = {
+        ...fallbackOutput,
+        notes: "openai_background_generated",
+        promptUsed,
+        preview: {
+          square_main: generatedAssets.squarePath,
+          widescreen_main: generatedAssets.widescreenPath,
+          vertical_main: generatedAssets.verticalPath
         }
-
-        assetRows.push({
-          projectId: params.project.id,
-          generationId: plannedGeneration.id,
-          kind: "IMAGE",
-          slot: variant.slot,
-          file_path: filePath,
-          mime_type: "image/png",
-          width: variant.width,
-          height: variant.height
-        });
-      }
+      };
 
       await prisma.$transaction([
         prisma.asset.deleteMany({
           where: {
             generationId: plannedGeneration.id,
             slot: {
-              in: slots
+              in: [...PREVIEW_ASSET_SLOTS, "square", "wide", "tall"]
             }
           }
         }),
@@ -556,24 +541,20 @@ async function createAiBackgroundAssetsForPlannedGenerations(params: {
           },
           data: {
             status: "COMPLETED",
-            output: {
-              ...plannedGeneration.draft.output,
-              designDoc: designDocByShape.square,
-              designDocByShape,
-              preview
-            } as Prisma.InputJsonValue
+            output: completedOutput as Prisma.InputJsonValue
           }
         })
       ]);
-
-      console.log(
-        `[ai-backgrounds] generation ${plannedGeneration.id}: generated 3 images (${filenames.join(", ")})`
-      );
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
       console.error(
-        `AI background generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}).`,
-        error
+        `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}). Falling back to layout-only output. ${message}`
       );
+
+      await completeGenerationWithFallbackOutput({
+        generationId: plannedGeneration.id,
+        output: fallbackOutput
+      });
     }
   }
 }
@@ -788,8 +769,9 @@ export async function generateRoundOneAction(
     return {
       id: generationId,
       preset,
+      round: 1,
       optionIndex: index,
-      draft: buildGenerationDraft({
+      fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
         presetKey: preset.key,
         project,
@@ -801,22 +783,21 @@ export async function generateRoundOneAction(
   });
 
   await prisma.$transaction(
-    plannedGenerations.map(({ id: generationId, preset, draft }) =>
+    plannedGenerations.map(({ id: generationId, preset }) =>
       prisma.generation.create({
         data: {
           id: generationId,
           projectId: project.id,
           presetId: preset.id,
           round: 1,
-          status: "COMPLETED",
-          input,
-          output: draft.output
+          status: "RUNNING",
+          input
         }
       })
     )
   );
 
-  await createAiBackgroundAssetsForPlannedGenerations({
+  await createOpenAiPreviewAssetsForPlannedGenerations({
     project,
     plannedGenerations
   });
@@ -925,8 +906,9 @@ export async function generateRoundTwoAction(
     return {
       id: generationId,
       preset,
+      round,
       optionIndex: index,
-      draft: buildGenerationDraft({
+      fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
         presetKey: preset.key,
         project,
@@ -938,22 +920,21 @@ export async function generateRoundTwoAction(
   });
 
   await prisma.$transaction(
-    plannedGenerations.map(({ id: generationId, preset, draft }) =>
+    plannedGenerations.map(({ id: generationId, preset }) =>
       prisma.generation.create({
         data: {
           id: generationId,
           projectId: project.id,
           presetId: preset.id,
           round,
-          status: "COMPLETED",
-          input,
-          output: draft.output
+          status: "RUNNING",
+          input
         }
       })
     )
   );
 
-  await createAiBackgroundAssetsForPlannedGenerations({
+  await createOpenAiPreviewAssetsForPlannedGenerations({
     project,
     plannedGenerations
   });
