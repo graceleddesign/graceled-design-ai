@@ -9,3 +9,6 @@ prisma/dev.db-journal
 
 # Runtime uploads
 public/uploads/
+public/style_library/*
+!public/style_library/README.md
+reference/

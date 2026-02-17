@@ -122,6 +122,21 @@ npm run db:seed
 npm run dev
 ```
 
+## Owned Reference Library (Clean Minimal)
+
+Place owned sermon-series style references here:
+
+- `reference/sermon-series/` (jpg/jpeg/png/webp)
+
+Then build the reference index:
+
+```bash
+node scripts/index-reference-library.ts
+# or: npm run refs:index
+```
+
+This writes `reference/index.json`, which `type_clean_min_v1` uses to sample clean/minimal references and build style-collage guidance for background generation.
+
 ## Common Commands
 
 ```bash
@@ -156,3 +171,4 @@ npm run prisma:migrate
 - `/app/*` routes are session-protected via `requireSession()` in the authenticated layout.
 - Renderer/generation engine is intentionally not implemented yet.
 - Current focus is working auth/org flow, project setup UI, and core schema.
+- Generated preview images are written to `/public/uploads` for local development; use object storage (for example S3/R2/GCS) in real deployments.

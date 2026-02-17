@@ -10,10 +10,18 @@ import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { buildFinalSvg } from "@/lib/final-deliverables";
 import { generatePngFromPrompt } from "@/lib/openai-image";
 import { optionLabel } from "@/lib/option-label";
-import { buildBackgroundPrompt } from "@/lib/preset-prompts";
 import { prisma } from "@/lib/prisma";
+import { buildReferenceCollageBuffer, pickReferences } from "@/lib/reference-library";
+import { listStyleRefs, pickStyleRefsForOptions, type StyleRef } from "@/lib/style-library";
+import {
+  buildCleanMinimalDesignDoc,
+  buildCleanMinimalOverlaySvg,
+  chooseTextPaletteForBackground,
+  computeCleanMinimalLayout
+} from "@/lib/templates/type-clean-min";
 
 export type ProjectActionState = {
   error?: string;
@@ -56,24 +64,49 @@ const generateRoundTwoSchema = z.object({
   feedbackText: z.string().trim().max(2000).optional(),
   emphasis: z.enum(["title", "quote"]),
   expressiveness: z.coerce.number().int().min(0).max(100),
-  temperature: z.coerce.number().int().min(0).max(100)
+  temperature: z.coerce.number().int().min(0).max(100),
+  styleDirection: z.enum(["option_a", "option_b", "option_c", "different"]).default("different")
 });
-const MIN_ROUND_ONE_PRESETS = 3;
+const ROUND_OPTION_COUNT = 3;
+const INTERNAL_LAYOUT_PRESET_KEY = "type_clean_min_v1";
 const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
 type PreviewShape = (typeof PREVIEW_SHAPES)[number];
-type PreviewAssetSlot = "square_main" | "widescreen_main" | "vertical_main";
+type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
+type FinalAssetSlot = "square" | "wide" | "tall";
+type LegacyPreviewAssetSlot = "square_main" | "wide_main" | "tall_main" | "widescreen_main" | "vertical_main";
 
 const PREVIEW_DIMENSIONS: Record<PreviewShape, { width: number; height: number }> = {
   square: { width: 1080, height: 1080 },
   wide: { width: 1920, height: 1080 },
   tall: { width: 1080, height: 1920 }
 };
-const PREVIEW_ASSET_SLOTS: readonly PreviewAssetSlot[] = ["square_main", "widescreen_main", "vertical_main"];
-const PREVIEW_ASSET_DIMENSIONS: Record<PreviewAssetSlot, { width: number; height: number }> = {
-  square_main: { width: 1080, height: 1080 },
-  widescreen_main: { width: 1920, height: 1080 },
-  vertical_main: { width: 1080, height: 1920 }
+const FINAL_ASSET_SLOT_BY_SHAPE: Record<PreviewShape, FinalAssetSlot> = {
+  square: "square",
+  wide: "wide",
+  tall: "tall"
 };
+const LEGACY_PREVIEW_ASSET_SLOTS: readonly LegacyPreviewAssetSlot[] = [
+  "square_main",
+  "wide_main",
+  "tall_main",
+  "widescreen_main",
+  "vertical_main"
+];
+const BACKGROUND_ASSET_SLOT_BY_SHAPE: Record<PreviewShape, BackgroundAssetSlot> = {
+  square: "square_bg",
+  wide: "wide_bg",
+  tall: "tall_bg"
+};
+const OPENAI_IMAGE_SIZE_BY_SHAPE: Record<PreviewShape, "1024x1024" | "1536x1024" | "1024x1536"> = {
+  square: "1024x1024",
+  wide: "1536x1024",
+  tall: "1024x1536"
+};
+const PREVIEW_ASSET_SLOTS_TO_CLEAR: readonly string[] = [
+  ...LEGACY_PREVIEW_ASSET_SLOTS,
+  ...PREVIEW_SHAPES,
+  ...Object.values(BACKGROUND_ASSET_SLOT_BY_SHAPE)
+];
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -211,6 +244,117 @@ function readSelectedPresetKeysFromInput(input: unknown): string[] {
   return getUniqueStrings(selectedPresetKeys);
 }
 
+function truncateForPrompt(value: string | null | undefined, maxLength: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) {
+    return "";
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function optionStyleDirectionHint(optionIndex: number): string {
+  if (optionIndex === 0) {
+    return "Option A direction: classic clean minimal, thin rules, left-aligned composition, restrained accents.";
+  }
+  if (optionIndex === 1) {
+    return "Option B direction: minimal composition with one bolder accent shape (circle or line) used sparingly.";
+  }
+  return "Option C direction: minimal composition with stronger photo-like grain/texture emphasis while preserving clean negative space.";
+}
+
+function shapeCompositionHint(shape: PreviewShape): string {
+  if (shape === "wide") {
+    return "Reserve at least the left 55% as clean negative space for typography; keep art interest mostly to the right.";
+  }
+  if (shape === "tall") {
+    return "Reserve upper-middle area as clean negative space for typography; keep heavier art in the lower third.";
+  }
+  return "Reserve large left-center negative space for typography and keep accents subtle near edges.";
+}
+
+function readFeedbackRequest(input: unknown): string {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return "";
+  }
+
+  const feedback = (input as { feedback?: unknown }).feedback;
+  if (!feedback || typeof feedback !== "object" || Array.isArray(feedback)) {
+    return "";
+  }
+
+  const request = (feedback as { request?: unknown }).request;
+  return typeof request === "string" ? truncateForPrompt(request, 220) : "";
+}
+
+function buildCleanMinimalBackgroundPrompt(params: {
+  project: GenerationProjectContext;
+  palette: string[];
+  shape: PreviewShape;
+  generationId: string;
+  optionIndex: number;
+  feedbackRequest?: string;
+}): string {
+  const title = truncateForPrompt(params.project.series_title, 120);
+  const subtitle = truncateForPrompt(params.project.series_subtitle, 120);
+  const scripture = truncateForPrompt(params.project.scripture_passages, 140);
+  const description = truncateForPrompt(params.project.series_description, 280);
+  const paletteHint =
+    params.palette.length > 0
+      ? `Use restrained tones influenced by this palette: ${params.palette.join(", ")}.`
+      : "Use a neutral clean-minimal palette with soft whites, warm grays, slate, and one subtle accent.";
+
+  return [
+    "Create a premium sermon-series BACKGROUND only.",
+    "No text, no letters, no words, no logos, no watermark.",
+    "Clean minimal aesthetic: generous whitespace, subtle paper texture, disciplined geometric accents, calm editorial balance.",
+    shapeCompositionHint(params.shape),
+    optionStyleDirectionHint(params.optionIndex),
+    title ? `Series title context: ${title}.` : "",
+    subtitle ? `Series subtitle context: ${subtitle}.` : "",
+    scripture ? `Scripture context: ${scripture}.` : "",
+    description ? `Series description mood context: ${description}.` : "",
+    paletteHint,
+    params.feedbackRequest ? `Refinement cues: ${params.feedbackRequest}.` : "",
+    `Variation seed: ${params.generationId}-${params.shape}.`
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function toPngDataUrl(pngBuffer: Buffer): string {
+  return `data:image/png;base64,${pngBuffer.toString("base64")}`;
+}
+
+function readUsedStylePathsFromOutput(output: unknown): string[] {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return [];
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return [];
+  }
+
+  const paths = (meta as { usedStylePaths?: unknown }).usedStylePaths;
+  return Array.isArray(paths) ? getUniqueStrings(paths) : [];
+}
+
+function styleDirectionToOptionIndex(styleDirection: "option_a" | "option_b" | "option_c" | "different"): number | null {
+  if (styleDirection === "option_a") {
+    return 0;
+  }
+  if (styleDirection === "option_b") {
+    return 1;
+  }
+  if (styleDirection === "option_c") {
+    return 2;
+  }
+  return null;
+}
+
 type GenerationProjectContext = {
   series_title: string;
   series_subtitle: string | null;
@@ -229,6 +373,8 @@ type BuildGenerationOutputParams = {
   input: unknown;
   round: number;
   optionIndex: number;
+  styleRefs?: StyleRef[];
+  revisedPrompt?: string;
 };
 
 type GenerationOutputPayload = {
@@ -236,6 +382,11 @@ type GenerationOutputPayload = {
   designDocByShape: Record<PreviewShape, DesignDoc>;
   notes: string;
   promptUsed?: string;
+  meta: {
+    styleRefCount: number;
+    usedStylePaths: string[];
+    revisedPrompt?: string;
+  };
   preview?: {
     square_main: string;
     widescreen_main: string;
@@ -276,6 +427,7 @@ function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, t
   return {
     width: targetWidth,
     height: targetHeight,
+    backgroundImagePath: designDoc.backgroundImagePath,
     background: designDoc.background,
     layers
   };
@@ -284,35 +436,50 @@ function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, t
 function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): GenerationOutputPayload {
   const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
 
-  const fallbackDesignDoc = buildFallbackDesignDoc({
-    output: null,
-    input: params.input,
-    round: params.round,
-    optionIndex: params.optionIndex,
-    project: {
-      seriesTitle: params.project.series_title,
-      seriesSubtitle: params.project.series_subtitle,
-      scripturePassages: params.project.scripture_passages,
-      seriesDescription: params.project.series_description,
-      logoPath: params.project.brandKit?.logoPath || null,
-      palette
-    }
-  });
+  const buildDocForShape = (shape?: PreviewShape) =>
+    buildFallbackDesignDoc({
+      output: null,
+      input: params.input,
+      presetKey: params.presetKey,
+      shape,
+      round: params.round,
+      optionIndex: params.optionIndex,
+      project: {
+        seriesTitle: params.project.series_title,
+        seriesSubtitle: params.project.series_subtitle,
+        scripturePassages: params.project.scripture_passages,
+        seriesDescription: params.project.series_description,
+        logoPath: params.project.brandKit?.logoPath || null,
+        palette
+      }
+    });
 
   const designDocByShape = {} as Record<PreviewShape, DesignDoc>;
-  for (const shape of PREVIEW_SHAPES) {
-    const shapeDimensions = PREVIEW_DIMENSIONS[shape];
-    designDocByShape[shape] = adaptDesignDocToDimensions(
-      fallbackDesignDoc,
-      shapeDimensions.width,
-      shapeDimensions.height
-    );
+  if (params.presetKey === "type_clean_min_v1") {
+    for (const shape of PREVIEW_SHAPES) {
+      designDocByShape[shape] = buildDocForShape(shape);
+    }
+  } else {
+    const fallbackDesignDoc = buildDocForShape();
+    for (const shape of PREVIEW_SHAPES) {
+      const shapeDimensions = PREVIEW_DIMENSIONS[shape];
+      designDocByShape[shape] = adaptDesignDocToDimensions(
+        fallbackDesignDoc,
+        shapeDimensions.width,
+        shapeDimensions.height
+      );
+    }
   }
 
   return {
     designDoc: designDocByShape.square,
     designDocByShape,
-    notes: `Fallback layout: ${params.presetKey} | variant ${params.optionIndex % 3}`
+    notes: `Fallback layout: ${params.presetKey} | variant ${params.optionIndex % 3}`,
+    meta: {
+      styleRefCount: params.styleRefs?.length || 0,
+      usedStylePaths: (params.styleRefs || []).map((ref) => ref.path),
+      revisedPrompt: params.revisedPrompt
+    }
   };
 }
 
@@ -352,7 +519,7 @@ function buildGenerationInput(
     typographyDirection: "match_site" | "graceled_defaults";
     paletteJson: string;
   },
-  selectedPresetKeys: string[]
+  selectedPresetKeys: string[] = []
 ) {
   return {
     series_title: project.series_title,
@@ -366,14 +533,47 @@ function buildGenerationInput(
   };
 }
 
+async function findInternalLayoutPresetId(organizationId: string): Promise<string | null> {
+  const preset = await prisma.preset.findFirst({
+    where: {
+      key: INTERNAL_LAYOUT_PRESET_KEY,
+      enabled: true,
+      OR: [{ organizationId: null }, { organizationId }]
+    },
+    select: {
+      id: true
+    }
+  });
+
+  return preset?.id || null;
+}
+
+function normalizeStyleRefsForOptions(input: StyleRef[][], optionCount: number): StyleRef[][] {
+  return Array.from({ length: optionCount }, (_, optionIndex) => {
+    const refs = input[optionIndex] || [];
+    return refs.slice(0, 6);
+  });
+}
+
+async function loadStyleRefsByPaths(paths: string[]): Promise<StyleRef[]> {
+  const uniquePaths = getUniqueStrings(paths);
+  if (uniquePaths.length === 0) {
+    return [];
+  }
+
+  const allRefs = await listStyleRefs();
+  const byPath = new Map(allRefs.map((ref) => [ref.path, ref] as const));
+  return uniquePaths.map((item) => byPath.get(item)).filter((ref): ref is StyleRef => Boolean(ref)).slice(0, 6);
+}
+
 type PlannedGeneration = {
   id: string;
-  preset: {
-    id: string;
-    key: string;
-  };
+  presetId: string | null;
+  presetKey: string;
   round: number;
   optionIndex: number;
+  styleRefs: StyleRef[];
+  input: Prisma.InputJsonValue;
   fallbackOutput: GenerationOutputPayload;
 };
 
@@ -387,71 +587,129 @@ function isOpenAiPreviewGenerationEnabled(): boolean {
 }
 
 async function writeGenerationPreviewFiles(params: {
-  generationId: string;
-  squarePng: Buffer;
-}): Promise<{
-  squarePath: string;
-  widescreenPath: string;
-  verticalPath: string;
-}> {
+  fileName: string;
+  png: Buffer;
+}): Promise<string> {
   const uploadDirectory = path.join(process.cwd(), "public", "uploads");
   await mkdir(uploadDirectory, { recursive: true });
+  await writeFile(path.join(uploadDirectory, params.fileName), params.png);
+  return path.posix.join("uploads", params.fileName);
+}
 
-  const squareFileName = `${params.generationId}-square.png`;
-  const wideFileName = `${params.generationId}-wide.png`;
-  const tallFileName = `${params.generationId}-tall.png`;
-
-  const squarePng = await sharp(params.squarePng).png().toBuffer();
-  const widePng = await sharp(squarePng)
+async function normalizePngToShape(png: Buffer, shape: PreviewShape): Promise<Buffer> {
+  const dimensions = PREVIEW_DIMENSIONS[shape];
+  return sharp(png)
     .resize({
-      width: PREVIEW_ASSET_DIMENSIONS.widescreen_main.width,
-      height: PREVIEW_ASSET_DIMENSIONS.widescreen_main.height,
+      width: dimensions.width,
+      height: dimensions.height,
       fit: "cover",
       position: "center"
     })
     .png()
     .toBuffer();
-  const tallPng = await sharp(squarePng)
+}
+
+async function generateCleanMinimalBackgroundPng(params: {
+  prompt: string;
+  shape: PreviewShape;
+  referenceCollageDataUrl?: string;
+}): Promise<Buffer> {
+  const size = OPENAI_IMAGE_SIZE_BY_SHAPE[params.shape];
+
+  if (params.referenceCollageDataUrl) {
+    try {
+      return await generatePngFromPrompt({
+        prompt: params.prompt,
+        size,
+        references: [{ dataUrl: params.referenceCollageDataUrl }]
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
+      console.warn(`Reference-guided generation failed for ${params.shape}; retrying prompt-only. ${message}`);
+    }
+  }
+
+  return generatePngFromPrompt({
+    prompt: params.prompt,
+    size
+  });
+}
+
+async function renderCompositedPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
+  const svg = await buildFinalSvg(designDoc);
+  return sharp(Buffer.from(svg))
     .resize({
-      width: PREVIEW_ASSET_DIMENSIONS.vertical_main.width,
-      height: PREVIEW_ASSET_DIMENSIONS.vertical_main.height,
-      fit: "cover",
+      width: designDoc.width,
+      height: designDoc.height,
+      fit: "fill",
       position: "center"
     })
     .png()
     .toBuffer();
-
-  await Promise.all([
-    writeFile(path.join(uploadDirectory, squareFileName), squarePng),
-    writeFile(path.join(uploadDirectory, wideFileName), widePng),
-    writeFile(path.join(uploadDirectory, tallFileName), tallPng)
-  ]);
-
-  return {
-    squarePath: `/uploads/${squareFileName}`,
-    widescreenPath: `/uploads/${wideFileName}`,
-    verticalPath: `/uploads/${tallFileName}`
-  };
 }
 
 async function completeGenerationWithFallbackOutput(params: {
+  projectId: string;
   generationId: string;
   output: GenerationOutputPayload;
 }): Promise<void> {
+  const designDocByShape = params.output.designDocByShape;
+  const [squarePng, widePng, tallPng] = await Promise.all([
+    renderCompositedPreviewPng(designDocByShape.square),
+    renderCompositedPreviewPng(designDocByShape.wide),
+    renderCompositedPreviewPng(designDocByShape.tall)
+  ]);
+  const [squarePath, widePath, tallPath] = await Promise.all([
+    writeGenerationPreviewFiles({
+      fileName: `${params.generationId}-square.png`,
+      png: squarePng
+    }),
+    writeGenerationPreviewFiles({
+      fileName: `${params.generationId}-wide.png`,
+      png: widePng
+    }),
+    writeGenerationPreviewFiles({
+      fileName: `${params.generationId}-tall.png`,
+      png: tallPng
+    })
+  ]);
+  const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
+    projectId: params.projectId,
+    generationId: params.generationId,
+    kind: "IMAGE",
+    slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
+    file_path: shape === "square" ? squarePath : shape === "wide" ? widePath : tallPath,
+    mime_type: "image/png",
+    width: PREVIEW_DIMENSIONS[shape].width,
+    height: PREVIEW_DIMENSIONS[shape].height
+  }));
+
+  const completedOutput: GenerationOutputPayload = {
+    ...params.output,
+    preview: {
+      square_main: squarePath,
+      widescreen_main: widePath,
+      vertical_main: tallPath
+    }
+  };
+
   await prisma.$transaction([
     prisma.asset.deleteMany({
       where: {
         generationId: params.generationId,
         slot: {
-          in: [...PREVIEW_ASSET_SLOTS, "square", "wide", "tall"]
+          in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
         }
       }
+    }),
+    prisma.asset.createMany({
+      data: finalAssetRows
     }),
     prisma.generation.update({
       where: { id: params.generationId },
       data: {
         status: "COMPLETED",
-        output: params.output as Prisma.InputJsonValue
+        output: completedOutput as Prisma.InputJsonValue
       }
     })
   ]);
@@ -468,6 +726,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
     if (!openAiEnabled) {
       await completeGenerationWithFallbackOutput({
+        projectId: params.project.id,
         generationId: plannedGeneration.id,
         output: fallbackOutput
       });
@@ -476,50 +735,140 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
     try {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-      const promptUsed = buildBackgroundPrompt({
-        presetKey: plannedGeneration.preset.key,
-        project: {
-          seriesTitle: params.project.series_title,
-          seriesSubtitle: params.project.series_subtitle,
-          scripturePassages: params.project.scripture_passages,
-          seriesDescription: params.project.series_description
-        },
-        palette,
-        seed: plannedGeneration.id
-      });
+      const feedbackRequest = readFeedbackRequest(plannedGeneration.input);
+      const content = {
+        title: params.project.series_title,
+        subtitle: params.project.series_subtitle,
+        passage: params.project.scripture_passages,
+        description: params.project.series_description
+      };
+      const pickedReferences = await pickReferences({ count: 4, mode: "clean-minimal" });
+      const usedReferencePaths = pickedReferences.map((item) => item.relativePath);
 
-      const squarePng = await generatePngFromPrompt({
-        prompt: promptUsed,
-        size: "1024x1024"
-      });
-      const generatedAssets = await writeGenerationPreviewFiles({
-        generationId: plannedGeneration.id,
-        squarePng
-      });
+      let collageReferenceDataUrl: string | undefined;
+      if (usedReferencePaths.length > 0) {
+        try {
+          const collageBuffer = await buildReferenceCollageBuffer(usedReferencePaths);
+          collageReferenceDataUrl = toPngDataUrl(collageBuffer);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown collage error";
+          console.warn(`Failed to build reference collage for generation ${plannedGeneration.id}. ${message}`);
+        }
+      }
 
-      const assetRows: Prisma.AssetCreateManyInput[] = PREVIEW_ASSET_SLOTS.map((slot) => ({
+      const shapeResults = await Promise.all(
+        PREVIEW_SHAPES.map(async (shape) => {
+          const prompt = buildCleanMinimalBackgroundPrompt({
+            project: params.project,
+            palette,
+            shape,
+            generationId: plannedGeneration.id,
+            optionIndex: plannedGeneration.optionIndex,
+            feedbackRequest
+          });
+
+          const backgroundSource = await generateCleanMinimalBackgroundPng({
+            prompt,
+            shape,
+            referenceCollageDataUrl: collageReferenceDataUrl
+          });
+          const backgroundPng = await normalizePngToShape(backgroundSource, shape);
+          const backgroundPath = await writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-${shape}-bg.png`,
+            png: backgroundPng
+          });
+
+          const dimensions = PREVIEW_DIMENSIONS[shape];
+          const layout = computeCleanMinimalLayout({
+            width: dimensions.width,
+            height: dimensions.height,
+            content
+          });
+          const textPalette = await chooseTextPaletteForBackground({
+            backgroundPng,
+            sampleRegion: layout.textRegion,
+            width: dimensions.width,
+            height: dimensions.height
+          });
+
+          const overlaySvg = buildCleanMinimalOverlaySvg({
+            width: dimensions.width,
+            height: dimensions.height,
+            content,
+            palette: textPalette
+          });
+          const finalPng = await sharp(backgroundPng)
+            .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
+            .png()
+            .toBuffer();
+
+          const finalPath = await writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-${shape}.png`,
+            png: finalPng
+          });
+
+          return {
+            shape,
+            prompt,
+            backgroundPath,
+            finalPath,
+            designDoc: buildCleanMinimalDesignDoc({
+              width: dimensions.width,
+              height: dimensions.height,
+              content,
+              palette: textPalette,
+              backgroundImagePath: backgroundPath
+            })
+          };
+        })
+      );
+
+      const promptUsed = shapeResults.map((result) => `${result.shape}: ${result.prompt}`).join("\n");
+      const byShape = Object.fromEntries(shapeResults.map((result) => [result.shape, result])) as Record<
+        PreviewShape,
+        (typeof shapeResults)[number]
+      >;
+      const designDocByShape: Record<PreviewShape, DesignDoc> = {
+        square: byShape.square.designDoc,
+        wide: byShape.wide.designDoc,
+        tall: byShape.tall.designDoc
+      };
+
+      const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
         projectId: params.project.id,
         generationId: plannedGeneration.id,
         kind: "IMAGE",
-        slot,
-        file_path:
-          slot === "square_main"
-            ? generatedAssets.squarePath
-            : slot === "widescreen_main"
-              ? generatedAssets.widescreenPath
-              : generatedAssets.verticalPath,
+        slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
+        file_path: byShape[shape].backgroundPath,
         mime_type: "image/png",
-        width: PREVIEW_ASSET_DIMENSIONS[slot].width,
-        height: PREVIEW_ASSET_DIMENSIONS[slot].height
+        width: PREVIEW_DIMENSIONS[shape].width,
+        height: PREVIEW_DIMENSIONS[shape].height
       }));
+      const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
+        projectId: params.project.id,
+        generationId: plannedGeneration.id,
+        kind: "IMAGE",
+        slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
+        file_path: byShape[shape].finalPath,
+        mime_type: "image/png",
+        width: PREVIEW_DIMENSIONS[shape].width,
+        height: PREVIEW_DIMENSIONS[shape].height
+      }));
+
       const completedOutput: GenerationOutputPayload = {
         ...fallbackOutput,
-        notes: "openai_background_generated",
+        designDoc: designDocByShape.square,
+        designDocByShape,
+        notes: "ai+clean-min-overlay",
         promptUsed,
+        meta: {
+          styleRefCount: usedReferencePaths.length,
+          usedStylePaths: usedReferencePaths
+        },
         preview: {
-          square_main: generatedAssets.squarePath,
-          widescreen_main: generatedAssets.widescreenPath,
-          vertical_main: generatedAssets.verticalPath
+          square_main: byShape.square.finalPath,
+          widescreen_main: byShape.wide.finalPath,
+          vertical_main: byShape.tall.finalPath
         }
       };
 
@@ -528,12 +877,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           where: {
             generationId: plannedGeneration.id,
             slot: {
-              in: [...PREVIEW_ASSET_SLOTS, "square", "wide", "tall"]
+              in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
             }
           }
         }),
         prisma.asset.createMany({
-          data: assetRows
+          data: [...backgroundAssetRows, ...finalAssetRows]
         }),
         prisma.generation.update({
           where: {
@@ -548,10 +897,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       console.error(
-        `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.preset.key}). Falling back to layout-only output. ${message}`
+        `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
       );
 
       await completeGenerationWithFallbackOutput({
+        projectId: params.project.id,
         generationId: plannedGeneration.id,
         output: fallbackOutput
       });
@@ -722,7 +1072,7 @@ export async function saveBrandKitAction(
 export async function generateRoundOneAction(
   projectId: string,
   _: GenerationActionState,
-  formData: FormData
+  _formData: FormData
 ): Promise<GenerationActionState> {
   const session = await requireSession();
 
@@ -735,63 +1085,44 @@ export async function generateRoundOneAction(
     return { error: "Set up the brand kit before generating directions." };
   }
 
-  const selectedPresetKeys = getUniqueStrings(formData.getAll("selectedPresetKeys"));
-  if (selectedPresetKeys.length < MIN_ROUND_ONE_PRESETS) {
-    return { error: `Select at least ${MIN_ROUND_ONE_PRESETS} preset lanes.` };
-  }
+  const presetId = await findInternalLayoutPresetId(session.organizationId);
+  const refsForOptions = normalizeStyleRefsForOptions(await pickStyleRefsForOptions(ROUND_OPTION_COUNT), ROUND_OPTION_COUNT);
+  const input = buildGenerationInput(project, project.brandKit);
 
-  const selectedPresets = await prisma.preset.findMany({
-    where: {
-      key: { in: selectedPresetKeys },
-      enabled: true,
-      OR: [{ organizationId: null }, { organizationId: session.organizationId }]
-    },
-    select: {
-      id: true,
-      key: true
-    }
-  });
-
-  const presetByKey = new Map(selectedPresets.map((preset) => [preset.key, preset] as const));
-  const orderedPresets = selectedPresetKeys
-    .map((key) => presetByKey.get(key))
-    .filter((preset): preset is { id: string; key: string } => Boolean(preset));
-
-  if (orderedPresets.length !== selectedPresetKeys.length) {
-    return { error: "One or more selected presets are unavailable." };
-  }
-
-  const input = buildGenerationInput(project, project.brandKit, selectedPresetKeys);
-
-  const plannedGenerations: PlannedGeneration[] = orderedPresets.map((preset, index) => {
+  const plannedGenerations: PlannedGeneration[] = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
     const generationId = randomUUID();
+    const styleRefs = refsForOptions[index] || [];
 
     return {
       id: generationId,
-      preset,
+      presetId,
+      presetKey: INTERNAL_LAYOUT_PRESET_KEY,
       round: 1,
       optionIndex: index,
+      styleRefs,
+      input: input as Prisma.InputJsonValue,
       fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
-        presetKey: preset.key,
+        presetKey: INTERNAL_LAYOUT_PRESET_KEY,
         project,
         input,
         round: 1,
-        optionIndex: index
+        optionIndex: index,
+        styleRefs
       })
     };
   });
 
   await prisma.$transaction(
-    plannedGenerations.map(({ id: generationId, preset }) =>
+    plannedGenerations.map(({ id: generationId, presetId: generationPresetId, input: generationInput }) =>
       prisma.generation.create({
         data: {
           id: generationId,
           projectId: project.id,
-          presetId: preset.id,
+          presetId: generationPresetId,
           round: 1,
           status: "RUNNING",
-          input
+          input: generationInput
         }
       })
     )
@@ -827,7 +1158,8 @@ export async function generateRoundTwoAction(
     feedbackText: formData.get("feedbackText") || undefined,
     emphasis: formData.get("emphasis"),
     expressiveness: formData.get("expressiveness"),
-    temperature: formData.get("temperature")
+    temperature: formData.get("temperature"),
+    styleDirection: formData.get("styleDirection") || "different"
   });
 
   if (!parsed.success) {
@@ -844,11 +1176,7 @@ export async function generateRoundTwoAction(
         select: {
           id: true,
           input: true,
-          preset: {
-            select: {
-              key: true
-            }
-          }
+          output: true
         }
       })
     : null;
@@ -857,78 +1185,80 @@ export async function generateRoundTwoAction(
     return { error: "Selected direction was not found for this project." };
   }
 
-  const availablePresets = await prisma.preset.findMany({
-    where: {
-      enabled: true,
-      OR: [{ organizationId: null }, { organizationId: session.organizationId }]
-    },
-    orderBy: [{ collection: "asc" }, { name: "asc" }],
-    select: {
-      id: true,
-      key: true
-    }
-  });
-
-  const availablePresetByKey = new Map(availablePresets.map((preset) => [preset.key, preset] as const));
-  const suggestedPresetKeys = getUniqueStrings([
-    chosenGeneration?.preset?.key,
-    ...readSelectedPresetKeysFromInput(chosenGeneration?.input).slice(0, 3),
-    ...availablePresets.map((preset) => preset.key)
-  ]);
-
-  const selectedPresets = suggestedPresetKeys
-    .map((key) => availablePresetByKey.get(key))
-    .filter((preset): preset is { id: string; key: string } => Boolean(preset))
-    .slice(0, 3);
-
-  if (selectedPresets.length < 3) {
-    return { error: "Need at least 3 enabled presets to generate this round." };
-  }
-
-  const selectedPresetKeys = selectedPresets.map((preset) => preset.key);
+  const presetId = await findInternalLayoutPresetId(session.organizationId);
   const input = {
-    ...buildGenerationInput(project, project.brandKit, selectedPresetKeys),
+    ...buildGenerationInput(project, project.brandKit),
     feedback: {
       sourceRound: parsed.data.currentRound,
       chosenGenerationId,
       request: parsed.data.feedbackText || "",
       emphasis: parsed.data.emphasis,
       expressiveness: parsed.data.expressiveness,
-      temperature: parsed.data.temperature
+      temperature: parsed.data.temperature,
+      styleDirection: parsed.data.styleDirection
     }
   };
 
   const round = parsed.data.currentRound + 1;
+  let refsForOptions = normalizeStyleRefsForOptions(await pickStyleRefsForOptions(ROUND_OPTION_COUNT), ROUND_OPTION_COUNT);
+  const selectedOptionIndex = styleDirectionToOptionIndex(parsed.data.styleDirection);
 
-  const plannedGenerations: PlannedGeneration[] = selectedPresets.map((preset, index) => {
+  if (selectedOptionIndex !== null) {
+    const currentRoundGenerations = await prisma.generation.findMany({
+      where: {
+        projectId: project.id,
+        round: parsed.data.currentRound
+      },
+      orderBy: {
+        createdAt: "asc"
+      },
+      select: {
+        output: true
+      }
+    });
+
+    const sourceOutput = currentRoundGenerations[selectedOptionIndex]?.output ?? chosenGeneration?.output ?? null;
+    const usedStylePaths = readUsedStylePathsFromOutput(sourceOutput);
+    const reusedRefs = await loadStyleRefsByPaths(usedStylePaths);
+    if (reusedRefs.length > 0) {
+      refsForOptions = Array.from({ length: ROUND_OPTION_COUNT }, () => reusedRefs);
+    }
+  }
+
+  const plannedGenerations: PlannedGeneration[] = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
     const generationId = randomUUID();
+    const styleRefs = refsForOptions[index] || [];
 
     return {
       id: generationId,
-      preset,
+      presetId,
+      presetKey: INTERNAL_LAYOUT_PRESET_KEY,
       round,
       optionIndex: index,
+      styleRefs,
+      input: input as Prisma.InputJsonValue,
       fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
-        presetKey: preset.key,
+        presetKey: INTERNAL_LAYOUT_PRESET_KEY,
         project,
         input,
         round,
-        optionIndex: index
+        optionIndex: index,
+        styleRefs
       })
     };
   });
 
   await prisma.$transaction(
-    plannedGenerations.map(({ id: generationId, preset }) =>
+    plannedGenerations.map(({ id: generationId, presetId: generationPresetId, input: generationInput }) =>
       prisma.generation.create({
         data: {
           id: generationId,
           projectId: project.id,
-          presetId: preset.id,
+          presetId: generationPresetId,
           round,
           status: "RUNNING",
-          input
+          input: generationInput
         }
       })
     )
