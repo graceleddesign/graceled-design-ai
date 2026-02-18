@@ -223,7 +223,9 @@ const PRESET_PROFILE_HINTS: Record<string, readonly string[]> = {
   slab_shadow: ["slab_robotoslab_manrope", "slab_arvo_space", "slab_robotoslab_condensed"],
   inline_outline: ["contrast_playfair_space", "contrast_fraunces_sora", "contrast_dmserif_manrope"],
   badge_stamp: ["editorial_sourceserif_manrope", "editorial_newsreader_grotesk", "editorial_sourceserif_sora"],
-  knockout_mask: ["condensed_oswald_source", "condensed_archivo_news", "grotesk_space_manrope"]
+  knockout_mask: ["slab_robotoslab_manrope", "slab_arvo_space", "slab_robotoslab_condensed"],
+  monument_overprint: ["contrast_playfair_space", "grotesk_space_manrope", "editorial_sourceserif_manrope"],
+  modern_condensed_monument: ["condensed_oswald_source", "condensed_archivo_news", "grotesk_manrope_serif"]
 };
 
 const STYLE_FAMILY_VIBE_ORDER: Record<StyleFamily, PairingVibe[]> = {
@@ -292,12 +294,16 @@ const FALLBACK_PROFILE: PairingProfile = {
   }
 };
 
-function escapeCssString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+function normalizeStackToken(token: string): string {
+  return token.trim().replace(/^['"]+|['"]+$/g, "").trim();
 }
 
-function quoteFamily(value: string): string {
-  return `'${escapeCssString(value)}'`;
+function unquoteStack(stack: string): string {
+  return stack
+    .split(",")
+    .map((token) => normalizeStackToken(token))
+    .filter((token) => Boolean(token))
+    .join(",");
 }
 
 function sanitizeFontId(id: string): FontId {
@@ -316,16 +322,17 @@ function stackWithFallback(primaryFamily: string | null, fallbackFamily: Curated
   const seen = new Set<string>();
   const parts: string[] = [];
   const pushToken = (token: string) => {
-    const normalized = token.replace(/^['"]+|['"]+$/g, "").trim().toLowerCase();
+    const normalizedRaw = normalizeStackToken(token);
+    const normalized = normalizedRaw.toLowerCase();
     if (!normalized || seen.has(normalized)) {
       return;
     }
     seen.add(normalized);
-    parts.push(token);
+    parts.push(normalizedRaw);
   };
 
   if (primaryFamily) {
-    pushToken(quoteFamily(primaryFamily));
+    pushToken(primaryFamily);
   }
 
   for (const token of buildCuratedFontFamilyStack(fallbackFamily).split(",")) {
@@ -438,7 +445,7 @@ function resolveSlotFont(params: { slot: "title" | "subtitle" | "accent"; reques
   if (!params.requestedId || !hasFontAssetId(params.requestedId)) {
     return {
       id: fallbackId,
-      family: buildCuratedFontFamilyStack(fallbackFamily)
+      family: unquoteStack(buildCuratedFontFamilyStack(fallbackFamily))
     };
   }
 
@@ -447,7 +454,7 @@ function resolveSlotFont(params: { slot: "title" | "subtitle" | "accent"; reques
   if (!asset) {
     return {
       id: fallbackId,
-      family: buildCuratedFontFamilyStack(fallbackFamily)
+      family: unquoteStack(buildCuratedFontFamilyStack(fallbackFamily))
     };
   }
 
@@ -493,12 +500,16 @@ export function getFontPairing(
   const recipeVibe = inferRecipeVibe(lockupRecipe);
   const preferredVibes = STYLE_FAMILY_VIBE_ORDER[styleFamily] || STYLE_FAMILY_VIBE_ORDER["clean-min"];
   const presetProfileHints = presetId ? PRESET_PROFILE_HINTS[presetId] || [] : [];
-  const candidates = sortedCandidateProfiles({
+  const scoredCandidates = sortedCandidateProfiles({
     presetVibe,
     recipeVibe,
     preferredVibes,
     presetProfileHints
   });
+  const hintedCandidates = presetProfileHints
+    .map((profileId) => PAIRING_PROFILES.find((profile) => profile.id === profileId))
+    .filter((profile): profile is PairingProfile => Boolean(profile));
+  const candidates = hintedCandidates.length > 0 ? hintedCandidates : scoredCandidates;
 
   const selected = candidates.length > 0 ? candidates[fnv1aHash(resolveSeed({
     styleFamily,
