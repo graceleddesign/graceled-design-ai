@@ -4,33 +4,6 @@ import { DesignDirectionsForm } from "@/components/design-directions-form";
 import { requireSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
-function readSelectedPresetKeysFromInput(input: unknown): string[] {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return [];
-  }
-
-  const selectedPresetKeys = (input as { selectedPresetKeys?: unknown }).selectedPresetKeys;
-  if (!Array.isArray(selectedPresetKeys)) {
-    return [];
-  }
-
-  const deduped: string[] = [];
-  for (const value of selectedPresetKeys) {
-    if (typeof value !== "string") {
-      continue;
-    }
-
-    const key = value.trim();
-    if (!key || deduped.includes(key)) {
-      continue;
-    }
-
-    deduped.push(key);
-  }
-
-  return deduped;
-}
-
 export default async function ProjectDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const session = await requireSession();
   const { id } = await params;
@@ -56,34 +29,6 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
   if (!project) {
     notFound();
   }
-
-  const latestRoundOneGeneration = await prisma.generation.findFirst({
-    where: {
-      projectId: project.id,
-      round: 1
-    },
-    orderBy: {
-      createdAt: "desc"
-    },
-    select: {
-      input: true
-    }
-  });
-
-  const presets = await prisma.preset.findMany({
-    where: {
-      enabled: true,
-      OR: [{ organizationId: null }, { organizationId: session.organizationId }]
-    },
-    orderBy: [{ collection: "asc" }, { name: "asc" }],
-    select: {
-      id: true,
-      key: true,
-      name: true,
-      subtitle: true,
-      collection: true
-    }
-  });
 
   return (
     <section className="space-y-6">
@@ -122,7 +67,7 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
         </div>
 
         <div>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Pipeline Status</h2>
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Design Status</h2>
           <ul className="mt-3 space-y-2 text-sm text-slate-700">
             <li>Brand kit: {project.brandKit ? "Configured" : "Not configured"}</li>
             {project.brandKit?.websiteUrl ? <li>Website: {project.brandKit.websiteUrl}</li> : null}
@@ -143,15 +88,10 @@ export default async function ProjectDetailPage({ params }: { params: Promise<{ 
               View Generations
             </Link>
           </div>
-          <p className="mt-4 text-sm text-slate-500">Stub generation flow is available. Final rendering is not implemented yet.</p>
         </div>
       </div>
 
-      <DesignDirectionsForm
-        projectId={project.id}
-        presets={presets}
-        initialSelectedPresetKeys={readSelectedPresetKeysFromInput(latestRoundOneGeneration?.input)}
-      />
+      <DesignDirectionsForm projectId={project.id} />
     </section>
   );
 }

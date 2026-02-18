@@ -1,4 +1,4 @@
-import { optionLabel } from "@/lib/option-label";
+import { buildOverlayDisplayContent } from "@/lib/overlay-lines";
 
 export type DesignTextAlign = "left" | "center" | "right";
 
@@ -49,13 +49,18 @@ export type DesignLayer = DesignTextLayer | DesignImageLayer | DesignShapeLayer;
 export type DesignDoc = {
   width: number;
   height: number;
+  backgroundImagePath?: string | null;
   background: DesignDocBackground;
   layers: DesignLayer[];
 };
 
+type DesignDocShape = "square" | "wide" | "tall";
+
 type BuildFinalDesignDocParams = {
   output: unknown;
   input: unknown;
+  presetKey?: string | null;
+  shape?: DesignDocShape;
   project: {
     seriesTitle: string;
     seriesSubtitle: string | null;
@@ -66,6 +71,7 @@ type BuildFinalDesignDocParams = {
   };
   round: number;
   optionIndex: number;
+  backgroundImagePath?: string | null;
 };
 
 function isRecord(input: unknown): input is Record<string, unknown> {
@@ -112,6 +118,28 @@ function normalizeColor(input: unknown, fallback: string): string {
 
   if (/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(trimmed)) {
     return trimmed.toUpperCase();
+  }
+
+  return fallback;
+}
+
+function normalizeShapePaint(input: unknown, fallback: string): string {
+  if (typeof input !== "string") {
+    return fallback;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  if (/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(trimmed)) {
+    return trimmed.toUpperCase();
+  }
+
+  const gradientMatch = /^url\(\s*#([a-zA-Z][\w-]*)\s*\)$/.exec(trimmed);
+  if (gradientMatch) {
+    return `url(#${gradientMatch[1]})`;
   }
 
   return fallback;
@@ -186,8 +214,8 @@ function normalizeShapeLayer(input: Record<string, unknown>): DesignShapeLayer {
     h: clampNumber(input.h, 200),
     rotation: normalizeRotation(input.rotation),
     shape: "rect",
-    fill: normalizeColor(input.fill, "#FFFFFF"),
-    stroke: normalizeColor(input.stroke, "#000000"),
+    fill: normalizeShapePaint(input.fill, "#FFFFFF"),
+    stroke: normalizeShapePaint(input.stroke, "#000000"),
     strokeWidth: clampNumber(input.strokeWidth, 0)
   };
 }
@@ -201,6 +229,13 @@ export function normalizeDesignDoc(input: unknown): DesignDoc | null {
   const height = clampNumber(input.height, 1080);
   const layersInput = Array.isArray(input.layers) ? input.layers : [];
   const background = isRecord(input.background) ? input.background : null;
+  const hasBackgroundImagePath = Object.prototype.hasOwnProperty.call(input, "backgroundImagePath");
+  const backgroundImagePath =
+    input.backgroundImagePath === null
+      ? null
+      : typeof input.backgroundImagePath === "string" && input.backgroundImagePath.trim()
+        ? input.backgroundImagePath.trim()
+        : undefined;
 
   const layers: DesignLayer[] = [];
 
@@ -235,7 +270,7 @@ export function normalizeDesignDoc(input: unknown): DesignDoc | null {
     return null;
   }
 
-  return {
+  const normalized: DesignDoc = {
     width,
     height,
     background: {
@@ -243,19 +278,12 @@ export function normalizeDesignDoc(input: unknown): DesignDoc | null {
     },
     layers
   };
-}
 
-function parseFeedbackText(input: unknown): string {
-  if (!isRecord(input)) {
-    return "";
+  if (hasBackgroundImagePath) {
+    normalized.backgroundImagePath = backgroundImagePath ?? null;
   }
 
-  const feedback = input.feedback;
-  if (!isRecord(feedback)) {
-    return "";
-  }
-
-  return typeof feedback.request === "string" ? feedback.request : "";
+  return normalized;
 }
 
 function parsePreviewAsset(output: unknown): string {
@@ -282,33 +310,97 @@ function normalizeLogoPath(logoPath: string | null): string | null {
   return logoPath.startsWith("/") ? logoPath : `/${logoPath}`;
 }
 
-export function buildFallbackDesignDoc(params: BuildFinalDesignDocParams): DesignDoc {
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function toWords(value: string): string[] {
+  const normalized = normalizeWhitespace(value);
+  return normalized ? normalized.split(" ") : [];
+}
+
+function wrapText(value: string, maxChars: number, maxLines: number): string {
+  const words = toWords(value);
+  if (words.length === 0) {
+    return "";
+  }
+
+  const lines: string[] = [];
+  let lineWords: string[] = [];
+
+  for (const word of words) {
+    const candidate = lineWords.length === 0 ? word : `${lineWords.join(" ")} ${word}`;
+    if (candidate.length <= maxChars || lineWords.length === 0) {
+      lineWords.push(word);
+      continue;
+    }
+
+    lines.push(lineWords.join(" "));
+    lineWords = [word];
+  }
+
+  if (lineWords.length > 0) {
+    lines.push(lineWords.join(" "));
+  }
+
+  if (lines.length <= maxLines) {
+    return lines.join("\n");
+  }
+
+  const clamped = lines.slice(0, maxLines);
+  const lastIndex = clamped.length - 1;
+  let lastLine = clamped[lastIndex];
+  while (lastLine.length > maxChars - 1 && lastLine.includes(" ")) {
+    lastLine = lastLine.slice(0, lastLine.lastIndexOf(" "));
+  }
+  clamped[lastIndex] = `${lastLine.replace(/[.,;:!?-]+$/, "")}…`;
+  return clamped.join("\n");
+}
+
+function shapeDimensions(shape: DesignDocShape): { width: number; height: number } {
+  if (shape === "square") {
+    return { width: 1080, height: 1080 };
+  }
+  if (shape === "tall") {
+    return { width: 1080, height: 1920 };
+  }
+  return { width: 1920, height: 1080 };
+}
+
+function buildDefaultFallbackDesignDoc(params: BuildFinalDesignDocParams): DesignDoc {
   const primary = normalizeColor(params.project.palette[0], "#0F172A");
   const accent = normalizeColor(params.project.palette[1], "#1E293B");
-  const panel = normalizeColor(params.project.palette[2], "#F8FAFC");
   const logoSrc = normalizeLogoPath(params.project.logoPath);
   const previewAsset = parsePreviewAsset(params.output);
-  const feedbackText = parseFeedbackText(params.input);
-
-  const bodyParts = [
-    params.project.seriesDescription,
-    params.project.scripturePassages,
-    feedbackText
-  ].filter((value): value is string => typeof value === "string" && Boolean(value.trim()));
-
-  const body = bodyParts.length > 0 ? bodyParts.join("\n\n") : "Approved final concept for production use.";
+  const displayContent = buildOverlayDisplayContent({
+    title: params.project.seriesTitle,
+    subtitle: params.project.seriesSubtitle,
+    scripturePassages: params.project.scripturePassages
+  });
+  const subtitle = displayContent.subtitle;
 
   const layers: DesignLayer[] = [
     {
       type: "shape",
-      x: 84,
-      y: 84,
-      w: 1752,
-      h: 912,
+      x: 0,
+      y: 0,
+      w: 1920,
+      h: 1080,
       shape: "rect",
-      fill: panel,
+      fill: "url(#scrim)",
+      stroke: "#000000",
+      strokeWidth: 0
+    },
+    {
+      type: "shape",
+      x: 140,
+      y: 142,
+      w: 260,
+      h: 2,
+      shape: "rect",
+      fill: accent,
       stroke: accent,
-      strokeWidth: 2
+      strokeWidth: 0
     },
     {
       type: "text",
@@ -316,43 +408,30 @@ export function buildFallbackDesignDoc(params: BuildFinalDesignDocParams): Desig
       y: 160,
       w: 980,
       h: 180,
-      text: params.project.seriesTitle,
+      text: displayContent.title,
       fontSize: 72,
       fontFamily: "Arial",
       fontWeight: 700,
       color: primary,
       align: "left"
-    },
-    {
+    }
+  ];
+
+  if (subtitle) {
+    layers.push({
       type: "text",
       x: 140,
       y: 340,
       w: 980,
       h: 90,
-      text:
-        params.project.seriesSubtitle && params.project.seriesSubtitle.trim()
-          ? params.project.seriesSubtitle
-          : `${optionLabel(params.optionIndex)} approved in round ${params.round}`,
+      text: subtitle,
       fontSize: 36,
       fontFamily: "Arial",
       fontWeight: 500,
       color: accent,
       align: "left"
-    },
-    {
-      type: "text",
-      x: 140,
-      y: 470,
-      w: 980,
-      h: 360,
-      text: body,
-      fontSize: 30,
-      fontFamily: "Arial",
-      fontWeight: 400,
-      color: "#1F2937",
-      align: "left"
-    }
-  ];
+    });
+  }
 
   if (logoSrc) {
     layers.push({
@@ -376,7 +455,7 @@ export function buildFallbackDesignDoc(params: BuildFinalDesignDocParams): Desig
     });
   }
 
-  return {
+  const designDoc: DesignDoc = {
     width: 1920,
     height: 1080,
     background: {
@@ -384,6 +463,172 @@ export function buildFallbackDesignDoc(params: BuildFinalDesignDocParams): Desig
     },
     layers
   };
+
+  if (typeof params.backgroundImagePath === "string" || params.backgroundImagePath === null) {
+    designDoc.backgroundImagePath = params.backgroundImagePath;
+  }
+
+  return designDoc;
+}
+
+function buildCleanMinimalFallbackDesignDoc(params: BuildFinalDesignDocParams): DesignDoc {
+  const shape = params.shape || "wide";
+  const { width, height } = shapeDimensions(shape);
+  const logoSrc = normalizeLogoPath(params.project.logoPath);
+  const displayContent = buildOverlayDisplayContent({
+    title: params.project.seriesTitle,
+    subtitle: params.project.seriesSubtitle,
+    scripturePassages: params.project.scripturePassages
+  });
+
+  const marginX = shape === "wide" ? 138 : shape === "square" ? 102 : 146;
+  const marginY = shape === "tall" ? 168 : 112;
+  const textX = shape === "tall" ? Math.round(width * 0.14) : marginX;
+  const textW = shape === "wide" ? Math.round(width * 0.42) : shape === "square" ? Math.round(width * 0.5) : Math.round(width * 0.72);
+
+  const titleText = wrapText(displayContent.title, shape === "wide" ? 16 : shape === "square" ? 13 : 14, 3);
+  const subtitleText = displayContent.subtitle
+    ? wrapText(normalizeWhitespace(displayContent.subtitle).toUpperCase(), shape === "wide" ? 32 : 24, 2)
+    : "";
+
+  const titleFontSize = shape === "wide" ? 136 : shape === "square" ? 108 : 122;
+  const subtitleFontSize = shape === "wide" ? 39 : shape === "square" ? 33 : 36;
+  const optionVariant = ((params.optionIndex % 3) + 3) % 3;
+  const accentColor = normalizeColor(params.project.palette[1], "#334155");
+  const softAccent = normalizeColor(params.project.palette[2], "#E2E8F0");
+
+  const titleLineCount = titleText ? titleText.split("\n").length : 1;
+  const subtitleLineCount = subtitleText ? subtitleText.split("\n").length : 0;
+
+  const layers: DesignLayer[] = [
+    {
+      type: "shape",
+      x: 0,
+      y: 0,
+      w: width,
+      h: height,
+      shape: "rect",
+      fill: shape === "tall" ? "url(#scrimTall)" : "url(#scrim)",
+      stroke: "#000000",
+      strokeWidth: 0
+    },
+    {
+      type: "shape",
+      x: textX,
+      y: shape === "tall" ? marginY - 52 : marginY - 44,
+      w: shape === "wide" ? 240 : shape === "square" ? 170 : 210,
+      h: 2,
+      shape: "rect",
+      fill: "#CBD5E1",
+      stroke: "#CBD5E1",
+      strokeWidth: 0
+    },
+    {
+      type: "text",
+      x: textX,
+      y: marginY,
+      w: textW,
+      h: Math.max(180, Math.round(titleLineCount * titleFontSize * 1.16)),
+      text: titleText,
+      fontSize: titleFontSize,
+      fontFamily: "Arial",
+      fontWeight: 800,
+      color: "#0F172A",
+      align: "left"
+    }
+  ];
+
+  if (optionVariant === 1) {
+    layers.push({
+      type: "shape",
+      x: shape === "wide" ? Math.round(width * 0.77) : Math.round(width * 0.8),
+      y: shape === "tall" ? Math.round(height * 0.34) : Math.round(height * 0.2),
+      w: shape === "tall" ? 12 : 14,
+      h: shape === "tall" ? Math.round(height * 0.42) : Math.round(height * 0.56),
+      shape: "rect",
+      fill: accentColor,
+      stroke: accentColor,
+      strokeWidth: 0
+    });
+    layers.push({
+      type: "shape",
+      x: shape === "wide" ? Math.round(width * 0.74) : Math.round(width * 0.74),
+      y: shape === "tall" ? Math.round(height * 0.74) : Math.round(height * 0.69),
+      w: shape === "wide" ? 240 : shape === "square" ? 200 : 160,
+      h: 6,
+      shape: "rect",
+      fill: accentColor,
+      stroke: accentColor,
+      strokeWidth: 0
+    });
+  }
+
+  if (optionVariant === 2) {
+    layers.push({
+      type: "shape",
+      x: shape === "wide" ? Math.round(width * 0.63) : Math.round(width * 0.58),
+      y: shape === "tall" ? Math.round(height * 0.68) : Math.round(height * 0.56),
+      w: shape === "wide" ? Math.round(width * 0.3) : Math.round(width * 0.34),
+      h: shape === "wide" ? Math.round(height * 0.3) : Math.round(height * 0.26),
+      shape: "rect",
+      fill: softAccent,
+      stroke: accentColor,
+      strokeWidth: 1
+    });
+  }
+
+  let currentY = marginY + titleLineCount * titleFontSize * 1.16 + (shape === "tall" ? 56 : 42);
+
+  if (subtitleText) {
+    layers.push({
+      type: "text",
+      x: textX,
+      y: currentY,
+      w: textW,
+      h: Math.max(64, Math.round(subtitleLineCount * subtitleFontSize * 1.3)),
+      text: subtitleText,
+      fontSize: subtitleFontSize,
+      fontFamily: "Arial",
+      fontWeight: 600,
+      color: "#334155",
+      align: "left"
+    });
+    currentY += subtitleLineCount * subtitleFontSize * 1.3 + 24;
+  }
+
+  if (logoSrc) {
+    layers.push({
+      type: "image",
+      x: textX,
+      y: height - marginY + (shape === "tall" ? 4 : 8),
+      w: shape === "tall" ? 170 : 184,
+      h: shape === "tall" ? 66 : 70,
+      src: logoSrc
+    });
+  }
+
+  const designDoc: DesignDoc = {
+    width,
+    height,
+    background: {
+      color: "#F8F6F1"
+    },
+    layers
+  };
+
+  if (typeof params.backgroundImagePath === "string" || params.backgroundImagePath === null) {
+    designDoc.backgroundImagePath = params.backgroundImagePath;
+  }
+
+  return designDoc;
+}
+
+export function buildFallbackDesignDoc(params: BuildFinalDesignDocParams): DesignDoc {
+  if (params.presetKey === "type_clean_min_v1") {
+    return buildCleanMinimalFallbackDesignDoc(params);
+  }
+
+  return buildDefaultFallbackDesignDoc(params);
 }
 
 export function buildFinalDesignDoc(params: BuildFinalDesignDocParams): DesignDoc {

@@ -10,6 +10,7 @@ import { prisma } from "@/lib/prisma";
 
 const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
 type PreviewShape = (typeof PREVIEW_SHAPES)[number];
+const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
 
 const SHAPE_CONFIG: Record<
   PreviewShape,
@@ -196,6 +197,8 @@ function resolveOverlayDesignDoc(params: {
   const fallbackDoc = buildFallbackDesignDoc({
     output: params.generationOutput,
     input: params.generationInput,
+    presetKey: params.presetKey,
+    shape: params.shape,
     round: params.round,
     optionIndex: readOptionIndex(params.generationInput, params.presetKey),
     project: {
@@ -257,9 +260,11 @@ function buildBackgroundPrompt(params: {
     `Use palette: ${promptPalette(params.palette)}.`,
     "Include subtle texture and geometric depth.",
     "Leave generous negative space for typography overlays.",
+    "Default to abstract textures and geometric motifs unless a literal photo scene was explicitly requested.",
+    "Negative scene list: highway, road, cars, city, skyscraper, traffic, street signs, billboards.",
     presetStyleHint(params.presetKey),
     thematicHints ? `Theme inspiration: ${thematicHints}.` : "Theme inspiration: modern worship campaign.",
-    "NO WORDS, NO LETTERS, NO NUMBERS, NO LOGOS, NO WATERMARKS."
+    "NO TEXT, NO LETTERS, NO WORDS, NO TYPOGRAPHY, NO SIGNAGE, NO LOGOS, NO WATERMARKS."
   ].join(" ");
 }
 
@@ -308,6 +313,18 @@ export async function createGenerationPreviewAssets(params: {
   await mkdir(uploadDirectory, { recursive: true });
 
   const palette = parsePaletteJson(generation.project.brandKit?.paletteJson);
+  const backgroundPrompt = buildBackgroundPrompt({
+    presetKey: generation.preset?.key || null,
+    seriesTitle: generation.project.series_title,
+    seriesSubtitle: generation.project.series_subtitle,
+    scripturePassages: generation.project.scripture_passages,
+    palette
+  });
+  const masterBackgroundPng = await generateBackgroundPng({
+    prompt: backgroundPrompt,
+    size: SHAPE_CONFIG[OPTION_MASTER_BACKGROUND_SHAPE].sourceSize,
+    quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim())
+  });
   const assetRows: {
     projectId: string;
     generationId: string;
@@ -337,19 +354,7 @@ export async function createGenerationPreviewAssets(params: {
       includeImages: true
     });
 
-    const backgroundPng = await generateBackgroundPng({
-      prompt: buildBackgroundPrompt({
-        presetKey: generation.preset?.key || null,
-        seriesTitle: generation.project.series_title,
-        seriesSubtitle: generation.project.series_subtitle,
-        scripturePassages: generation.project.scripture_passages,
-        palette
-      }),
-      size: config.sourceSize,
-      quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim())
-    });
-
-    const resizedBackground = await sharp(backgroundPng)
+    const resizedBackground = await sharp(masterBackgroundPng)
       .resize({
         width: config.outputWidth,
         height: config.outputHeight,

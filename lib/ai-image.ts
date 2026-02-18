@@ -46,7 +46,7 @@ function buildPrompt(params: {
     paletteHint,
     `Theme inspired by: ${params.seriesTitle}.`,
     thematicHint,
-    "NO TEXT. Do not include any words, letters, numbers, logos, symbols with text, or watermarks."
+    "NO TEXT. no text, no letters, no words, no typography, no signage, no logos, no watermarks."
   ]
     .filter(Boolean)
     .join(" ");

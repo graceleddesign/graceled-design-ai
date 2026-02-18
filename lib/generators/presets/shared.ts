@@ -1,4 +1,5 @@
 import { optionLabel } from "@/lib/option-label";
+import { buildOverlayDisplayContent } from "@/lib/overlay-lines";
 import type { DesignDoc, DesignLayer, DesignTextAlign, DesignTextLayer } from "@/lib/design-doc";
 
 export const CANVAS_WIDTH = 1920;
@@ -188,6 +189,11 @@ export function createPresetContext(params: GenerateDesignDocForPresetParams): P
   const seed = derivePresetSeed(params);
   const rng = createSeededRandom(seed);
   const palette = normalizePalette(params.project.palette);
+  const displayContent = buildOverlayDisplayContent({
+    title: params.project.seriesTitle,
+    subtitle: params.project.seriesSubtitle,
+    scripturePassages: params.project.scripturePassages
+  });
 
   return {
     seed,
@@ -199,12 +205,10 @@ export function createPresetContext(params: GenerateDesignDocForPresetParams): P
     round: params.round,
     optionIndex: params.optionIndex,
     optionLabel: optionLabel(params.optionIndex),
-    title: params.project.seriesTitle,
-    subtitle:
-      params.project.seriesSubtitle?.trim() ||
-      `${optionLabel(params.optionIndex)} | Round ${params.round}`,
-    scripture: params.project.scripturePassages?.trim() || "",
-    description: params.project.seriesDescription?.trim() || "",
+    title: displayContent.title,
+    subtitle: displayContent.subtitle,
+    scripture: "",
+    description: "",
     logoSrc: normalizeLogoPath(params.project.logoPath)
   };
 }
@@ -434,6 +438,6 @@ export function createNoiseLayers(params: {
 }
 
 export function buildSupportingCopy(context: PresetGeneratorContext): string {
-  const parts = [context.subtitle, context.scripture, context.description].filter((value) => Boolean(value && value.trim()));
+  const parts = [context.subtitle, context.scripture].filter((value) => Boolean(value && value.trim()));
   return parts.join("\n");
 }

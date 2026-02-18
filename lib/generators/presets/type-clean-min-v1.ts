@@ -370,18 +370,6 @@ function createGridLayers(
   const safeWidth = columnSpanWidth(layout.columns);
   const layers: DesignLayer[] = [];
 
-  layers.push({
-    type: "shape",
-    x: layout.marginX,
-    y: layout.marginY,
-    w: safeWidth,
-    h: safeHeight,
-    shape: "rect",
-    fill: palette.panel,
-    stroke: palette.grid,
-    strokeWidth: 1
-  });
-
   for (let col = 1; col < layout.columns; col += 1) {
     if (layout.columns >= 10 && col % 2 !== 0) {
       continue;
@@ -414,8 +402,8 @@ function createGridLayers(
       w: safeWidth,
       h: 1,
       shape: "rect",
-      fill: mixHex(palette.grid, palette.panel, 0.26),
-      stroke: mixHex(palette.grid, palette.panel, 0.26),
+      fill: mixHex(palette.grid, palette.background, 0.26),
+      stroke: mixHex(palette.grid, palette.background, 0.26),
       strokeWidth: 0
     });
   }
@@ -446,18 +434,15 @@ function buildShapeDoc(
 
   const subtitleFontSize = clamp(Math.round(titleFit.fontSize * 0.3), 26, shape === "wide" ? 40 : 38);
   const scriptureFontSize = clamp(Math.round(subtitleFontSize * 0.86), 20, 32);
-  const descriptionFontSize = clamp(Math.round(scriptureFontSize * 0.84), 17, 26);
 
   const mainX = columnX(layout.mainStartCol);
   const mainW = columnSpanWidth(layout.mainSpanCols);
-  const safeBottom = dimensions.height - layout.marginY;
   const titleBlockHeight = titleFit.lineCount * titleFit.lineHeight;
   const titleY = layout.titleTop;
   const metaStartY = titleY + titleBlockHeight + (shape === "tall" ? 72 : 54);
 
   const subtitleText = clampWrappedCopy(context.subtitle, Math.max(18, Math.floor(mainW / (subtitleFontSize * 0.56))), 2);
   const scriptureText = clampWrappedCopy(context.scripture, Math.max(18, Math.floor(mainW / (scriptureFontSize * 0.56))), shape === "tall" ? 3 : 2);
-  const descriptionText = clampWrappedCopy(context.description, Math.max(16, Math.floor(mainW / (descriptionFontSize * 0.54))), shape === "tall" ? 4 : 3);
 
   const layers: DesignLayer[] = [
     ...createGradientLayers(dimensions, palette, shape, rng),
@@ -538,52 +523,6 @@ function buildShapeDoc(
       align: "left"
     });
     currentY += scriptureLines * scriptureFontSize * 1.24 + 24;
-  }
-
-  if (layout.showSideDescription && descriptionText) {
-    const sideX = columnX(layout.sideStartCol);
-    const sideW = columnSpanWidth(layout.sideSpanCols);
-    layers.push(
-      {
-        type: "shape",
-        x: sideX - 14,
-        y: layout.marginY + 126,
-        w: 2,
-        h: dimensions.height - layout.marginY * 2 - 210,
-        shape: "rect",
-        fill: mixHex(palette.accent, palette.panel, 0.34),
-        stroke: mixHex(palette.accent, palette.panel, 0.34),
-        strokeWidth: 0
-      },
-      {
-        type: "text",
-        x: sideX + 18,
-        y: layout.marginY + 174,
-        w: sideW - 24,
-        h: dimensions.height - layout.marginY * 2 - 230,
-        text: descriptionText,
-        fontSize: descriptionFontSize,
-        fontFamily: "Arial",
-        fontWeight: 500,
-        color: palette.textMuted,
-        align: "left"
-      }
-    );
-  } else if (descriptionText && currentY < safeBottom - 70) {
-    const descriptionLines = descriptionText.split("\n").length;
-    layers.push({
-      type: "text",
-      x: mainX,
-      y: Math.min(currentY, safeBottom - descriptionLines * descriptionFontSize * 1.24 - 20),
-      w: mainW,
-      h: descriptionLines * descriptionFontSize * 1.24 + 8,
-      text: descriptionText,
-      fontSize: descriptionFontSize,
-      fontFamily: "Arial",
-      fontWeight: 500,
-      color: palette.textMuted,
-      align: "left"
-    });
   }
 
   const cornerSize = shape === "tall" ? 34 : 28;
