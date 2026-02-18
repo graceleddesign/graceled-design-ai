@@ -1,7 +1,7 @@
 "use server";
 
 import { randomUUID } from "crypto";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
@@ -11,11 +11,20 @@ import { z } from "zod";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import { buildFinalSvg } from "@/lib/final-deliverables";
+import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
 import { generatePngFromPrompt } from "@/lib/openai-image";
+import { openai } from "@/lib/openai";
 import { optionLabel } from "@/lib/option-label";
+import { buildOverlayDisplayContent, normalizeLine } from "@/lib/overlay-lines";
+import { ensureThree, filterToEnabledPresets, pickInitialPresetKeys, pickPresetKeysForStyle } from "@/lib/preset-picker";
 import { prisma } from "@/lib/prisma";
-import { buildReferenceCollageBuffer, pickReferences } from "@/lib/reference-library";
-import { listStyleRefs, pickStyleRefsForOptions, type StyleRef } from "@/lib/style-library";
+import {
+  loadIndex,
+  resolveReferenceAbsolutePath,
+  sampleRefsForOption,
+  type ReferenceLibraryItem
+} from "@/lib/referenceLibrary";
+import { normalizeStyleDirection } from "@/lib/style-direction";
 import {
   buildCleanMinimalDesignDoc,
   buildCleanMinimalOverlaySvg,
@@ -65,10 +74,9 @@ const generateRoundTwoSchema = z.object({
   emphasis: z.enum(["title", "quote"]),
   expressiveness: z.coerce.number().int().min(0).max(100),
   temperature: z.coerce.number().int().min(0).max(100),
-  styleDirection: z.enum(["option_a", "option_b", "option_c", "different"]).default("different")
+  styleDirection: z.unknown().optional()
 });
 const ROUND_OPTION_COUNT = 3;
-const INTERNAL_LAYOUT_PRESET_KEY = "type_clean_min_v1";
 const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
 type PreviewShape = (typeof PREVIEW_SHAPES)[number];
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
@@ -102,6 +110,7 @@ const OPENAI_IMAGE_SIZE_BY_SHAPE: Record<PreviewShape, "1024x1024" | "1536x1024"
   wide: "1536x1024",
   tall: "1024x1536"
 };
+const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
 const PREVIEW_ASSET_SLOTS_TO_CLEAR: readonly string[] = [
   ...LEGACY_PREVIEW_ASSET_SLOTS,
   ...PREVIEW_SHAPES,
@@ -210,40 +219,6 @@ function parsePaletteJson(raw: string): string[] {
   }
 }
 
-function getUniqueStrings(values: readonly unknown[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const value of values) {
-    if (typeof value !== "string") {
-      continue;
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-
-  return result;
-}
-
-function readSelectedPresetKeysFromInput(input: unknown): string[] {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return [];
-  }
-
-  const selectedPresetKeys = (input as { selectedPresetKeys?: unknown }).selectedPresetKeys;
-  if (!Array.isArray(selectedPresetKeys)) {
-    return [];
-  }
-
-  return getUniqueStrings(selectedPresetKeys);
-}
-
 function truncateForPrompt(value: string | null | undefined, maxLength: number): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (!text) {
@@ -253,16 +228,6 @@ function truncateForPrompt(value: string | null | undefined, maxLength: number):
     return text;
   }
   return `${text.slice(0, maxLength - 1).trimEnd()}…`;
-}
-
-function optionStyleDirectionHint(optionIndex: number): string {
-  if (optionIndex === 0) {
-    return "Option A direction: classic clean minimal, thin rules, left-aligned composition, restrained accents.";
-  }
-  if (optionIndex === 1) {
-    return "Option B direction: minimal composition with one bolder accent shape (circle or line) used sparingly.";
-  }
-  return "Option C direction: minimal composition with stronger photo-like grain/texture emphasis while preserving clean negative space.";
 }
 
 function shapeCompositionHint(shape: PreviewShape): string {
@@ -289,70 +254,499 @@ function readFeedbackRequest(input: unknown): string {
   return typeof request === "string" ? truncateForPrompt(request, 220) : "";
 }
 
-function buildCleanMinimalBackgroundPrompt(params: {
-  project: GenerationProjectContext;
-  palette: string[];
-  shape: PreviewShape;
-  generationId: string;
-  optionIndex: number;
-  feedbackRequest?: string;
-}): string {
-  const title = truncateForPrompt(params.project.series_title, 120);
-  const subtitle = truncateForPrompt(params.project.series_subtitle, 120);
-  const scripture = truncateForPrompt(params.project.scripture_passages, 140);
-  const description = truncateForPrompt(params.project.series_description, 280);
-  const paletteHint =
-    params.palette.length > 0
-      ? `Use restrained tones influenced by this palette: ${params.palette.join(", ")}.`
-      : "Use a neutral clean-minimal palette with soft whites, warm grays, slate, and one subtle accent.";
+type StyleBrief = {
+  layout: string;
+  typography: {
+    title: string;
+    subtitle: string;
+    passage: string;
+  };
+  motifs: string[];
+  spacing: string;
+  colorDirection: string;
+  avoid: string[];
+};
 
-  return [
-    "Create a premium sermon-series BACKGROUND only.",
-    "No text, no letters, no words, no logos, no watermark.",
-    "Clean minimal aesthetic: generous whitespace, subtle paper texture, disciplined geometric accents, calm editorial balance.",
-    shapeCompositionHint(params.shape),
-    optionStyleDirectionHint(params.optionIndex),
-    title ? `Series title context: ${title}.` : "",
-    subtitle ? `Series subtitle context: ${subtitle}.` : "",
-    scripture ? `Scripture context: ${scripture}.` : "",
-    description ? `Series description mood context: ${description}.` : "",
-    paletteHint,
-    params.feedbackRequest ? `Refinement cues: ${params.feedbackRequest}.` : "",
-    `Variation seed: ${params.generationId}-${params.shape}.`
+function optionLane(optionIndex: number): "A" | "B" | "C" {
+  if (optionIndex === 0) {
+    return "A";
+  }
+  if (optionIndex === 1) {
+    return "B";
+  }
+  return "C";
+}
+
+function laneBriefHint(optionIndex: number): string {
+  const lane = optionLane(optionIndex);
+  if (lane === "A") {
+    return "Minimal / typography-led lane with Swiss-grid restraint and generous negative space.";
+  }
+  if (lane === "B") {
+    return "Illustration / ornament lane with tasteful decorative marks and controlled accents.";
+  }
+  return "Photo / texture lane with cinematic grain and tactile depth while preserving clarity.";
+}
+
+function safeArrayOfStrings(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const normalized = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function fallbackStyleBrief(optionIndex: number, palette: string[]): StyleBrief {
+  const lane = optionLane(optionIndex);
+
+  if (lane === "A") {
+    return {
+      layout: "Asymmetric editorial grid; keep left-center typography lane clean and uninterrupted.",
+      typography: {
+        title: "Large bold title with strong hierarchy and precise line breaks.",
+        subtitle: "Smaller uppercase/semibold support line with tight tracking.",
+        passage: "Subtle serif or book-style line; secondary emphasis."
+      },
+      motifs: ["thin rules", "small geometric marks", "soft paper grain"],
+      spacing: "Generous outer margins; clear breathing room between title, subtitle, and passage.",
+      colorDirection: palette.length > 0 ? `Restrained palette grounded in ${palette.join(", ")}.` : "Neutral off-white, slate, and one accent.",
+      avoid: ["busy collage", "too many words", "large white text box", "centered everything"]
+    };
+  }
+
+  if (lane === "B") {
+    return {
+      layout: "Balanced composition with one ornament cluster away from core typography lane.",
+      typography: {
+        title: "Strong headline with clean, non-decorative letterforms.",
+        subtitle: "Compact supporting line that does not compete with title.",
+        passage: "Quiet tertiary line with comfortable readability."
+      },
+      motifs: ["engraved lines", "minimal icon marks", "ornamental accents"],
+      spacing: "Keep decorative motifs peripheral; protect typography area with negative space.",
+      colorDirection: palette.length > 0 ? `Use palette accents from ${palette.join(", ")} without overfilling.` : "Warm neutrals with controlled accent.",
+      avoid: ["dense illustrations behind title", "clip-art look", "heavy framing boxes"]
+    };
+  }
+
+  return {
+    layout: "Texture-led composition with clear typography lane and directional depth.",
+    typography: {
+      title: "Confident title with high contrast against textured background.",
+      subtitle: "Secondary line with reduced weight and visual noise.",
+      passage: "Tertiary line with readable contrast; never dominate title."
+    },
+    motifs: ["film grain", "subtle texture overlays", "soft photographic gradients"],
+    spacing: "Leave meaningful negative space for text; avoid crowding central hierarchy.",
+    colorDirection: palette.length > 0 ? `Use palette as tonal guidance: ${palette.join(", ")}.` : "Muted cinematic tones with one accent.",
+    avoid: ["literal photo collage", "full-bleed clutter", "copying reference composition"]
+  };
+}
+
+function parseStyleBriefFromText(text: string, optionIndex: number, palette: string[]): StyleBrief {
+  if (!text.trim()) {
+    return fallbackStyleBrief(optionIndex, palette);
+  }
+
+  const normalized = text
+    .replace(/^\s*```(?:json)?/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(normalized) as Record<string, unknown>;
+    const typography = (parsed.typography || {}) as Record<string, unknown>;
+    const fallback = fallbackStyleBrief(optionIndex, palette);
+
+    return {
+      layout: typeof parsed.layout === "string" && parsed.layout.trim() ? parsed.layout.trim() : fallback.layout,
+      typography: {
+        title:
+          typeof typography.title === "string" && typography.title.trim() ? typography.title.trim() : fallback.typography.title,
+        subtitle:
+          typeof typography.subtitle === "string" && typography.subtitle.trim()
+            ? typography.subtitle.trim()
+            : fallback.typography.subtitle,
+        passage:
+          typeof typography.passage === "string" && typography.passage.trim()
+            ? typography.passage.trim()
+            : fallback.typography.passage
+      },
+      motifs: safeArrayOfStrings(parsed.motifs, fallback.motifs),
+      spacing: typeof parsed.spacing === "string" && parsed.spacing.trim() ? parsed.spacing.trim() : fallback.spacing,
+      colorDirection:
+        typeof parsed.colorDirection === "string" && parsed.colorDirection.trim()
+          ? parsed.colorDirection.trim()
+          : fallback.colorDirection,
+      avoid: safeArrayOfStrings(parsed.avoid, fallback.avoid)
+    };
+  } catch {
+    return fallbackStyleBrief(optionIndex, palette);
+  }
+}
+
+function parseResponseText(response: unknown): string {
+  if (!response || typeof response !== "object") {
+    return "";
+  }
+
+  const outputText = (response as { output_text?: unknown }).output_text;
+  if (typeof outputText === "string" && outputText.trim()) {
+    return outputText;
+  }
+
+  const output = (response as { output?: unknown }).output;
+  if (!Array.isArray(output)) {
+    return "";
+  }
+
+  const chunks: string[] = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (const segment of content) {
+      if (!segment || typeof segment !== "object") {
+        continue;
+      }
+      const textValue = (segment as { text?: unknown }).text;
+      if (typeof textValue === "string" && textValue.trim()) {
+        chunks.push(textValue.trim());
+      }
+    }
+  }
+
+  return chunks.join("\n").trim();
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  if (!text.trim()) {
+    return null;
+  }
+
+  const normalized = text
+    .replace(/^\s*```(?:json)?/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(normalized);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function buildAvoidWords(project: GenerationProjectContext): string[] {
+  const raw = [project.series_title, project.series_subtitle || ""]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const tokens = raw
+    .flatMap((value) => value.split(/\s+/))
+    .map((value) => value.trim())
+    .filter((value) => value.length >= 2);
+
+  const dedupedByNormalized = new Map<string, string>();
+  for (const item of [...raw, ...tokens]) {
+    const normalized = normalizeLine(item);
+    if (!normalized) {
+      continue;
+    }
+    if (!dedupedByNormalized.has(normalized)) {
+      dedupedByNormalized.set(normalized, item);
+    }
+  }
+
+  return [...dedupedByNormalized.values()];
+}
+
+function removeAvoidWords(text: string, avoidWords: string[]): string {
+  let result = text;
+  for (const avoidWord of avoidWords) {
+    const escaped = avoidWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result.replace(new RegExp(`\\b${escaped}\\b`, "ig"), " ");
+  }
+  return result.replace(/\s+/g, " ").trim();
+}
+
+function buildCreativeBrief(params: {
+  project: GenerationProjectContext;
+  styleBrief: StyleBrief;
+  avoidWords: string[];
+}): string {
+  const raw = [
+    params.project.series_description || "",
+    params.project.scripture_passages || "",
+    params.styleBrief.layout,
+    params.styleBrief.spacing,
+    params.styleBrief.colorDirection,
+    params.styleBrief.motifs.join(" ")
   ]
     .filter(Boolean)
     .join(" ");
+
+  const sanitized = removeAvoidWords(raw, params.avoidWords)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\b\d+\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!sanitized) {
+    return "Providence, redemption, loyalty, mercy, harvest textures, and quiet sacred atmosphere.";
+  }
+
+  const stopwords = new Set([
+    "and",
+    "the",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "only",
+    "never",
+    "must",
+    "keep",
+    "use",
+    "tone",
+    "tones",
+    "color",
+    "layout",
+    "spacing",
+    "title",
+    "subtitle",
+    "passage",
+    "series",
+    "scripture",
+    "context",
+    "prompt",
+    "rendered",
+    "render"
+  ]);
+
+  const words = sanitized
+    .split(" ")
+    .filter((word) => word.length >= 4)
+    .filter((word) => !stopwords.has(word));
+  const unique = [...new Set(words)].slice(0, 14);
+
+  if (unique.length === 0) {
+    return "Providence, redemption, loyalty, mercy, harvest textures, and quiet sacred atmosphere.";
+  }
+
+  return unique.join(", ");
 }
 
-function toPngDataUrl(pngBuffer: Buffer): string {
-  return `data:image/png;base64,${pngBuffer.toString("base64")}`;
+function containsPhotoSceneRequest(input: string): boolean {
+  const normalized = input.toLowerCase();
+  if (!normalized.trim()) {
+    return false;
+  }
+  if (/\b(no|avoid|without)\s+(photo|photography|photographic|scene|literal scene)\b/.test(normalized)) {
+    return false;
+  }
+  return /\b(photo|photography|photographic|realistic|realism|literal scene|cityscape|landscape scene|street scene)\b/.test(
+    normalized
+  );
 }
 
-function readUsedStylePathsFromOutput(output: unknown): string[] {
-  if (!output || typeof output !== "object" || Array.isArray(output)) {
-    return [];
-  }
-
-  const meta = (output as { meta?: unknown }).meta;
-  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
-    return [];
-  }
-
-  const paths = (meta as { usedStylePaths?: unknown }).usedStylePaths;
-  return Array.isArray(paths) ? getUniqueStrings(paths) : [];
+function hasExplicitPhotoRequest(params: {
+  project: GenerationProjectContext;
+  feedbackRequest: string;
+}): boolean {
+  const source = [
+    params.project.series_title,
+    params.project.series_subtitle || "",
+    params.project.series_description || "",
+    params.project.scripture_passages || "",
+    params.feedbackRequest
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return containsPhotoSceneRequest(source);
 }
 
-function styleDirectionToOptionIndex(styleDirection: "option_a" | "option_b" | "option_c" | "different"): number | null {
-  if (styleDirection === "option_a") {
-    return 0;
+function buildTopicMotifHint(project: GenerationProjectContext): string {
+  const source = [
+    project.series_title,
+    project.series_subtitle || "",
+    project.scripture_passages || "",
+    project.series_description || ""
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\bruth\b/.test(source)) {
+    return "Subtle topic motifs: wheat, barley, gleaning fields, harvest texture, and quiet Bethlehem-era atmosphere.";
   }
-  if (styleDirection === "option_b") {
-    return 1;
+  if (/\b(psalm|psalms)\b/.test(source)) {
+    return "Subtle topic motifs: layered light rays, gentle gradients, and contemplative abstract rhythm.";
   }
-  if (styleDirection === "option_c") {
-    return 2;
+
+  return "Keep motif language symbolic and understated for church contexts.";
+}
+
+async function hasTextLikeRasterPattern(image: Buffer): Promise<boolean> {
+  const downscaled = await sharp(image, { failOn: "none" })
+    .resize({ width: 320, fit: "inside" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+    .catch(() => null);
+
+  if (!downscaled || !downscaled.info.width || !downscaled.info.height) {
+    return false;
   }
-  return null;
+
+  const width = downscaled.info.width;
+  const height = downscaled.info.height;
+  const pixels = downscaled.data;
+  if (width < 32 || height < 32) {
+    return false;
+  }
+
+  const edgeMask = new Uint8Array(width * height);
+  let edgeCount = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const idx = y * width + x;
+      const gx = Math.abs(pixels[idx + 1] - pixels[idx - 1]);
+      const gy = Math.abs(pixels[idx + width] - pixels[idx - width]);
+      const magnitude = gx + gy;
+      if (magnitude > 72) {
+        edgeMask[idx] = 1;
+        edgeCount += 1;
+      }
+    }
+  }
+
+  const edgeRatio = edgeCount / (width * height);
+  if (edgeRatio < 0.012 || edgeRatio > 0.34) {
+    return false;
+  }
+
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  let textLikeComponents = 0;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const start = y * width + x;
+      if (!edgeMask[start] || visited[start]) {
+        continue;
+      }
+
+      let head = 0;
+      let tail = 0;
+      visited[start] = 1;
+      queue[tail++] = start;
+      let area = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+
+      while (head < tail) {
+        const current = queue[head++];
+        const cy = Math.floor(current / width);
+        const cx = current - cy * width;
+        area += 1;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const neighbor of neighbors) {
+          if (neighbor <= 0 || neighbor >= edgeMask.length - 1) {
+            continue;
+          }
+          if (!edgeMask[neighbor] || visited[neighbor]) {
+            continue;
+          }
+          visited[neighbor] = 1;
+          queue[tail++] = neighbor;
+        }
+      }
+
+      const boxWidth = maxX - minX + 1;
+      const boxHeight = maxY - minY + 1;
+      if (boxWidth < 5 || boxHeight < 4) {
+        continue;
+      }
+
+      const boxArea = boxWidth * boxHeight;
+      const density = area / boxArea;
+      const aspect = boxWidth / boxHeight;
+      const textLike =
+        area >= 12 &&
+        area <= 2200 &&
+        boxArea <= 4600 &&
+        aspect >= 1.15 &&
+        aspect <= 15 &&
+        density >= 0.07 &&
+        density <= 0.62;
+
+      if (textLike) {
+        textLikeComponents += 1;
+        if (textLikeComponents >= 10) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+async function imageHasReadableText(image: Buffer): Promise<boolean> {
+  if (await hasTextLikeRasterPattern(image)) {
+    return true;
+  }
+
+  if (!process.env.OPENAI_API_KEY?.trim()) {
+    return false;
+  }
+
+  try {
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: 'Detect readable text in this image. Return JSON only: {"hasText": true|false}.'
+            },
+            {
+              type: "input_image",
+              image_url: `data:image/png;base64,${image.toString("base64")}`,
+              detail: "low"
+            }
+          ]
+        }
+      ]
+    });
+
+    const parsed = parseJsonObject(parseResponseText(response));
+    return parsed?.hasText === true;
+  } catch {
+    return false;
+  }
 }
 
 type GenerationProjectContext = {
@@ -373,7 +767,7 @@ type BuildGenerationOutputParams = {
   input: unknown;
   round: number;
   optionIndex: number;
-  styleRefs?: StyleRef[];
+  referenceItems?: ReferenceLibraryItem[];
   revisedPrompt?: string;
 };
 
@@ -386,6 +780,7 @@ type GenerationOutputPayload = {
     styleRefCount: number;
     usedStylePaths: string[];
     revisedPrompt?: string;
+    designSpec?: Record<string, unknown>;
   };
   preview?: {
     square_main: string;
@@ -476,8 +871,8 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     designDocByShape,
     notes: `Fallback layout: ${params.presetKey} | variant ${params.optionIndex % 3}`,
     meta: {
-      styleRefCount: params.styleRefs?.length || 0,
-      usedStylePaths: (params.styleRefs || []).map((ref) => ref.path),
+      styleRefCount: params.referenceItems?.length || 0,
+      usedStylePaths: (params.referenceItems || []).map((ref) => ref.path || ref.thumbPath),
       revisedPrompt: params.revisedPrompt
     }
   };
@@ -533,37 +928,41 @@ function buildGenerationInput(
   };
 }
 
-async function findInternalLayoutPresetId(organizationId: string): Promise<string | null> {
-  const preset = await prisma.preset.findFirst({
+type EnabledPresetRecord = {
+  id: string;
+  key: string;
+};
+
+async function findEnabledPresetsForOrganization(organizationId: string): Promise<EnabledPresetRecord[]> {
+  return prisma.preset.findMany({
     where: {
-      key: INTERNAL_LAYOUT_PRESET_KEY,
       enabled: true,
       OR: [{ organizationId: null }, { organizationId }]
     },
     select: {
-      id: true
-    }
-  });
-
-  return preset?.id || null;
-}
-
-function normalizeStyleRefsForOptions(input: StyleRef[][], optionCount: number): StyleRef[][] {
-  return Array.from({ length: optionCount }, (_, optionIndex) => {
-    const refs = input[optionIndex] || [];
-    return refs.slice(0, 6);
+      id: true,
+      key: true
+    },
+    orderBy: [{ createdAt: "asc" }]
   });
 }
 
-async function loadStyleRefsByPaths(paths: string[]): Promise<StyleRef[]> {
-  const uniquePaths = getUniqueStrings(paths);
-  if (uniquePaths.length === 0) {
-    return [];
+async function pickReferenceSetsForRound(projectId: string, round: number, optionCount: number): Promise<ReferenceLibraryItem[][]> {
+  const refs = await loadIndex();
+  if (refs.length === 0) {
+    return Array.from({ length: optionCount }, () => []);
   }
 
-  const allRefs = await listStyleRefs();
-  const byPath = new Map(allRefs.map((ref) => [ref.path, ref] as const));
-  return uniquePaths.map((item) => byPath.get(item)).filter((ref): ref is StyleRef => Boolean(ref)).slice(0, 6);
+  return Promise.all(
+    Array.from({ length: optionCount }, (_, optionIndex) =>
+      sampleRefsForOption({
+        projectId,
+        round,
+        optionIndex,
+        n: 3
+      })
+    )
+  );
 }
 
 type PlannedGeneration = {
@@ -572,7 +971,7 @@ type PlannedGeneration = {
   presetKey: string;
   round: number;
   optionIndex: number;
-  styleRefs: StyleRef[];
+  references: ReferenceLibraryItem[];
   input: Prisma.InputJsonValue;
   fallbackOutput: GenerationOutputPayload;
 };
@@ -609,19 +1008,172 @@ async function normalizePngToShape(png: Buffer, shape: PreviewShape): Promise<Bu
     .toBuffer();
 }
 
+function mimeTypeFromPath(filePath: string): string | null {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".png") {
+    return "image/png";
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (extension === ".webp") {
+    return "image/webp";
+  }
+  return null;
+}
+
+async function buildReferenceDataUrls(references: ReferenceLibraryItem[]): Promise<string[]> {
+  const dataUrls = await Promise.all(
+    references.map(async (reference) => {
+      const relativePath = reference.path || reference.thumbPath;
+      const absolutePath = resolveReferenceAbsolutePath(relativePath);
+      const mime = mimeTypeFromPath(relativePath);
+      if (!mime) {
+        return null;
+      }
+
+      const bytes = await readFile(absolutePath).catch(() => null);
+      if (!bytes) {
+        return null;
+      }
+
+      return `data:${mime};base64,${bytes.toString("base64")}`;
+    })
+  );
+
+  return dataUrls.filter((value): value is string => Boolean(value));
+}
+
+async function createStyleBrief(params: {
+  optionIndex: number;
+  project: GenerationProjectContext;
+  references: ReferenceLibraryItem[];
+  feedbackRequest: string;
+  palette: string[];
+}): Promise<StyleBrief> {
+  const fallback = fallbackStyleBrief(params.optionIndex, params.palette);
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    return fallback;
+  }
+
+  const title = truncateForPrompt(params.project.series_title, 120);
+  const subtitle = truncateForPrompt(params.project.series_subtitle, 120);
+  const scripture = truncateForPrompt(params.project.scripture_passages, 140);
+  const description = truncateForPrompt(params.project.series_description, 360);
+  const referenceSummary = params.references
+    .slice(0, 6)
+    .map((reference) => {
+      const tags = reference.styleTags.length > 0 ? reference.styleTags.join(", ") : "untagged";
+      return `${reference.id} (${reference.aspect.toFixed(2)}): ${tags}`;
+    })
+    .join("\n");
+
+  const prompt = [
+    "You are an art director for premium church sermon graphics.",
+    "Generate one JSON object only. No markdown.",
+    'Schema: {"layout":"...","typography":{"title":"...","subtitle":"...","passage":"..."},"motifs":["..."],"spacing":"...","colorDirection":"...","avoid":["..."]}',
+    "Keep guidance concise and practical.",
+    `Lane target: ${laneBriefHint(params.optionIndex)}`,
+    title ? `Series title: ${title}` : "",
+    subtitle ? `Series subtitle: ${subtitle}` : "",
+    scripture ? `Scripture passages: ${scripture}` : "",
+    description ? `Series description mood context (PROMPT-ONLY, never rendered): ${description}` : "",
+    params.feedbackRequest ? `User refinement request: ${params.feedbackRequest}` : "",
+    params.palette.length > 0 ? `Brand palette: ${params.palette.join(", ")}` : "",
+    referenceSummary ? `Reference summaries:\n${referenceSummary}` : "",
+    "Hard rule: final rendered text must contain only series title + optional series subtitle.",
+    "Hard rule: series description is context only and must never be rendered as text."
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  try {
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
+      input: prompt
+    });
+    const text = parseResponseText(response);
+    return parseStyleBriefFromText(text, params.optionIndex, params.palette);
+  } catch {
+    return fallback;
+  }
+}
+
+function buildCleanMinimalBackgroundPrompt(params: {
+  project: GenerationProjectContext;
+  palette: string[];
+  shape: PreviewShape;
+  generationId: string;
+  optionIndex: number;
+  feedbackRequest?: string;
+  styleBrief: StyleBrief;
+  creativeBrief: string;
+  avoidWords: string[];
+  originalityBoost?: string;
+  noTextBoost?: string;
+}): string {
+  const description = truncateForPrompt(params.project.series_description, 360);
+  const photoRequested = hasExplicitPhotoRequest({
+    project: params.project,
+    feedbackRequest: params.feedbackRequest || ""
+  });
+  const topicMotifHint = buildTopicMotifHint(params.project);
+  const paletteHint =
+    params.palette.length > 0
+      ? `Use restrained tones influenced by this palette: ${params.palette.join(", ")}.`
+      : "Use a neutral clean-minimal palette with soft whites, warm grays, slate, and one subtle accent.";
+  const avoidWordList = params.avoidWords.slice(0, 16).join(", ");
+  const minimalNegativeList = "highway, road, cars, city, skyscraper, traffic, intersections, street signs, billboards";
+
+  return [
+    "Create an ORIGINAL premium sermon-series BACKGROUND only.",
+    "Background only. no text, no letters, no words, no typography, no signage, no watermarks.",
+    "No logos and no symbols that resemble letters.",
+    "Do not include any readable characters in any language.",
+    "Create an ORIGINAL design; do not copy reference images; use them only for inspiration.",
+    "Use strong hierarchy principles: disciplined grid, intentional negative space, restrained accents.",
+    photoRequested
+      ? "Photo scene was requested by user context, but keep imagery restrained and topic-relevant with clean negative space."
+      : "Default to abstract textures, subtle paper grain, geometric motifs, and minimal illustration accents. Avoid literal scene photography unless explicitly requested.",
+    topicMotifHint,
+    !photoRequested ? `Negative scene list: ${minimalNegativeList}.` : "",
+    "Leave intentional negative space for a text overlay in the upper-left area.",
+    shapeCompositionHint(params.shape),
+    laneBriefHint(params.optionIndex),
+    `Creative brief: ${params.creativeBrief}`,
+    `Layout brief: ${params.styleBrief.layout}`,
+    `Typography intent for later overlay: title=${params.styleBrief.typography.title} | subtitle=${params.styleBrief.typography.subtitle} | passage=${params.styleBrief.typography.passage}.`,
+    params.styleBrief.motifs.length > 0 ? `Motifs: ${params.styleBrief.motifs.join(", ")}.` : "",
+    `Spacing: ${params.styleBrief.spacing}`,
+    `Color direction: ${params.styleBrief.colorDirection}`,
+    params.styleBrief.avoid.length > 0 ? `Avoid: ${params.styleBrief.avoid.join(", ")}.` : "",
+    avoidWordList ? `Avoid words (never render these as text): ${avoidWordList}.` : "",
+    description ? `Series description mood context (prompt-only, never render): ${description}.` : "",
+    paletteHint,
+    params.feedbackRequest ? `Refinement cues: ${params.feedbackRequest}.` : "",
+    params.noTextBoost || "",
+    params.originalityBoost || "",
+    "Final text policy reminder: title/subtitle are overlay-only and must NOT appear in the background art.",
+    `Variation seed: ${params.generationId}.`
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 async function generateCleanMinimalBackgroundPng(params: {
   prompt: string;
   shape: PreviewShape;
-  referenceCollageDataUrl?: string;
+  referenceDataUrls: string[];
 }): Promise<Buffer> {
   const size = OPENAI_IMAGE_SIZE_BY_SHAPE[params.shape];
 
-  if (params.referenceCollageDataUrl) {
+  if (params.referenceDataUrls.length > 0) {
     try {
       return await generatePngFromPrompt({
         prompt: params.prompt,
         size,
-        references: [{ dataUrl: params.referenceCollageDataUrl }]
+        references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl }))
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
@@ -633,6 +1185,83 @@ async function generateCleanMinimalBackgroundPng(params: {
     prompt: params.prompt,
     size
   });
+}
+
+const NO_TEXT_RETRY_BOOSTS = [
+  "Hard requirement: absolutely no letterforms. If any characters appear, regenerate a fully abstract scene.",
+  "CRITICAL NO-TEXT RETRY: zero readable text, zero glyphs, zero typographic marks. Produce pure image textures and shapes only."
+] as const;
+
+async function generateValidatedBackgroundPng(params: {
+  project: GenerationProjectContext;
+  palette: string[];
+  shape: PreviewShape;
+  generationId: string;
+  optionIndex: number;
+  feedbackRequest: string;
+  styleBrief: StyleBrief;
+  creativeBrief: string;
+  avoidWords: string[];
+  referenceDataUrls: string[];
+  originalityBoost?: string;
+}): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number }> {
+  let lastPrompt = "";
+  let lastBackgroundPng: Buffer | null = null;
+
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[attempt - 1];
+    const prompt = buildCleanMinimalBackgroundPrompt({
+      project: params.project,
+      palette: params.palette,
+      shape: params.shape,
+      generationId: params.generationId,
+      optionIndex: params.optionIndex,
+      feedbackRequest: params.feedbackRequest,
+      styleBrief: params.styleBrief,
+      creativeBrief: params.creativeBrief,
+      avoidWords: params.avoidWords,
+      originalityBoost: params.originalityBoost,
+      noTextBoost
+    });
+
+    const backgroundSource = await generateCleanMinimalBackgroundPng({
+      prompt,
+      shape: params.shape,
+      referenceDataUrls: params.referenceDataUrls
+    });
+    const backgroundPng = await normalizePngToShape(backgroundSource, params.shape);
+    const hasText = await imageHasReadableText(backgroundPng);
+    if (!hasText) {
+      return {
+        backgroundPng,
+        prompt,
+        textRetryCount: attempt
+      };
+    }
+
+    lastPrompt = prompt;
+    lastBackgroundPng = backgroundPng;
+  }
+
+  return {
+    backgroundPng: lastBackgroundPng as Buffer,
+    prompt: lastPrompt,
+    textRetryCount: 2
+  };
+}
+
+function findClosestReferenceDistance(hash: string, references: ReferenceLibraryItem[]): number {
+  let closest = Number.POSITIVE_INFINITY;
+  for (const reference of references) {
+    if (!reference.dHash) {
+      continue;
+    }
+    const distance = hammingDistanceHash(hash, reference.dHash);
+    if (distance < closest) {
+      closest = distance;
+    }
+  }
+  return closest;
 }
 
 async function renderCompositedPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
@@ -720,6 +1349,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   plannedGenerations: PlannedGeneration[];
 }): Promise<void> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
+  const referenceIndex = await loadIndex();
 
   for (const plannedGeneration of params.plannedGenerations) {
     const fallbackOutput = plannedGeneration.fallbackOutput;
@@ -736,49 +1366,104 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     try {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
       const feedbackRequest = readFeedbackRequest(plannedGeneration.input);
-      const content = {
+      const displayContent = buildOverlayDisplayContent({
         title: params.project.series_title,
         subtitle: params.project.series_subtitle,
-        passage: params.project.scripture_passages,
-        description: params.project.series_description
+        scripturePassages: params.project.scripture_passages
+      });
+      const content = {
+        title: displayContent.title,
+        subtitle: displayContent.subtitle
       };
-      const pickedReferences = await pickReferences({ count: 4, mode: "clean-minimal" });
-      const usedReferencePaths = pickedReferences.map((item) => item.relativePath);
+      const references =
+        plannedGeneration.references.length > 0
+          ? plannedGeneration.references.slice(0, 3)
+          : referenceIndex.length > 0
+            ? await sampleRefsForOption({
+                projectId: params.project.id,
+                round: plannedGeneration.round,
+                optionIndex: plannedGeneration.optionIndex,
+                n: 3
+              })
+            : [];
+      const referenceDataUrls = await buildReferenceDataUrls(references);
+      const styleBrief = await createStyleBrief({
+        optionIndex: plannedGeneration.optionIndex,
+        project: params.project,
+        references,
+        feedbackRequest,
+        palette
+      });
+      const avoidWords = buildAvoidWords(params.project);
+      const creativeBrief = buildCreativeBrief({
+        project: params.project,
+        styleBrief,
+        avoidWords
+      });
+      const masterDimensions = PREVIEW_DIMENSIONS[OPTION_MASTER_BACKGROUND_SHAPE];
+      const renderMasterAttempt = async (originalityBoost?: string) => {
+        const validatedBackground = await generateValidatedBackgroundPng({
+          project: params.project,
+          palette,
+          shape: OPTION_MASTER_BACKGROUND_SHAPE,
+          generationId: plannedGeneration.id,
+          optionIndex: plannedGeneration.optionIndex,
+          feedbackRequest,
+          styleBrief,
+          creativeBrief,
+          avoidWords,
+          referenceDataUrls,
+          originalityBoost
+        });
+        const backgroundPng = validatedBackground.backgroundPng;
+        const layout = computeCleanMinimalLayout({
+          width: masterDimensions.width,
+          height: masterDimensions.height,
+          content
+        });
+        const textPalette = await chooseTextPaletteForBackground({
+          backgroundPng,
+          sampleRegion: layout.textRegion,
+          width: masterDimensions.width,
+          height: masterDimensions.height
+        });
+        const overlaySvg = buildCleanMinimalOverlaySvg({
+          width: masterDimensions.width,
+          height: masterDimensions.height,
+          content,
+          palette: textPalette
+        });
+        const finalPng = await sharp(backgroundPng)
+          .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
+          .png()
+          .toBuffer();
+        const hash = await computeDHashFromBuffer(finalPng);
+        const closestDistance = findClosestReferenceDistance(hash, references);
 
-      let collageReferenceDataUrl: string | undefined;
-      if (usedReferencePaths.length > 0) {
-        try {
-          const collageBuffer = await buildReferenceCollageBuffer(usedReferencePaths);
-          collageReferenceDataUrl = toPngDataUrl(collageBuffer);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Unknown collage error";
-          console.warn(`Failed to build reference collage for generation ${plannedGeneration.id}. ${message}`);
-        }
+        return {
+          prompt: validatedBackground.prompt,
+          textRetryCount: validatedBackground.textRetryCount,
+          backgroundPng,
+          closestDistance
+        };
+      };
+
+      let masterAttempt = await renderMasterAttempt();
+      let originalityRetried = false;
+      if (Number.isFinite(masterAttempt.closestDistance) && masterAttempt.closestDistance < 6) {
+        originalityRetried = true;
+        masterAttempt = await renderMasterAttempt(
+          "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
+        );
       }
 
       const shapeResults = await Promise.all(
         PREVIEW_SHAPES.map(async (shape) => {
-          const prompt = buildCleanMinimalBackgroundPrompt({
-            project: params.project,
-            palette,
-            shape,
-            generationId: plannedGeneration.id,
-            optionIndex: plannedGeneration.optionIndex,
-            feedbackRequest
-          });
-
-          const backgroundSource = await generateCleanMinimalBackgroundPng({
-            prompt,
-            shape,
-            referenceCollageDataUrl: collageReferenceDataUrl
-          });
-          const backgroundPng = await normalizePngToShape(backgroundSource, shape);
-          const backgroundPath = await writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-${shape}-bg.png`,
-            png: backgroundPng
-          });
-
           const dimensions = PREVIEW_DIMENSIONS[shape];
+          const backgroundPng =
+            shape === OPTION_MASTER_BACKGROUND_SHAPE
+              ? masterAttempt.backgroundPng
+              : await normalizePngToShape(masterAttempt.backgroundPng, shape);
           const layout = computeCleanMinimalLayout({
             width: dimensions.width,
             height: dimensions.height,
@@ -790,7 +1475,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             width: dimensions.width,
             height: dimensions.height
           });
-
           const overlaySvg = buildCleanMinimalOverlaySvg({
             width: dimensions.width,
             height: dimensions.height,
@@ -801,7 +1485,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
             .png()
             .toBuffer();
-
+          const backgroundPath = await writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-${shape}-bg.png`,
+            png: backgroundPng
+          });
           const finalPath = await writeGenerationPreviewFiles({
             fileName: `${plannedGeneration.id}-${shape}.png`,
             png: finalPng
@@ -809,7 +1496,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
           return {
             shape,
-            prompt,
             backgroundPath,
             finalPath,
             designDoc: buildCleanMinimalDesignDoc({
@@ -823,7 +1509,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         })
       );
 
-      const promptUsed = shapeResults.map((result) => `${result.shape}: ${result.prompt}`).join("\n");
+      const promptUsed = [
+        `master(${OPTION_MASTER_BACKGROUND_SHAPE}): ${masterAttempt.prompt}`,
+        originalityRetried ? "[retry: originality-guard]" : "",
+        masterAttempt.textRetryCount > 0 ? `[retry: no-text x${masterAttempt.textRetryCount}]` : "",
+        "derived variants: square/wide/tall reframed from one master background."
+      ]
+        .filter(Boolean)
+        .join(" ");
       const byShape = Object.fromEntries(shapeResults.map((result) => [result.shape, result])) as Record<
         PreviewShape,
         (typeof shapeResults)[number]
@@ -862,8 +1555,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         notes: "ai+clean-min-overlay",
         promptUsed,
         meta: {
-          styleRefCount: usedReferencePaths.length,
-          usedStylePaths: usedReferencePaths
+          styleRefCount: references.length,
+          usedStylePaths: references.map((reference) => reference.path || reference.thumbPath),
+          designSpec: {
+            seed: plannedGeneration.id,
+            optionLane: optionLane(plannedGeneration.optionIndex),
+            masterBackgroundShape: OPTION_MASTER_BACKGROUND_SHAPE,
+            palette,
+            motifs: styleBrief.motifs,
+            layout: styleBrief.layout
+          }
         },
         preview: {
           square_main: byShape.square.finalPath,
@@ -1085,30 +1786,41 @@ export async function generateRoundOneAction(
     return { error: "Set up the brand kit before generating directions." };
   }
 
-  const presetId = await findInternalLayoutPresetId(session.organizationId);
-  const refsForOptions = normalizeStyleRefsForOptions(await pickStyleRefsForOptions(ROUND_OPTION_COUNT), ROUND_OPTION_COUNT);
-  const input = buildGenerationInput(project, project.brandKit);
+  const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
+  const enabledPresetKeySet = new Set(enabledPresets.map((preset) => preset.key));
+  const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
+  const selectedPresetKeys = ensureThree(
+    filterToEnabledPresets(pickInitialPresetKeys(), enabledPresetKeySet),
+    enabledPresetKeySet,
+    [...enabledPresets.map((preset) => preset.key), ...pickInitialPresetKeys()]
+  );
+  if (selectedPresetKeys.length < ROUND_OPTION_COUNT) {
+    return { error: "At least three presets are required to generate options." };
+  }
 
-  const plannedGenerations: PlannedGeneration[] = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
+  const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT);
+  const input = buildGenerationInput(project, project.brandKit, selectedPresetKeys);
+
+  const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
     const generationId = randomUUID();
-    const styleRefs = refsForOptions[index] || [];
+    const references = refsForOptions[index] || [];
 
     return {
       id: generationId,
-      presetId,
-      presetKey: INTERNAL_LAYOUT_PRESET_KEY,
+      presetId: presetIdByKey.get(presetKey) || null,
+      presetKey,
       round: 1,
       optionIndex: index,
-      styleRefs,
+      references,
       input: input as Prisma.InputJsonValue,
       fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
-        presetKey: INTERNAL_LAYOUT_PRESET_KEY,
+        presetKey,
         project,
         input,
         round: 1,
         optionIndex: index,
-        styleRefs
+        referenceItems: references
       })
     };
   });
@@ -1159,7 +1871,7 @@ export async function generateRoundTwoAction(
     emphasis: formData.get("emphasis"),
     expressiveness: formData.get("expressiveness"),
     temperature: formData.get("temperature"),
-    styleDirection: formData.get("styleDirection") || "different"
+    styleDirection: formData.get("styleDirection")
   });
 
   if (!parsed.success) {
@@ -1185,9 +1897,21 @@ export async function generateRoundTwoAction(
     return { error: "Selected direction was not found for this project." };
   }
 
-  const presetId = await findInternalLayoutPresetId(session.organizationId);
+  const styleDirection = normalizeStyleDirection(parsed.data.styleDirection);
+  const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
+  const enabledPresetKeySet = new Set(enabledPresets.map((preset) => preset.key));
+  const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
+  const selectedPresetKeys = ensureThree(
+    filterToEnabledPresets(pickPresetKeysForStyle(styleDirection), enabledPresetKeySet),
+    enabledPresetKeySet,
+    [...enabledPresets.map((preset) => preset.key), ...pickPresetKeysForStyle(styleDirection), ...pickInitialPresetKeys()]
+  );
+  if (selectedPresetKeys.length < ROUND_OPTION_COUNT) {
+    return { error: "At least three presets are required to generate options." };
+  }
+
   const input = {
-    ...buildGenerationInput(project, project.brandKit),
+    ...buildGenerationInput(project, project.brandKit, selectedPresetKeys),
     feedback: {
       sourceRound: parsed.data.currentRound,
       chosenGenerationId,
@@ -1195,56 +1919,33 @@ export async function generateRoundTwoAction(
       emphasis: parsed.data.emphasis,
       expressiveness: parsed.data.expressiveness,
       temperature: parsed.data.temperature,
-      styleDirection: parsed.data.styleDirection
+      styleDirection
     }
   };
 
   const round = parsed.data.currentRound + 1;
-  let refsForOptions = normalizeStyleRefsForOptions(await pickStyleRefsForOptions(ROUND_OPTION_COUNT), ROUND_OPTION_COUNT);
-  const selectedOptionIndex = styleDirectionToOptionIndex(parsed.data.styleDirection);
+  const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT);
 
-  if (selectedOptionIndex !== null) {
-    const currentRoundGenerations = await prisma.generation.findMany({
-      where: {
-        projectId: project.id,
-        round: parsed.data.currentRound
-      },
-      orderBy: {
-        createdAt: "asc"
-      },
-      select: {
-        output: true
-      }
-    });
-
-    const sourceOutput = currentRoundGenerations[selectedOptionIndex]?.output ?? chosenGeneration?.output ?? null;
-    const usedStylePaths = readUsedStylePathsFromOutput(sourceOutput);
-    const reusedRefs = await loadStyleRefsByPaths(usedStylePaths);
-    if (reusedRefs.length > 0) {
-      refsForOptions = Array.from({ length: ROUND_OPTION_COUNT }, () => reusedRefs);
-    }
-  }
-
-  const plannedGenerations: PlannedGeneration[] = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
+  const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
     const generationId = randomUUID();
-    const styleRefs = refsForOptions[index] || [];
+    const references = refsForOptions[index] || [];
 
     return {
       id: generationId,
-      presetId,
-      presetKey: INTERNAL_LAYOUT_PRESET_KEY,
+      presetId: presetIdByKey.get(presetKey) || null,
+      presetKey,
       round,
       optionIndex: index,
-      styleRefs,
+      references,
       input: input as Prisma.InputJsonValue,
       fallbackOutput: buildFallbackGenerationOutput({
         projectId: project.id,
-        presetKey: INTERNAL_LAYOUT_PRESET_KEY,
+        presetKey,
         project,
         input,
         round,
         optionIndex: index,
-        styleRefs
+        referenceItems: references
       })
     };
   });

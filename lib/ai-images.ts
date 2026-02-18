@@ -36,8 +36,24 @@ function paletteHint(palette: string[]): string {
   return `Use this brand palette subtly: ${palette.join(", ")}.`;
 }
 
+function truncateForPrompt(value: string | null | undefined, maxLength: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) {
+    return "";
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
 function projectHints(project: BackgroundProjectContext): string {
-  const hints = [project.seriesTitle, project.seriesSubtitle, project.scripturePassages, project.seriesDescription]
+  const hints = [
+    truncateForPrompt(project.seriesTitle, 120),
+    truncateForPrompt(project.seriesSubtitle, 120),
+    truncateForPrompt(project.scripturePassages, 140),
+    truncateForPrompt(project.seriesDescription, 320)
+  ]
     .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
     .join(" | ");
 
@@ -65,7 +81,7 @@ export function buildBackgroundPrompt(params: {
   const baseInstructions = [
     "Generate background art only for a church sermon series design system.",
     "Do not render text overlays.",
-    "No text, letters, numbers, logos, watermarks, or word-like symbols."
+    "No text, no letters, no words, no typography, no signage, no logos, no watermarks, and no word-like symbols."
   ];
   const styleInstructions = PRESET_STYLE_BY_KEY[params.presetKey] || DEFAULT_STYLE_INSTRUCTIONS;
 

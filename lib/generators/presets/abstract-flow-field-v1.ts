@@ -64,19 +64,21 @@ export const generateAbstractFlowFieldV1: PresetGenerator = (context) => {
     });
   }
 
-  const textPanelColor = mixHex(base, "#FFFFFF", 0.1);
-  layers.push({
-    type: "shape",
-    x: 120,
-    y: 130,
-    w: 920,
-    h: 820,
-    shape: "rect",
-    fill: textPanelColor,
-    stroke: lightenHex(textPanelColor, 0.24),
-    strokeWidth: 2,
-    rotation: context.rng.float(-3, 3)
-  });
+  const hazeColor = mixHex(base, "#FFFFFF", 0.08);
+  for (let index = 0; index < 3; index += 1) {
+    layers.push({
+      type: "shape",
+      x: context.rng.float(-140, 220),
+      y: context.rng.float(120, 740),
+      w: context.rng.float(540, 980),
+      h: context.rng.float(120, 220),
+      shape: "rect",
+      fill: lightenHex(hazeColor, context.rng.float(0.02, 0.1)),
+      stroke: lightenHex(hazeColor, context.rng.float(0.02, 0.1)),
+      strokeWidth: 0,
+      rotation: context.rng.float(-16, 16)
+    });
+  }
 
   layers.push(
     createTitleLayer({

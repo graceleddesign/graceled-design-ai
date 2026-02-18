@@ -1,4 +1,5 @@
 import type { DesignDoc, DesignLayer } from "@/lib/design-doc";
+import { buildOverlayDisplayContent } from "@/lib/overlay-lines";
 
 const SHAPE_DIMENSIONS = {
   square: { width: 1080, height: 1080 },
@@ -34,12 +35,10 @@ type NormalizedTemplateContext = {
   title: string;
   subtitle: string;
   passage: string;
-  description: string;
   palette: string[];
   logoPath: string | null;
   optionIndex: number;
   round: number;
-  optionLabel: string;
   variant: number;
   seed: string;
 };
@@ -334,7 +333,7 @@ function fitTitleText(params: {
 
   if (words.length === 0) {
     return {
-      text: "Sermon Series",
+      text: "Untitled Series",
       fontSize: params.minSize,
       lineCount: 1,
       lineHeight: Math.round(params.minSize * 1.2)
@@ -386,24 +385,21 @@ function fitTitleText(params: {
   };
 }
 
-function optionLabel(optionIndex: number): string {
-  const clamped = Number.isFinite(optionIndex) ? Math.max(0, Math.floor(optionIndex)) : 0;
-  return String.fromCharCode(65 + (clamped % 26));
-}
-
 function normalizeContext(params: BuildTemplateDesignDocParams): NormalizedTemplateContext {
-  const label = optionLabel(params.optionIndex);
+  const displayContent = buildOverlayDisplayContent({
+    title: params.project.title,
+    subtitle: params.project.subtitle,
+    scripturePassages: params.project.passage
+  });
 
   return {
-    title: cleanCopy(params.project.title) || "Sermon Series",
-    subtitle: cleanCopy(params.project.subtitle) || `Round ${params.round} | Option ${label}`,
-    passage: cleanCopy(params.project.passage),
-    description: cleanCopy(params.project.description),
+    title: cleanCopy(displayContent.title) || "Untitled Series",
+    subtitle: cleanCopy(displayContent.subtitle),
+    passage: cleanCopy(displayContent.scripturePassages),
     palette: normalizePalette(Array.isArray(params.brand.palette) ? params.brand.palette : []),
     logoPath: normalizeLogoPath(params.brand.logoPath),
     optionIndex: Number.isFinite(params.optionIndex) ? Math.max(0, Math.floor(params.optionIndex)) : 0,
     round: Number.isFinite(params.round) ? Math.max(1, Math.floor(params.round)) : 1,
-    optionLabel: label,
     variant: Number.isFinite(params.optionIndex) ? Math.abs(Math.floor(params.optionIndex)) % 3 : 0,
     seed: cleanCopy(params.seed) || `${params.presetKey}|${params.shape}|${params.optionIndex}|${params.round}`
   };
@@ -577,10 +573,6 @@ function addLogoLayer(layers: DesignLayer[], logoPath: string | null, metrics: S
   });
 }
 
-function buildKickerText(ctx: NormalizedTemplateContext): string {
-  return `OPTION ${ctx.optionLabel}  |  ROUND ${ctx.round}`;
-}
-
 function createVariantLeftRule(
   ctx: NormalizedTemplateContext,
   shape: TemplateShape,
@@ -615,15 +607,8 @@ function createVariantLeftRule(
   );
   const subtitleLines = subtitleText ? subtitleText.split("\n").length : 0;
 
-  const passageText = wrapAndClamp(
-    ctx.passage || ctx.description,
-    maxCharsForWidth(titleW, metrics.passageSize, 0.55),
-    shape === "tall" ? 3 : 2
-  );
+  const passageText = wrapAndClamp(ctx.passage, maxCharsForWidth(titleW, metrics.passageSize, 0.55), shape === "tall" ? 3 : 2);
   const passageY = subtitleY + subtitleLines * metrics.subtitleSize * 1.24 + Math.round(metrics.safeH * 0.03);
-
-  const kicker = buildKickerText(ctx);
-  const kickerY = metrics.safeY + metrics.safeH - Math.round(metrics.safeH * 0.08);
 
   const microRuleW = shape === "wide" ? 214 : 146;
   const microRuleY = metrics.safeY + metrics.safeH - Math.round(metrics.safeH * 0.045);
@@ -701,19 +686,6 @@ function createVariantLeftRule(
 
   layers.push(
     {
-      type: "text",
-      x: titleX,
-      y: kickerY,
-      w: titleW,
-      h: 28,
-      text: kicker,
-      fontSize: Math.max(14, Math.round(metrics.descriptionSize * 0.8)),
-      fontFamily: "Inter, Arial, sans-serif",
-      fontWeight: 600,
-      color: palette.textMuted,
-      align: "left"
-    },
-    {
       type: "shape",
       x: metrics.safeX + metrics.safeW - microRuleW,
       y: microRuleY,
@@ -773,18 +745,10 @@ function createVariantCenteredRule(
   );
   const subtitleLines = subtitleText ? subtitleText.split("\n").length : 0;
 
-  const passageText = wrapAndClamp(
-    ctx.passage || ctx.description,
-    maxCharsForWidth(titleW, metrics.passageSize, 0.55),
-    shape === "tall" ? 4 : 2
-  );
+  const passageText = wrapAndClamp(ctx.passage, maxCharsForWidth(titleW, metrics.passageSize, 0.55), shape === "tall" ? 4 : 2);
 
   const subtitleY = titleY + titleFit.lineCount * titleFit.lineHeight + Math.round(metrics.safeH * 0.05);
   const passageY = subtitleY + subtitleLines * metrics.subtitleSize * 1.24 + Math.round(metrics.safeH * 0.03);
-
-  const footnoteText = ctx.description
-    ? wrapAndClamp(ctx.description, maxCharsForWidth(metrics.safeW, metrics.descriptionSize, 0.56), 2)
-    : buildKickerText(ctx);
 
   const layers: DesignLayer[] = [
     {
@@ -861,19 +825,6 @@ function createVariantCenteredRule(
   const bottomY = metrics.safeY + metrics.safeH - Math.round(metrics.safeH * 0.09);
   layers.push(
     {
-      type: "text",
-      x: metrics.safeX,
-      y: bottomY,
-      w: metrics.safeW,
-      h: Math.round(metrics.descriptionSize * 2.6),
-      text: footnoteText,
-      fontSize: metrics.descriptionSize,
-      fontFamily: "Inter, Arial, sans-serif",
-      fontWeight: 500,
-      color: palette.textMuted,
-      align: "center"
-    },
-    {
       type: "shape",
       x: metrics.safeX,
       y: bottomY - 20,
@@ -940,15 +891,7 @@ function createVariantInsetCard(
   );
   const subtitleLines = subtitleText ? subtitleText.split("\n").length : 0;
 
-  const passageText = wrapAndClamp(
-    ctx.passage || ctx.description,
-    maxCharsForWidth(rightMetaW, metrics.passageSize, 0.54),
-    shape === "tall" ? 3 : 2
-  );
-
-  const descriptionText = ctx.description
-    ? wrapAndClamp(ctx.description, maxCharsForWidth(cardW * 0.54, metrics.descriptionSize, 0.56), 2)
-    : buildKickerText(ctx);
+  const passageText = wrapAndClamp(ctx.passage, maxCharsForWidth(rightMetaW, metrics.passageSize, 0.54), shape === "tall" ? 3 : 2);
 
   const layers: DesignLayer[] = [
     {
@@ -1056,19 +999,6 @@ function createVariantInsetCard(
       fill: mixHex(palette.accentStrong, palette.surface, 0.22),
       stroke: mixHex(palette.accentStrong, palette.surface, 0.22),
       strokeWidth: 0
-    },
-    {
-      type: "text",
-      x: cardX + 20,
-      y: cardY + cardH - Math.round(cardH * 0.14),
-      w: Math.round(cardW * 0.56),
-      h: Math.round(metrics.descriptionSize * 2.6),
-      text: descriptionText,
-      fontSize: metrics.descriptionSize,
-      fontFamily: "Inter, Arial, sans-serif",
-      fontWeight: 500,
-      color: palette.textMuted,
-      align: "left"
     }
   );
 
@@ -1087,7 +1017,8 @@ function buildTypeCleanMinDoc(ctx: NormalizedTemplateContext, shape: TemplateSha
   } else if (ctx.variant === 1) {
     layers.push(...createVariantCenteredRule(ctx, shape, metrics, palette, rng));
   } else {
-    layers.push(...createVariantInsetCard(ctx, shape, metrics, palette));
+    // Avoid hard-edged inset panels; keep this lane text-forward and open.
+    layers.push(...createVariantLeftRule(ctx, shape, metrics, palette, rng));
   }
 
   addLogoLayer(layers, ctx.logoPath, metrics);

@@ -11,7 +11,7 @@ export async function GET() {
   try {
     const pngBuffer = await generatePngFromPrompt({
       prompt:
-        "Draw a premium, modern, minimal sermon series graphic background. No text. Subtle gradient + clean shapes.",
+        "Draw a premium, modern, minimal sermon series graphic background. no text, no letters, no words, no typography, no signage, no watermarks. Subtle gradient + clean shapes.",
       size: "1024x1024",
       quality: "medium"
     });
