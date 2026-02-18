@@ -1,5 +1,7 @@
 import sharp from "sharp";
+import type { LockupRecipe } from "@/lib/design-brief";
 import type { DesignDoc, DesignLayer } from "@/lib/design-doc";
+import { buildOverlayDisplayContent } from "@/lib/overlay-lines";
 
 export type CleanMinimalShape = "square" | "wide" | "tall";
 
@@ -7,11 +9,10 @@ export type CleanMinimalTextContent = {
   title: string;
   subtitle?: string | null;
   passage?: string | null;
-  description?: string | null;
 };
 
 type TextBlockLayout = {
-  key: "title" | "subtitle" | "passage" | "description";
+  key: "title" | "subtitle" | "passage";
   x: number;
   y: number;
   w: number;
@@ -21,6 +22,8 @@ type TextBlockLayout = {
   lineHeight: number;
   fontFamily: string;
   lines: string[];
+  align: "left" | "center" | "right";
+  letterSpacing: number;
 };
 
 export type CleanMinimalTextRegion = {
@@ -34,10 +37,10 @@ export type CleanMinimalTextPalette = {
   primary: string;
   secondary: string;
   tertiary: string;
-  backingFill: string;
-  backingStroke: string;
   rule: string;
   accent: string;
+  autoScrim: boolean;
+  scrimTint: "#FFFFFF" | "#000000";
 };
 
 export type CleanMinimalLayout = {
@@ -49,12 +52,31 @@ export type CleanMinimalLayout = {
   textRegion: CleanMinimalTextRegion;
   backingRegion: CleanMinimalTextRegion;
   blocks: TextBlockLayout[];
-  descriptionWasTruncated: boolean;
 };
 
 const TITLE_STACK = "'Inter','Helvetica','Arial',sans-serif";
 const BODY_STACK = "'Inter','Helvetica','Arial',sans-serif";
 const SERIF_STACK = "'Georgia','Times New Roman',serif";
+const DEFAULT_LOCKUP_RECIPE: LockupRecipe = {
+  layoutIntent: "minimal_clean",
+  titleTreatment: "singleline",
+  hierarchy: {
+    titleScale: 1.2,
+    subtitleScale: 0.56,
+    tracking: 0.02,
+    case: "upper"
+  },
+  alignment: "left",
+  placement: {
+    anchor: "top_left",
+    safeMarginPct: 0.08,
+    maxTitleWidthPct: 0.55
+  },
+  ornament: {
+    kind: "rule_dot",
+    weight: "thin"
+  }
+};
 
 function clamp(value: number, min: number, max: number): number {
   if (value < min) {
@@ -64,23 +86,6 @@ function clamp(value: number, min: number, max: number): number {
     return max;
   }
   return value;
-}
-
-function normalizeText(value: string | null | undefined): string {
-  if (typeof value !== "string") {
-    return "";
-  }
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function truncateWithEllipsis(value: string, maxChars: number): { text: string; truncated: boolean } {
-  if (value.length <= maxChars) {
-    return { text: value, truncated: false };
-  }
-  return {
-    text: `${value.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`,
-    truncated: true
-  };
 }
 
 function estimateCharsPerLine(width: number, fontSize: number): number {
@@ -124,6 +129,46 @@ function wrapText(value: string, maxCharsPerLine: number, maxLines: number): str
   return lines.slice(0, maxLines);
 }
 
+function toTitleCase(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\b([a-z])/g, (match) => match.toUpperCase());
+}
+
+function applyCaseTreatment(value: string, mode: LockupRecipe["hierarchy"]["case"]): string {
+  if (!value.trim()) {
+    return "";
+  }
+
+  if (mode === "upper" || mode === "small_caps") {
+    return value.toUpperCase();
+  }
+  if (mode === "title_case") {
+    return toTitleCase(value);
+  }
+
+  return value;
+}
+
+function maxTitleLinesForTreatment(
+  treatment: LockupRecipe["titleTreatment"],
+  shape: CleanMinimalShape
+): number {
+  if (treatment === "singleline") {
+    return 1;
+  }
+  if (treatment === "split") {
+    return 2;
+  }
+  if (treatment === "stacked") {
+    return shape === "tall" ? 4 : 3;
+  }
+  if (treatment === "boxed") {
+    return 3;
+  }
+  return 2;
+}
+
 function chooseTitleFontSizeByLength(titleLength: number, shape: CleanMinimalShape, width: number, height: number): number {
   const base = Math.min(width, height);
   const laneFactor = shape === "wide" ? 0.98 : shape === "tall" ? 1.04 : 1;
@@ -155,12 +200,15 @@ function renderTextBlockSvg(block: TextBlockLayout, color: string): string {
   }
 
   const firstBaseline = block.y + block.fontSize;
+  const textX = block.align === "center" ? block.x + block.w / 2 : block.align === "right" ? block.x + block.w : block.x;
+  const textAnchor = block.align === "center" ? "middle" : block.align === "right" ? "end" : "start";
   const lineParts = block.lines.map((line, index) => {
     const y = firstBaseline + index * block.lineHeight;
-    return `<tspan x="${block.x}" y="${y}">${escapeXml(line)}</tspan>`;
+    return `<tspan x="${textX}" y="${y}">${escapeXml(line)}</tspan>`;
   });
 
-  return `<text x="${block.x}" y="${firstBaseline}" fill="${color}" font-family="${block.fontFamily}" font-size="${block.fontSize}" font-weight="${block.fontWeight}" text-anchor="start">${lineParts.join("")}</text>`;
+  const letterSpacing = Number.isFinite(block.letterSpacing) ? block.letterSpacing : 0;
+  return `<text x="${textX}" y="${firstBaseline}" fill="${color}" font-family="${block.fontFamily}" font-size="${block.fontSize}" font-weight="${block.fontWeight}" text-anchor="${textAnchor}" letter-spacing="${letterSpacing}">${lineParts.join("")}</text>`;
 }
 
 function shapeFromDimensions(width: number, height: number): CleanMinimalShape {
@@ -173,120 +221,184 @@ function shapeFromDimensions(width: number, height: number): CleanMinimalShape {
   return "square";
 }
 
+function channelToLinear(channel: number): number {
+  const normalized = channel / 255;
+  return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function relativeLuminanceFromRgb(red: number, green: number, blue: number): number {
+  return 0.2126 * channelToLinear(red) + 0.7152 * channelToLinear(green) + 0.0722 * channelToLinear(blue);
+}
+
+function parseHexColor(input: string): [number, number, number] {
+  const normalized = input.trim().replace(/^#/, "");
+  if (normalized.length !== 6) {
+    return [15, 23, 42];
+  }
+  return [
+    Number.parseInt(normalized.slice(0, 2), 16),
+    Number.parseInt(normalized.slice(2, 4), 16),
+    Number.parseInt(normalized.slice(4, 6), 16)
+  ];
+}
+
+function relativeLuminanceFromHex(color: string): number {
+  const [red, green, blue] = parseHexColor(color);
+  return relativeLuminanceFromRgb(red, green, blue);
+}
+
+function contrastRatio(a: number, b: number): number {
+  const lighter = Math.max(a, b);
+  const darker = Math.min(a, b);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 export function computeCleanMinimalLayout(params: {
   width: number;
   height: number;
   content: CleanMinimalTextContent;
+  lockupRecipe?: LockupRecipe;
 }): CleanMinimalLayout {
   const shape = shapeFromDimensions(params.width, params.height);
   const width = params.width;
   const height = params.height;
-  const marginX = Math.round(width * (shape === "wide" ? 0.072 : 0.085));
-  const marginY = Math.round(height * (shape === "tall" ? 0.078 : 0.09));
+  const recipe = params.lockupRecipe || DEFAULT_LOCKUP_RECIPE;
+  const marginX = Math.round(width * recipe.placement.safeMarginPct);
+  const marginY = Math.round(height * recipe.placement.safeMarginPct);
+  const displayContent = buildOverlayDisplayContent({
+    title: params.content.title,
+    subtitle: params.content.subtitle,
+    scripturePassages: params.content.passage
+  });
 
-  const textWidth = Math.round(width * (shape === "wide" ? 0.46 : shape === "tall" ? 0.74 : 0.7));
-  const title = normalizeText(params.content.title) || "Untitled Series";
-  const subtitle = normalizeText(params.content.subtitle);
-  const passage = normalizeText(params.content.passage);
-  const descriptionSource = normalizeText(params.content.description);
-  const truncatedDescription = truncateWithEllipsis(descriptionSource, 140);
+  const textWidth = clamp(
+    Math.round(width * recipe.placement.maxTitleWidthPct),
+    Math.round(width * 0.32),
+    Math.round(width * 0.8)
+  );
+  const centeredAnchor =
+    recipe.placement.anchor === "top_center" ||
+    recipe.placement.anchor === "bottom_center" ||
+    recipe.placement.anchor === "center";
+  const textX =
+    centeredAnchor
+      ? Math.round((width - textWidth) / 2)
+      : recipe.alignment === "left"
+      ? marginX
+      : recipe.alignment === "center"
+        ? Math.round((width - textWidth) / 2)
+        : Math.max(0, width - marginX - textWidth);
+  const title = applyCaseTreatment(displayContent.title, recipe.hierarchy.case);
+  const subtitle = applyCaseTreatment(displayContent.subtitle, recipe.hierarchy.case);
+  const passage = applyCaseTreatment(displayContent.scripturePassages, recipe.hierarchy.case === "as_is" ? "as_is" : "title_case");
 
-  const titleFontSize = clamp(chooseTitleFontSizeByLength(title.length, shape, width, height), 52, shape === "tall" ? 150 : 132);
-  const subtitleFontSize = clamp(Math.round(titleFontSize * 0.42), 22, 52);
+  const baseTitleFontSize = chooseTitleFontSizeByLength(title.length, shape, width, height);
+  const titleFontSize = clamp(
+    Math.round(baseTitleFontSize * recipe.hierarchy.titleScale),
+    44,
+    shape === "tall" ? 170 : 148
+  );
+  const subtitleFontSize = clamp(Math.round(titleFontSize * recipe.hierarchy.subtitleScale), 18, 64);
   const passageFontSize = clamp(Math.round(subtitleFontSize * 0.82), 18, 40);
-  const descriptionFontSize = clamp(Math.round(subtitleFontSize * 0.7), 16, 30);
 
-  const titleLines = wrapText(title, estimateCharsPerLine(textWidth, titleFontSize), shape === "tall" ? 4 : 3);
+  const titleLines = wrapText(
+    title,
+    estimateCharsPerLine(textWidth, titleFontSize),
+    maxTitleLinesForTreatment(recipe.titleTreatment, shape)
+  );
   const subtitleLines = wrapText(subtitle, estimateCharsPerLine(textWidth, subtitleFontSize), 2);
   const passageLines = wrapText(passage, estimateCharsPerLine(textWidth, passageFontSize), 2);
-  const descriptionLines = wrapText(
-    truncatedDescription.text,
-    estimateCharsPerLine(Math.round(textWidth * 0.96), descriptionFontSize),
-    3
-  );
 
   const blocks: TextBlockLayout[] = [];
   const titleLineHeight = Math.round(titleFontSize * 1.08);
   const subtitleLineHeight = Math.round(subtitleFontSize * 1.2);
   const passageLineHeight = Math.round(passageFontSize * 1.24);
-  const descriptionLineHeight = Math.round(descriptionFontSize * 1.28);
+  const titleHeight = Math.max(titleFontSize + 10, titleLines.length * titleLineHeight);
+  const subtitleHeight = subtitleLines.length > 0 ? Math.max(subtitleFontSize + 8, subtitleLines.length * subtitleLineHeight) : 0;
+  const passageHeight = passageLines.length > 0 ? Math.max(passageFontSize + 6, passageLines.length * passageLineHeight) : 0;
+  const blockGap = Math.round(height * 0.018);
+  const totalContentHeight =
+    titleHeight + (subtitleHeight > 0 ? subtitleHeight + blockGap : 0) + (passageHeight > 0 ? passageHeight + blockGap : 0);
+  let currentY = marginY + Math.round(height * (shape === "tall" ? 0.02 : 0.015));
 
-  let currentY = marginY + Math.round(height * (shape === "tall" ? 0.03 : 0.02));
+  if (recipe.placement.anchor === "center") {
+    currentY = Math.round((height - totalContentHeight) / 2);
+  } else if (recipe.placement.anchor === "bottom_left" || recipe.placement.anchor === "bottom_center") {
+    currentY = height - marginY - totalContentHeight;
+  }
+
+  currentY = clamp(currentY, marginY, Math.max(marginY, height - marginY - totalContentHeight));
 
   blocks.push({
     key: "title",
-    x: marginX,
+    x: textX,
     y: currentY,
     w: textWidth,
-    h: Math.max(titleFontSize + 10, titleLines.length * titleLineHeight),
+    h: titleHeight,
     fontSize: titleFontSize,
     fontWeight: 720,
     lineHeight: titleLineHeight,
     fontFamily: TITLE_STACK,
-    lines: titleLines
+    lines: titleLines,
+    align: recipe.alignment,
+    letterSpacing: clamp(Math.round(titleFontSize * recipe.hierarchy.tracking), -12, 22)
   });
 
-  currentY += Math.max(titleFontSize + 10, titleLines.length * titleLineHeight) + Math.round(height * 0.02);
+  currentY += titleHeight + blockGap;
 
   if (subtitleLines.length > 0) {
     blocks.push({
       key: "subtitle",
-      x: marginX,
+      x: textX,
       y: currentY,
       w: textWidth,
-      h: Math.max(subtitleFontSize + 8, subtitleLines.length * subtitleLineHeight),
+      h: subtitleHeight,
       fontSize: subtitleFontSize,
       fontWeight: 540,
       lineHeight: subtitleLineHeight,
       fontFamily: BODY_STACK,
-      lines: subtitleLines
+      lines: subtitleLines,
+      align: recipe.alignment,
+      letterSpacing: clamp(Math.round(subtitleFontSize * recipe.hierarchy.tracking), -10, 18)
     });
-    currentY += Math.max(subtitleFontSize + 8, subtitleLines.length * subtitleLineHeight) + Math.round(height * 0.013);
+    currentY += subtitleHeight + blockGap;
   }
 
   if (passageLines.length > 0) {
     blocks.push({
       key: "passage",
-      x: marginX,
+      x: textX,
       y: currentY,
       w: textWidth,
-      h: Math.max(passageFontSize + 6, passageLines.length * passageLineHeight),
+      h: passageHeight,
       fontSize: passageFontSize,
       fontWeight: 430,
       lineHeight: passageLineHeight,
       fontFamily: SERIF_STACK,
-      lines: passageLines
+      lines: passageLines,
+      align: recipe.alignment,
+      letterSpacing: clamp(Math.round(passageFontSize * (recipe.hierarchy.tracking * 0.7)), -8, 14)
     });
   }
 
-  if (descriptionLines.length > 0) {
-    blocks.push({
-      key: "description",
-      x: marginX,
-      y: height - marginY - Math.max(descriptionFontSize + 6, descriptionLines.length * descriptionLineHeight),
-      w: Math.round(textWidth * 0.96),
-      h: Math.max(descriptionFontSize + 6, descriptionLines.length * descriptionLineHeight),
-      fontSize: descriptionFontSize,
-      fontWeight: 460,
-      lineHeight: descriptionLineHeight,
-      fontFamily: BODY_STACK,
-      lines: descriptionLines
-    });
-  }
-
-  const textRegionHeight = Math.round(height * (shape === "tall" ? 0.56 : 0.48));
+  const textRegionTop = clamp(Math.round(blocks[0]?.y || marginY) - Math.round(height * 0.03), 0, Math.max(0, height - 2));
+  const textRegionHeight = clamp(
+    Math.round(totalContentHeight + Math.round(height * 0.06)),
+    2,
+    Math.max(2, height - textRegionTop - marginY)
+  );
   const textRegion: CleanMinimalTextRegion = {
-    left: marginX,
-    top: marginY,
+    left: textX,
+    top: textRegionTop,
     width: textWidth,
     height: textRegionHeight
   };
 
   const backingRegion: CleanMinimalTextRegion = {
-    left: Math.max(0, marginX - Math.round(width * 0.025)),
-    top: Math.max(0, marginY - Math.round(height * 0.02)),
-    width: Math.min(width - marginX, textWidth + Math.round(width * 0.07)),
-    height: Math.min(height - marginY, Math.round(height * (shape === "tall" ? 0.68 : 0.58)))
+    left: Math.max(0, textRegion.left - Math.round(width * 0.025)),
+    top: Math.max(0, textRegion.top - Math.round(height * 0.02)),
+    width: Math.min(width - textRegion.left, textRegion.width + Math.round(width * 0.07)),
+    height: Math.min(height - textRegion.top, textRegion.height + Math.round(height * 0.08))
   };
 
   return {
@@ -297,8 +409,7 @@ export function computeCleanMinimalLayout(params: {
     marginY,
     textRegion,
     backingRegion,
-    blocks,
-    descriptionWasTruncated: truncatedDescription.truncated
+    blocks
   };
 }
 
@@ -325,28 +436,34 @@ export async function chooseTextPaletteForBackground(params: {
   const red = stats.channels[0]?.mean ?? 128;
   const green = stats.channels[1]?.mean ?? red;
   const blue = stats.channels[2]?.mean ?? green;
-  const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+  const backgroundLuminance = relativeLuminanceFromRgb(red, green, blue);
+  const usesDarkText = backgroundLuminance >= 0.57;
 
-  if (luminance >= 0.57) {
-    return {
-      primary: "#0F172A",
-      secondary: "#334155",
-      tertiary: "#475569",
-      backingFill: "rgba(255,255,255,0.22)",
-      backingStroke: "rgba(255,255,255,0.34)",
-      rule: "rgba(15,23,42,0.46)",
-      accent: "rgba(15,23,42,0.64)"
-    };
-  }
+  const basePalette = usesDarkText
+    ? {
+        primary: "#0F172A",
+        secondary: "#334155",
+        tertiary: "#475569",
+        rule: "rgba(15,23,42,0.46)",
+        accent: "rgba(15,23,42,0.64)",
+        scrimTint: "#FFFFFF" as const
+      }
+    : {
+        primary: "#F8FAFC",
+        secondary: "#E2E8F0",
+        tertiary: "#CBD5E1",
+        rule: "rgba(226,232,240,0.56)",
+        accent: "rgba(248,250,252,0.72)",
+        scrimTint: "#000000" as const
+      };
+
+  const textLuminance = relativeLuminanceFromHex(basePalette.primary);
+  const measuredContrast = contrastRatio(backgroundLuminance, textLuminance);
+  const autoScrim = measuredContrast < 4.8;
 
   return {
-    primary: "#F8FAFC",
-    secondary: "#E2E8F0",
-    tertiary: "#CBD5E1",
-    backingFill: "rgba(2,6,23,0.3)",
-    backingStroke: "rgba(148,163,184,0.3)",
-    rule: "rgba(226,232,240,0.56)",
-    accent: "rgba(248,250,252,0.72)"
+    ...basePalette,
+    autoScrim
   };
 }
 
@@ -355,40 +472,75 @@ export function buildCleanMinimalOverlaySvg(params: {
   height: number;
   content: CleanMinimalTextContent;
   palette: CleanMinimalTextPalette;
+  lockupRecipe?: LockupRecipe;
 }): string {
   const layout = computeCleanMinimalLayout({
     width: params.width,
     height: params.height,
-    content: params.content
+    content: params.content,
+    lockupRecipe: params.lockupRecipe
   });
 
   const titleBlock = layout.blocks.find((block) => block.key === "title");
   const subtitleBlock = layout.blocks.find((block) => block.key === "subtitle");
   const passageBlock = layout.blocks.find((block) => block.key === "passage");
-  const descriptionBlock = layout.blocks.find((block) => block.key === "description");
-
-  const topRuleY = layout.marginY - Math.round(layout.height * 0.03);
+  const topRuleY = layout.textRegion.top - Math.round(layout.height * 0.03);
+  const topRuleX = layout.textRegion.left;
   const topRuleWidth = Math.round(layout.textRegion.width * 0.58);
+  const isTall = layout.shape === "tall";
+  const ornamentKind = params.lockupRecipe?.ornament?.kind || "rule_dot";
+  const ornamentWeight = params.lockupRecipe?.ornament?.weight || "thin";
+  const ornamentStroke = ornamentWeight === "bold" ? 3 : ornamentWeight === "med" ? 2 : 1.4;
+  const titleTreatment = params.lockupRecipe?.titleTreatment || "singleline";
 
   const parts: string[] = [];
   parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}">`);
-  parts.push("<defs>");
-  parts.push("<filter id=\"cm-soft\" x=\"-15%\" y=\"-15%\" width=\"130%\" height=\"130%\">\n<feGaussianBlur stdDeviation=\"10\" />\n</filter>");
-  parts.push(
-    `<linearGradient id="cm-desc-fade" x1="0" y1="0" x2="1" y2="0"><stop offset="78%" stop-color="${params.palette.tertiary}" stop-opacity="1" /><stop offset="100%" stop-color="${params.palette.tertiary}" stop-opacity="0.6" /></linearGradient>`
-  );
-  parts.push("</defs>");
 
-  parts.push(
-    `<rect x="${layout.backingRegion.left}" y="${layout.backingRegion.top}" width="${layout.backingRegion.width}" height="${layout.backingRegion.height}" rx="22" fill="${params.palette.backingFill}" stroke="${params.palette.backingStroke}" stroke-width="1" filter="url(#cm-soft)" />`
-  );
+  if (params.palette.autoScrim) {
+    parts.push("<defs>");
+    parts.push(
+      `<linearGradient id="cm-scrim-main" x1="0" y1="0" x2="${isTall ? "0" : "1"}" y2="${isTall ? "1" : "0"}">`
+    );
+    parts.push(`<stop offset="0%" stop-color="${params.palette.scrimTint}" stop-opacity="0.18" />`);
+    parts.push(`<stop offset="45%" stop-color="${params.palette.scrimTint}" stop-opacity="0.09" />`);
+    parts.push(`<stop offset="100%" stop-color="${params.palette.scrimTint}" stop-opacity="0.00" />`);
+    parts.push("</linearGradient>");
+    parts.push('<radialGradient id="cm-scrim-soft" cx="22%" cy="20%" r="62%">');
+    parts.push(`<stop offset="0%" stop-color="${params.palette.scrimTint}" stop-opacity="0.14" />`);
+    parts.push(`<stop offset="100%" stop-color="${params.palette.scrimTint}" stop-opacity="0.00" />`);
+    parts.push("</radialGradient>");
+    parts.push("</defs>");
+    parts.push(`<rect x="0" y="0" width="${layout.width}" height="${layout.height}" fill="url(#cm-scrim-main)" />`);
+    parts.push(`<rect x="0" y="0" width="${layout.width}" height="${layout.height}" fill="url(#cm-scrim-soft)" />`);
+  }
 
-  parts.push(
-    `<line x1="${layout.marginX}" y1="${topRuleY}" x2="${layout.marginX + topRuleWidth}" y2="${topRuleY}" stroke="${params.palette.rule}" stroke-width="2" stroke-linecap="round" />`
-  );
-  parts.push(
-    `<circle cx="${layout.marginX + topRuleWidth + 20}" cy="${topRuleY}" r="5" fill="${params.palette.accent}" />`
-  );
+  if (ornamentKind === "rule_dot") {
+    parts.push(
+      `<line x1="${topRuleX}" y1="${topRuleY}" x2="${topRuleX + topRuleWidth}" y2="${topRuleY}" stroke="${params.palette.rule}" stroke-width="${ornamentStroke}" stroke-linecap="round" />`
+    );
+    parts.push(`<circle cx="${topRuleX + topRuleWidth + 20}" cy="${topRuleY}" r="${ornamentStroke + 2}" fill="${params.palette.accent}" />`);
+  } else if (ornamentKind === "grain") {
+    parts.push(
+      `<line x1="${topRuleX}" y1="${topRuleY}" x2="${topRuleX + topRuleWidth}" y2="${topRuleY}" stroke="${params.palette.rule}" stroke-width="${ornamentStroke}" stroke-linecap="round" stroke-dasharray="2 7" />`
+    );
+  } else if (ornamentKind === "wheat") {
+    parts.push(
+      `<line x1="${topRuleX}" y1="${topRuleY}" x2="${topRuleX + topRuleWidth}" y2="${topRuleY}" stroke="${params.palette.rule}" stroke-width="${ornamentStroke}" stroke-linecap="round" />`
+    );
+    parts.push(`<circle cx="${topRuleX + topRuleWidth + 16}" cy="${topRuleY - 5}" r="3" fill="${params.palette.accent}" />`);
+    parts.push(`<circle cx="${topRuleX + topRuleWidth + 22}" cy="${topRuleY}" r="3" fill="${params.palette.accent}" />`);
+    parts.push(`<circle cx="${topRuleX + topRuleWidth + 16}" cy="${topRuleY + 5}" r="3" fill="${params.palette.accent}" />`);
+  } else if (ornamentKind === "frame") {
+    parts.push(
+      `<rect x="${layout.backingRegion.left}" y="${layout.backingRegion.top}" width="${layout.backingRegion.width}" height="${layout.backingRegion.height}" rx="8" fill="none" stroke="${params.palette.rule}" stroke-width="${ornamentStroke}" />`
+    );
+  }
+
+  if (titleTreatment === "boxed" || titleTreatment === "badge") {
+    parts.push(
+      `<rect x="${layout.textRegion.left - 10}" y="${layout.textRegion.top - 8}" width="${layout.textRegion.width + 20}" height="${layout.textRegion.height + 16}" rx="${titleTreatment === "badge" ? 16 : 8}" fill="none" stroke="${params.palette.rule}" stroke-width="1.2" />`
+    );
+  }
 
   if (titleBlock) {
     parts.push(renderTextBlockSvg(titleBlock, params.palette.primary));
@@ -397,11 +549,7 @@ export function buildCleanMinimalOverlaySvg(params: {
     parts.push(renderTextBlockSvg(subtitleBlock, params.palette.secondary));
   }
   if (passageBlock) {
-    parts.push(renderTextBlockSvg(passageBlock, params.palette.secondary));
-  }
-  if (descriptionBlock) {
-    const descColor = layout.descriptionWasTruncated ? "url(#cm-desc-fade)" : params.palette.tertiary;
-    parts.push(renderTextBlockSvg(descriptionBlock, descColor));
+    parts.push(renderTextBlockSvg(passageBlock, params.palette.tertiary));
   }
 
   parts.push("</svg>");
@@ -414,22 +562,19 @@ export function buildCleanMinimalDesignDoc(params: {
   content: CleanMinimalTextContent;
   palette: CleanMinimalTextPalette;
   backgroundImagePath: string | null;
+  lockupRecipe?: LockupRecipe;
 }): DesignDoc {
   const layout = computeCleanMinimalLayout({
     width: params.width,
     height: params.height,
-    content: params.content
+    content: params.content,
+    lockupRecipe: params.lockupRecipe
   });
 
   const layers: DesignLayer[] = [];
 
   for (const block of layout.blocks) {
-    const color =
-      block.key === "title"
-        ? params.palette.primary
-        : block.key === "description"
-          ? params.palette.tertiary
-          : params.palette.secondary;
+    const color = block.key === "title" ? params.palette.primary : block.key === "passage" ? params.palette.tertiary : params.palette.secondary;
 
     layers.push({
       type: "text",
@@ -442,7 +587,8 @@ export function buildCleanMinimalDesignDoc(params: {
       fontFamily: block.key === "passage" ? "Georgia" : "Inter",
       fontWeight: block.fontWeight,
       color,
-      align: "left"
+      align: block.align,
+      letterSpacing: block.letterSpacing
     });
   }
 

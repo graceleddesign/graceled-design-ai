@@ -1,4 +1,4 @@
-import { access, readFile } from "fs/promises";
+import fs from "fs/promises";
 import path from "path";
 import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
@@ -9,6 +9,19 @@ const PX_PER_INCH = 96;
 
 function stripHash(hex: string): string {
   return hex.replace(/^#/, "").toUpperCase();
+}
+
+function isHexColor(value: string): boolean {
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim());
+}
+
+function toPptColor(value: string, fallback: string): string {
+  return isHexColor(value) ? stripHash(value) : stripHash(fallback);
+}
+
+function usesPaintReference(value: string, referenceId: string): boolean {
+  const normalized = value.replace(/\s+/g, "");
+  return normalized.toLowerCase() === `url(#${referenceId.toLowerCase()})`;
 }
 
 function pxToInches(px: number): number {
@@ -75,11 +88,18 @@ function getPublicFilePath(assetPath: string): string | null {
 
 async function fileExists(filePath: string): Promise<boolean> {
   try {
-    await access(filePath);
+    await fs.access(filePath);
     return true;
   } catch {
     return false;
   }
+}
+
+async function publicFileToDataUri(publicPath: string, mimeType: string): Promise<string> {
+  const clean = publicPath.startsWith("/") ? publicPath.slice(1) : publicPath;
+  const abs = path.join(process.cwd(), "public", clean);
+  const bytes = await fs.readFile(abs);
+  return `data:${mimeType};base64,${bytes.toString("base64")}`;
 }
 
 function detectMimeType(filePath: string): string {
@@ -109,7 +129,7 @@ async function resolveSvgImageHref(src: string): Promise<string> {
     return src;
   }
 
-  const bytes = await readFile(filePath);
+  const bytes = await fs.readFile(filePath);
   const mimeType = detectMimeType(filePath);
   return `data:${mimeType};base64,${bytes.toString("base64")}`;
 }
@@ -222,6 +242,10 @@ export async function buildFinalPptx(designDoc: DesignDoc): Promise<Buffer> {
   };
 
   for (const layer of designDoc.layers) {
+    if (isGuideLayer(layer)) {
+      continue;
+    }
+
     const x = pxToInches(layer.x);
     const y = pxToInches(layer.y);
     const w = pxToInches(layer.w);
@@ -249,10 +273,10 @@ export async function buildFinalPptx(designDoc: DesignDoc): Promise<Buffer> {
         w,
         h,
         fill: {
-          color: stripHash(layer.fill)
+          color: toPptColor(layer.fill, "#FFFFFF")
         },
         line: {
-          color: stripHash(layer.stroke),
+          color: toPptColor(layer.stroke, "#000000"),
           pt: pxToPoints(layer.strokeWidth)
         }
       });
@@ -295,20 +319,68 @@ type BuildFinalSvgOptions = {
   includeImages?: boolean;
 };
 
+function isGuideLayer(layer: DesignDoc["layers"][number]): boolean {
+  return layer.purpose === "guide";
+}
+
 export async function buildFinalSvg(designDoc: DesignDoc, options: BuildFinalSvgOptions = {}): Promise<string> {
   const includeBackground = options.includeBackground ?? true;
   const includeImages = options.includeImages ?? true;
   const svgParts: string[] = [];
+  const hasScrim = designDoc.layers.some(
+    (layer) =>
+      !isGuideLayer(layer) &&
+      layer.type === "shape" &&
+      (usesPaintReference(layer.fill, "scrim") || usesPaintReference(layer.stroke, "scrim"))
+  );
+  const hasScrimTall = designDoc.layers.some(
+    (layer) =>
+      !isGuideLayer(layer) &&
+      layer.type === "shape" &&
+      (usesPaintReference(layer.fill, "scrimTall") || usesPaintReference(layer.stroke, "scrimTall"))
+  );
 
   svgParts.push('<?xml version="1.0" encoding="UTF-8"?>');
   svgParts.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${designDoc.width}" height="${designDoc.height}" viewBox="0 0 ${designDoc.width} ${designDoc.height}">`
   );
+  if (hasScrim || hasScrimTall) {
+    svgParts.push("<defs>");
+    if (hasScrim) {
+      svgParts.push('<linearGradient id="scrim" x1="0" y1="0" x2="1" y2="0">');
+      svgParts.push('<stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.18" />');
+      svgParts.push('<stop offset="55%" stop-color="#FFFFFF" stop-opacity="0.08" />');
+      svgParts.push('<stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.00" />');
+      svgParts.push("</linearGradient>");
+    }
+    if (hasScrimTall) {
+      svgParts.push('<linearGradient id="scrimTall" x1="0" y1="0" x2="0" y2="1">');
+      svgParts.push('<stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.20" />');
+      svgParts.push('<stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.09" />');
+      svgParts.push('<stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.00" />');
+      svgParts.push("</linearGradient>");
+    }
+    svgParts.push("</defs>");
+  }
   if (includeBackground) {
     svgParts.push(`<rect x="0" y="0" width="${designDoc.width}" height="${designDoc.height}" fill="${escapeXml(designDoc.background.color)}" />`);
   }
+  if (designDoc.backgroundImagePath) {
+    try {
+      const backgroundImageHref = await publicFileToDataUri(designDoc.backgroundImagePath, "image/png");
+      svgParts.push(
+        `<image href="${escapeXml(backgroundImageHref)}" x="0" y="0" width="${designDoc.width}" height="${designDoc.height}" preserveAspectRatio="xMidYMid slice" />`
+      );
+    } catch {
+      // Ignore missing/unreadable backgrounds so exports can still render foreground layers.
+    }
+  }
 
   for (const [index, layer] of designDoc.layers.entries()) {
+    if (isGuideLayer(layer)) {
+      continue;
+    }
+
     svgParts.push(`<g id="layer-${index + 1}">`);
 
     if (layer.type === "shape") {
@@ -337,8 +409,14 @@ export async function buildFinalSvg(designDoc: DesignDoc, options: BuildFinalSvg
     const anchor = layer.align === "center" ? "middle" : layer.align === "right" ? "end" : "start";
     const lineHeight = layer.fontSize * 1.25;
     const firstBaseline = layer.y + layer.fontSize;
+    const letterSpacing =
+      typeof layer.letterSpacing === "number" && Number.isFinite(layer.letterSpacing)
+        ? ` letter-spacing="${layer.letterSpacing}"`
+        : "";
 
-    svgParts.push(`<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Arial")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}"${layerRotationTransform(layer)}>`);
+    svgParts.push(
+      `<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Arial")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}"${letterSpacing}${layerRotationTransform(layer)}>`
+    );
 
     for (const [lineIndex, line] of lines.entries()) {
       const lineY = lineIndex === 0 ? firstBaseline : firstBaseline + lineIndex * lineHeight;
