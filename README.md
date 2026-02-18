@@ -122,20 +122,21 @@ npm run db:seed
 npm run dev
 ```
 
-## Owned Reference Library (Clean Minimal)
+## Owned Reference Library
 
-Place owned sermon-series style references here:
+Place owned zip bundles here:
 
-- `reference/sermon-series/` (jpg/jpeg/png/webp)
+- `reference_zips/Folder 1.zip`
+- `reference_zips/Folder 2.zip`
+- `reference_zips/Folder 3.zip`
 
-Then build the reference index:
+Then ingest:
 
 ```bash
-node scripts/index-reference-library.ts
-# or: npm run refs:index
+npm run ingest:refs
 ```
 
-This writes `reference/index.json`, which `type_clean_min_v1` uses to sample clean/minimal references and build style-collage guidance for background generation.
+This writes normalized assets to `public/reference-library/` and metadata to `data/reference-library.json`.
 
 ## Common Commands
 
@@ -144,11 +145,39 @@ npm run dev            # start dev server
 npm run build          # production build
 npm run start          # run production server
 npm run lint           # lint (Next.js)
+npm run verify:fonts   # check all manifest fonts exist in public/fonts
+npm run test:font-assets
+npm run test:font-render
 npm run prisma:generate
 npm run prisma:push
 npm run prisma:migrate
 npm run db:seed
+npm run ingest:refs
 ```
+
+## Adding Fonts
+
+1. Create `public/fonts/`.
+2. Add local `.woff2` files (no runtime downloads). Suggested categories:
+   - Display serif: Playfair Display, DM Serif Display, Abril Fatface, or Fraunces
+   - Editorial serif: Source Serif 4 or Newsreader
+   - Condensed sans: Oswald, Archivo Narrow, or IBM Plex Sans Condensed
+   - Grotesk: Space Grotesk, Sora, or Manrope
+   - Slab: Roboto Slab or Arvo
+3. Use consistent naming, for example:
+   - `public/fonts/PlayfairDisplay-Regular.woff2`
+   - `public/fonts/PlayfairDisplay-Bold.woff2`
+4. Register/edit assets in `/Users/robrussell/Documents/GraceLed Designs AI/src/design/fonts/font-assets.ts`.
+5. Validate before running previews/exports:
+
+```bash
+npm run verify:fonts
+```
+
+Notes:
+- Preview rendering loads registered assets through global `@font-face` rules.
+- SVG export paths embed requested font data for deterministic SVG->PNG rendering.
+- If a requested font id is missing, typography falls back to the embedded default family set.
 
 ## Switching to PostgreSQL in Production
 
