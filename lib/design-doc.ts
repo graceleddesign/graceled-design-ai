@@ -1,6 +1,7 @@
 import { buildOverlayDisplayContent } from "@/lib/overlay-lines";
 
 export type DesignTextAlign = "left" | "center" | "right";
+export type DesignLayerPurpose = "content" | "guide";
 
 export type DesignDocBackground = {
   color: string;
@@ -17,8 +18,10 @@ export type DesignTextLayer = {
   fontSize: number;
   fontFamily: string;
   fontWeight: number;
+  letterSpacing?: number;
   color: string;
   align: DesignTextAlign;
+  purpose?: DesignLayerPurpose;
 };
 
 export type DesignImageLayer = {
@@ -29,6 +32,7 @@ export type DesignImageLayer = {
   h: number;
   rotation?: number;
   src: string;
+  purpose?: DesignLayerPurpose;
 };
 
 export type DesignShapeLayer = {
@@ -42,6 +46,7 @@ export type DesignShapeLayer = {
   fill: string;
   stroke: string;
   strokeWidth: number;
+  purpose?: DesignLayerPurpose;
 };
 
 export type DesignLayer = DesignTextLayer | DesignImageLayer | DesignShapeLayer;
@@ -153,6 +158,30 @@ function normalizeAlign(input: unknown, fallback: DesignTextAlign): DesignTextAl
   return fallback;
 }
 
+function normalizePurpose(input: unknown): DesignLayerPurpose | undefined {
+  if (input === "guide") {
+    return "guide";
+  }
+  if (input === "content") {
+    return "content";
+  }
+  return undefined;
+}
+
+function normalizeLetterSpacing(input: unknown): number | undefined {
+  if (typeof input !== "number" || Number.isNaN(input) || !Number.isFinite(input)) {
+    return undefined;
+  }
+
+  if (input < -24) {
+    return -24;
+  }
+  if (input > 24) {
+    return 24;
+  }
+  return input;
+}
+
 function normalizeImageSource(input: unknown): string | null {
   if (typeof input !== "string") {
     return null;
@@ -183,8 +212,10 @@ function normalizeTextLayer(input: Record<string, unknown>): DesignTextLayer | n
     fontSize: clampNumber(input.fontSize, 42),
     fontFamily: typeof input.fontFamily === "string" && input.fontFamily.trim() ? input.fontFamily.trim() : "Arial",
     fontWeight: clampNumber(input.fontWeight, 700),
+    letterSpacing: normalizeLetterSpacing(input.letterSpacing),
     color: normalizeColor(input.color, "#FFFFFF"),
-    align: normalizeAlign(input.align, "left")
+    align: normalizeAlign(input.align, "left"),
+    purpose: normalizePurpose(input.purpose)
   };
 }
 
@@ -201,7 +232,8 @@ function normalizeImageLayer(input: Record<string, unknown>): DesignImageLayer |
     w: clampNumber(input.w, 320),
     h: clampNumber(input.h, 320),
     rotation: normalizeRotation(input.rotation),
-    src
+    src,
+    purpose: normalizePurpose(input.purpose)
   };
 }
 
@@ -216,7 +248,8 @@ function normalizeShapeLayer(input: Record<string, unknown>): DesignShapeLayer {
     shape: "rect",
     fill: normalizeShapePaint(input.fill, "#FFFFFF"),
     stroke: normalizeShapePaint(input.stroke, "#000000"),
-    strokeWidth: clampNumber(input.strokeWidth, 0)
+    strokeWidth: clampNumber(input.strokeWidth, 0),
+    purpose: normalizePurpose(input.purpose)
   };
 }
 

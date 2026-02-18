@@ -10,6 +10,7 @@ import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { buildDesignBrief, type DesignBrief, validateDesignBrief } from "@/lib/design-brief";
 import { buildFinalSvg } from "@/lib/final-deliverables";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
 import { generatePngFromPrompt } from "@/lib/openai-image";
@@ -914,8 +915,18 @@ function buildGenerationInput(
     typographyDirection: "match_site" | "graceled_defaults";
     paletteJson: string;
   },
-  selectedPresetKeys: string[] = []
+  selectedPresetKeys: string[] = [],
+  lockupRecipe?: unknown
 ) {
+  const designBrief = buildDesignBrief({
+    seriesTitle: project.series_title,
+    seriesSubtitle: project.series_subtitle,
+    passage: project.scripture_passages,
+    backgroundPrompt: project.series_description,
+    selectedPresetKeys,
+    lockupRecipe
+  });
+
   return {
     series_title: project.series_title,
     series_subtitle: project.series_subtitle,
@@ -924,8 +935,32 @@ function buildGenerationInput(
     websiteUrl: brandKit.websiteUrl,
     typographyDirection: brandKit.typographyDirection,
     palette: parsePaletteJson(brandKit.paletteJson),
-    selectedPresetKeys
+    selectedPresetKeys,
+    designBrief
   };
+}
+
+function readLockupRecipeFromInput(input: unknown): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+
+  const designBrief = (input as { designBrief?: unknown }).designBrief;
+  if (!designBrief || typeof designBrief !== "object" || Array.isArray(designBrief)) {
+    return undefined;
+  }
+
+  return (designBrief as { lockupRecipe?: unknown }).lockupRecipe;
+}
+
+function readDesignBriefFromInput(input: unknown): DesignBrief | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+
+  const designBrief = (input as { designBrief?: unknown }).designBrief;
+  const validated = validateDesignBrief(designBrief);
+  return validated.ok ? validated.data : null;
 }
 
 type EnabledPresetRecord = {
@@ -1366,15 +1401,20 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     try {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
       const feedbackRequest = readFeedbackRequest(plannedGeneration.input);
+      const designBrief = readDesignBriefFromInput(plannedGeneration.input);
+      if (!designBrief) {
+        throw new Error("Generation input is missing a valid designBrief payload.");
+      }
       const displayContent = buildOverlayDisplayContent({
-        title: params.project.series_title,
-        subtitle: params.project.series_subtitle,
-        scripturePassages: params.project.scripture_passages
+        title: designBrief.seriesTitle || params.project.series_title,
+        subtitle: designBrief.seriesSubtitle || params.project.series_subtitle,
+        scripturePassages: designBrief.passage || params.project.scripture_passages
       });
       const content = {
         title: displayContent.title,
         subtitle: displayContent.subtitle
       };
+      const lockupRecipe = designBrief.lockupRecipe;
       const references =
         plannedGeneration.references.length > 0
           ? plannedGeneration.references.slice(0, 3)
@@ -1419,7 +1459,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const layout = computeCleanMinimalLayout({
           width: masterDimensions.width,
           height: masterDimensions.height,
-          content
+          content,
+          lockupRecipe
         });
         const textPalette = await chooseTextPaletteForBackground({
           backgroundPng,
@@ -1431,7 +1472,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           width: masterDimensions.width,
           height: masterDimensions.height,
           content,
-          palette: textPalette
+          palette: textPalette,
+          lockupRecipe
         });
         const finalPng = await sharp(backgroundPng)
           .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
@@ -1467,7 +1509,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const layout = computeCleanMinimalLayout({
             width: dimensions.width,
             height: dimensions.height,
-            content
+            content,
+            lockupRecipe
           });
           const textPalette = await chooseTextPaletteForBackground({
             backgroundPng,
@@ -1479,7 +1522,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             width: dimensions.width,
             height: dimensions.height,
             content,
-            palette: textPalette
+            palette: textPalette,
+            lockupRecipe
           });
           const finalPng = await sharp(backgroundPng)
             .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
@@ -1503,7 +1547,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               height: dimensions.height,
               content,
               palette: textPalette,
-              backgroundImagePath: backgroundPath
+              backgroundImagePath: backgroundPath,
+              lockupRecipe
             })
           };
         })
@@ -1563,7 +1608,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             masterBackgroundShape: OPTION_MASTER_BACKGROUND_SHAPE,
             palette,
             motifs: styleBrief.motifs,
-            layout: styleBrief.layout
+            layout: styleBrief.layout,
+            styleFamilies: designBrief.styleFamilies,
+            lockupRecipe: designBrief.lockupRecipe
           }
         },
         preview: {
@@ -1800,6 +1847,12 @@ export async function generateRoundOneAction(
 
   const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT);
   const input = buildGenerationInput(project, project.brandKit, selectedPresetKeys);
+  const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
+  if (!validatedDesignBrief.ok) {
+    return {
+      error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
+    };
+  }
 
   const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
     const generationId = randomUUID();
@@ -1911,7 +1964,12 @@ export async function generateRoundTwoAction(
   }
 
   const input = {
-    ...buildGenerationInput(project, project.brandKit, selectedPresetKeys),
+    ...buildGenerationInput(
+      project,
+      project.brandKit,
+      selectedPresetKeys,
+      chosenGeneration ? readLockupRecipeFromInput(chosenGeneration.input) : undefined
+    ),
     feedback: {
       sourceRound: parsed.data.currentRound,
       chosenGenerationId,
@@ -1922,6 +1980,12 @@ export async function generateRoundTwoAction(
       styleDirection
     }
   };
+  const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
+  if (!validatedDesignBrief.ok) {
+    return {
+      error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
+    };
+  }
 
   const round = parsed.data.currentRound + 1;
   const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT);
