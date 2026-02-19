@@ -1,0 +1,352 @@
+[
+  {
+    "id": "ArchivoNarrow-Regular",
+    "family": "Archivo Narrow",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/archivo-narrow/archivo-narrow-w400-normal.woff2",
+    "displayName": "Archivo Narrow Regular",
+    "tags": [
+      "condensed",
+      "sans",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "ArchivoNarrow-Bold",
+    "family": "Archivo Narrow",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/archivo-narrow/archivo-narrow-w700-normal.woff2",
+    "displayName": "Archivo Narrow Bold",
+    "tags": [
+      "condensed",
+      "sans",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Arvo-Regular",
+    "family": "Arvo",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/arvo/arvo-w400-normal.woff2",
+    "displayName": "Arvo Regular",
+    "tags": [
+      "slab",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Arvo-Bold",
+    "family": "Arvo",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/arvo/arvo-w700-normal.woff2",
+    "displayName": "Arvo Bold",
+    "tags": [
+      "slab",
+      "serif",
+      "display"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "DMSerifDisplay-Regular",
+    "family": "DM Serif Display",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/dm-serif-display/dm-serif-display-w400-normal.woff2",
+    "displayName": "DM Serif Display Regular",
+    "tags": [
+      "display",
+      "serif",
+      "editorial"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Fraunces-Regular",
+    "family": "Fraunces",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/fraunces/fraunces-w400-normal.woff2",
+    "displayName": "Fraunces Regular",
+    "tags": [
+      "display",
+      "serif",
+      "high-contrast"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Fraunces-SemiBold",
+    "family": "Fraunces",
+    "style": "normal",
+    "weight": 600,
+    "file": "/fonts/google/fraunces/fraunces-w600-normal.woff2",
+    "displayName": "Fraunces SemiBold",
+    "tags": [
+      "display",
+      "serif",
+      "high-contrast"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "IBMPlexSansCondensed-Regular",
+    "family": "IBM Plex Sans Condensed",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/ibm-plex-sans-condensed/ibm-plex-sans-condensed-w400-normal.woff2",
+    "displayName": "IBM Plex Sans Condensed Regular",
+    "tags": [
+      "condensed",
+      "sans",
+      "grotesk"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "IBMPlexSansCondensed-Bold",
+    "family": "IBM Plex Sans Condensed",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/ibm-plex-sans-condensed/ibm-plex-sans-condensed-w700-normal.woff2",
+    "displayName": "IBM Plex Sans Condensed Bold",
+    "tags": [
+      "condensed",
+      "sans",
+      "grotesk"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Manrope-Regular",
+    "family": "Manrope",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/manrope/manrope-w400-normal.woff2",
+    "displayName": "Manrope Regular",
+    "tags": [
+      "grotesk",
+      "sans",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Manrope-SemiBold",
+    "family": "Manrope",
+    "style": "normal",
+    "weight": 600,
+    "file": "/fonts/google/manrope/manrope-w600-normal.woff2",
+    "displayName": "Manrope SemiBold",
+    "tags": [
+      "grotesk",
+      "sans",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Newsreader-Regular",
+    "family": "Newsreader",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/newsreader/newsreader-w400-normal.woff2",
+    "displayName": "Newsreader Regular",
+    "tags": [
+      "editorial",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Newsreader-SemiBold",
+    "family": "Newsreader",
+    "style": "normal",
+    "weight": 600,
+    "file": "/fonts/google/newsreader/newsreader-w600-normal.woff2",
+    "displayName": "Newsreader SemiBold",
+    "tags": [
+      "editorial",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Oswald-Regular",
+    "family": "Oswald",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/oswald/oswald-w400-normal.woff2",
+    "displayName": "Oswald Regular",
+    "tags": [
+      "condensed",
+      "sans",
+      "display"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Oswald-Bold",
+    "family": "Oswald",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/oswald/oswald-w700-normal.woff2",
+    "displayName": "Oswald Bold",
+    "tags": [
+      "condensed",
+      "sans",
+      "display"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "PlayfairDisplay-Regular",
+    "family": "Playfair Display",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/playfair-display/playfair-display-w400-normal.woff2",
+    "displayName": "Playfair Display Regular",
+    "tags": [
+      "display",
+      "serif",
+      "high-contrast"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "PlayfairDisplay-Bold",
+    "family": "Playfair Display",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/playfair-display/playfair-display-w700-normal.woff2",
+    "displayName": "Playfair Display Bold",
+    "tags": [
+      "display",
+      "serif",
+      "high-contrast"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "RobotoSlab-Regular",
+    "family": "Roboto Slab",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/roboto-slab/roboto-slab-w400-normal.woff2",
+    "displayName": "Roboto Slab Regular",
+    "tags": [
+      "slab",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "RobotoSlab-Bold",
+    "family": "Roboto Slab",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/roboto-slab/roboto-slab-w700-normal.woff2",
+    "displayName": "Roboto Slab Bold",
+    "tags": [
+      "slab",
+      "serif",
+      "display"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Sora-Regular",
+    "family": "Sora",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/sora/sora-w400-normal.woff2",
+    "displayName": "Sora Regular",
+    "tags": [
+      "grotesk",
+      "sans",
+      "modern"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "Sora-Bold",
+    "family": "Sora",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/sora/sora-w700-normal.woff2",
+    "displayName": "Sora Bold",
+    "tags": [
+      "grotesk",
+      "sans",
+      "modern"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "SourceSerif4-Regular",
+    "family": "Source Serif 4",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/source-serif-4/source-serif-4-w400-normal.woff2",
+    "displayName": "Source Serif 4 Regular",
+    "tags": [
+      "editorial",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "SourceSerif4-SemiBold",
+    "family": "Source Serif 4",
+    "style": "normal",
+    "weight": 600,
+    "file": "/fonts/google/source-serif-4/source-serif-4-w600-normal.woff2",
+    "displayName": "Source Serif 4 SemiBold",
+    "tags": [
+      "editorial",
+      "serif",
+      "text"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "SpaceGrotesk-Regular",
+    "family": "Space Grotesk",
+    "style": "normal",
+    "weight": 400,
+    "file": "/fonts/google/space-grotesk/space-grotesk-w400-normal.woff2",
+    "displayName": "Space Grotesk Regular",
+    "tags": [
+      "grotesk",
+      "sans",
+      "modern"
+    ],
+    "source": "google"
+  },
+  {
+    "id": "SpaceGrotesk-Bold",
+    "family": "Space Grotesk",
+    "style": "normal",
+    "weight": 700,
+    "file": "/fonts/google/space-grotesk/space-grotesk-w700-normal.woff2",
+    "displayName": "Space Grotesk Bold",
+    "tags": [
+      "grotesk",
+      "sans",
+      "modern"
+    ],
+    "source": "google"
+  }
+]
