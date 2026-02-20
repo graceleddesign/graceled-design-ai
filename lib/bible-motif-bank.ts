@@ -2214,6 +2214,10 @@ export function detectBookKeysFromText(text: string): string[] {
 }
 
 const CHAPTER_VERSE_PATTERN = /\b\d{1,3}:\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?\b/;
+const REFERENCE_SEPARATOR_PATTERN = /[;,]/;
+const BARE_REFERENCE_SEGMENT_PATTERN =
+  /^\s*\d{1,3}(?::\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?)?(?:\s*[-\u2013]\s*\d{1,3}(?::\d{1,3})?)?\s*$/;
+const SCRIPTURE_SCOPE_DEBUG_FLAG = "BIBLE_MOTIF_SCOPE_DEBUG";
 
 function normalizeScopePhrase(value: string): string {
   return value
@@ -2250,6 +2254,92 @@ function hasChapterVerse(value: string): boolean {
   return CHAPTER_VERSE_PATTERN.test(value || "");
 }
 
+function splitReferenceSegments(value: string): string[] {
+  return (value || "")
+    .split(REFERENCE_SEPARATOR_PATTERN)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function countReferenceLikeSegments(value: string): number {
+  const segments = splitReferenceSegments(value);
+  if (segments.length === 0) {
+    return 0;
+  }
+
+  let count = 0;
+  let hasPriorBookSegment = false;
+  for (const segment of segments) {
+    const hasBook = detectBookKeysFromText(segment).length > 0 || isBookOnlyReference(segment);
+    const standaloneRefWithPriorBook = hasPriorBookSegment && BARE_REFERENCE_SEGMENT_PATTERN.test(segment);
+    if (hasBook || hasChapterVerse(segment) || standaloneRefWithPriorBook) {
+      count += 1;
+    }
+    if (hasBook) {
+      hasPriorBookSegment = true;
+    }
+  }
+  return count;
+}
+
+function hasExplicitMultiReference(value: string): boolean {
+  if (!REFERENCE_SEPARATOR_PATTERN.test(value || "")) {
+    return false;
+  }
+  return countReferenceLikeSegments(value) >= 2;
+}
+
+function looksLikeTightSingleReference(value: string): boolean {
+  const raw = (value || "").trim();
+  if (!raw || hasExplicitMultiReference(raw) || REFERENCE_SEPARATOR_PATTERN.test(raw)) {
+    return false;
+  }
+  if (hasChapterVerse(raw)) {
+    return true;
+  }
+  const hasBookContext = detectBookKeysFromText(raw).length > 0;
+  return hasBookContext && /\d/.test(raw);
+}
+
+function hasWholeBookSeriesPattern(value: string): boolean {
+  const raw = (value || "").trim();
+  if (!raw) {
+    return false;
+  }
+  if (isBookOnlyReference(raw)) {
+    return true;
+  }
+  if (hasChapterVerse(raw) || looksLikeTightSingleReference(raw)) {
+    return false;
+  }
+  return detectBookKeysFromText(raw).length > 0;
+}
+
+function shouldDebugScriptureScopeInference(): boolean {
+  return process.env.NODE_ENV !== "production" && process.env[SCRIPTURE_SCOPE_DEBUG_FLAG] === "1";
+}
+
+function debugScriptureScopeInference(
+  input: {
+    passageRef: string;
+    seriesTitle: string;
+    sermonTitle: string;
+    subtitle: string;
+  },
+  scope: ScriptureScope
+): void {
+  if (!shouldDebugScriptureScopeInference()) {
+    return;
+  }
+  console.debug("[motif-bank] inferScriptureScope", {
+    passageRef: input.passageRef,
+    seriesTitle: input.seriesTitle,
+    sermonTitle: input.sermonTitle,
+    subtitle: input.subtitle,
+    scriptureScope: scope
+  });
+}
+
 export function inferScriptureScope(input: {
   passageRef?: string | null;
   seriesTitle?: string | null;
@@ -2260,29 +2350,33 @@ export function inferScriptureScope(input: {
   const seriesTitle = (input.seriesTitle || "").trim();
   const sermonTitle = (input.sermonTitle || "").trim();
   const subtitle = (input.subtitle || "").trim();
+  const debugInput = { passageRef, seriesTitle, sermonTitle, subtitle };
   const aggregate = [passageRef, seriesTitle, sermonTitle, subtitle].filter(Boolean).join(" ");
+  const complete = (scope: ScriptureScope): ScriptureScope => {
+    debugScriptureScopeInference(debugInput, scope);
+    return scope;
+  };
 
-  if (hasChapterVerse(aggregate)) {
-    return "specific_passage";
+  const explicitMultiReference = [passageRef, seriesTitle, sermonTitle, subtitle].some((value) => hasExplicitMultiReference(value));
+  if (explicitMultiReference) {
+    return complete("multi_passage");
   }
 
-  if (!passageRef) {
-    return "whole_book";
+  const hasChapterVerseAnywhere = hasChapterVerse(aggregate);
+  const singleSpecificReference = looksLikeTightSingleReference(passageRef);
+  if (singleSpecificReference || hasChapterVerseAnywhere) {
+    return complete("specific_passage");
   }
 
-  if (isBookOnlyReference(passageRef)) {
-    return "whole_book";
+  if (!hasChapterVerseAnywhere && (!passageRef || isBookOnlyReference(passageRef) || hasWholeBookSeriesPattern(seriesTitle))) {
+    return complete("whole_book");
   }
 
-  const titleContext = [seriesTitle, sermonTitle, subtitle].filter(Boolean).join(" ");
-  const hasBookContextInTitles = detectBookKeysFromText(titleContext).length > 0;
-  if (hasBookContextInTitles && !hasChapterVerse(titleContext) && !hasChapterVerse(passageRef)) {
-    if (!/\d/.test(passageRef)) {
-      return "whole_book";
-    }
+  if (hasWholeBookSeriesPattern(seriesTitle) || isBookOnlyReference(passageRef)) {
+    return complete("whole_book");
   }
 
-  return "multi_passage";
+  return complete("whole_book");
 }
 
 function sortTopicMatches(matches: Array<{ key: string; index: number }>): Array<{ key: string; index: number }> {
