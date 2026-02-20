@@ -201,7 +201,7 @@ function buildBackgroundPrompt(params: {
     "Create an ORIGINAL premium sermon-series BACKGROUND only.",
     "No text, no letters, no words, no typography, no signage, no logos, no watermarks, no symbols resembling letters.",
     "Do not include readable characters in any language.",
-    `Direction family: ${params.direction.styleFamily}.`,
+    `Direction family: ${params.direction.styleFamily || "unassigned"}.`,
     `Composition target: ${params.direction.compositionType}.`,
     `Background mode: ${params.direction.backgroundMode}.`,
     `Type profile intent: ${params.direction.typeProfile}.`,
@@ -400,7 +400,7 @@ async function main() {
     }
     debugMetadata.push({
       option: optionLabel,
-      styleFamily: direction.styleFamily,
+      styleFamily: direction.styleFamily || "unassigned",
       compositionType: direction.compositionType,
       backgroundMode: direction.backgroundMode,
       typeProfile: direction.typeProfile,
@@ -411,7 +411,7 @@ async function main() {
       prompt: masterBackground.prompt
     });
     console.log(
-      `Option ${optionLabel}: ${direction.styleFamily} / ${direction.compositionType} | preset=${direction.presetKey} lockup=${lockupPresetId}`
+      `Option ${optionLabel}: ${direction.styleFamily || "unassigned"} / ${direction.compositionType} | preset=${direction.presetKey} lockup=${lockupPresetId}`
     );
   }
 

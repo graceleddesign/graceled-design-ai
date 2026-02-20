@@ -1,6 +1,12 @@
 import { getMotifBankContext } from "../lib/bible-motif-bank";
 import { detectPlayfulIntent, getDirectionTemplateCatalog, planDirectionSet } from "../lib/direction-planner";
-import { STYLE_FAMILY_BANK, type StyleFamilyKey } from "../lib/style-family-bank";
+import {
+  STYLE_FAMILY_BANK,
+  type StyleBucketKey,
+  type StyleFamilyKey,
+  type StyleMediumKey,
+  type StyleToneKey
+} from "../lib/style-family-bank";
 
 const TITLE_STAGE_FAMILY_KEYS = new Set<StyleFamilyKey>([
   "light_gradient_stage",
@@ -24,6 +30,36 @@ const PLAYFUL_STYLE_FAMILIES = new Set<StyleFamilyKey>([
 ]);
 
 const SAMPLES = [
+  {
+    id: "john-no-notes",
+    title: "John",
+    subtitle: "Believe and Live",
+    passage: "John 20:31",
+    description: "A gospel-centered walkthrough of Jesus' signs, words, and identity.",
+    designNotes: "",
+    brandMode: "fresh" as const,
+    seriesMarkRequested: false
+  },
+  {
+    id: "galatians-no-notes",
+    title: "Galatians",
+    subtitle: "Free in Christ",
+    passage: "Galatians 5:1",
+    description: "Paul on freedom, identity, and fruit of the Spirit.",
+    designNotes: "",
+    brandMode: "fresh" as const,
+    seriesMarkRequested: false
+  },
+  {
+    id: "vision-sunday-no-notes",
+    title: "Vision Sunday",
+    subtitle: "Built Together",
+    passage: "Habakkuk 2:2",
+    description: "Direction, mission, and church-wide alignment.",
+    designNotes: "",
+    brandMode: "brand" as const,
+    seriesMarkRequested: true
+  },
   {
     id: "galatians",
     title: "Galatians",
@@ -185,6 +221,18 @@ function upsertRecentFamilies(history: StyleFamilyKey[], selected: StyleFamilyKe
   return merged.slice(0, 20);
 }
 
+function upsertRecentBuckets(history: StyleBucketKey[], selected: StyleBucketKey[]): StyleBucketKey[] {
+  const seen = new Set<StyleBucketKey>();
+  const merged = [...selected, ...history].filter((bucket) => {
+    if (seen.has(bucket)) {
+      return false;
+    }
+    seen.add(bucket);
+    return true;
+  });
+  return merged.slice(0, 20);
+}
+
 function whyChosen(params: {
   family: StyleFamilyKey;
   recent: StyleFamilyKey[];
@@ -207,6 +255,7 @@ function whyChosen(params: {
 function main() {
   const enabledPresetKeys = [...new Set(getDirectionTemplateCatalog().map((template) => template.presetKey))];
   let recentStyleFamilies: StyleFamilyKey[] = [];
+  let recentStyleBuckets: StyleBucketKey[] = [];
 
   for (const sample of SAMPLES) {
     const motifContext = getMotifBankContext({
@@ -224,6 +273,8 @@ function main() {
       designNotes: sample.designNotes,
       topics: motifContext.topicNames
     });
+    const hasDesignNotes = Boolean(sample.designNotes?.trim());
+    const explorationMode = !hasDesignNotes;
     const directionPlan = planDirectionSet({
       runSeed,
       enabledPresetKeys,
@@ -235,16 +286,39 @@ function main() {
       allowedGenericMotifs: motifContext.allowedGenericMotifs,
       markIdeas: motifContext.markIdeaCandidates,
       recentStyleFamilies,
+      recentStyleBuckets,
+      explorationMode,
       seriesTitle: sample.title,
       seriesSubtitle: sample.subtitle,
       seriesDescription: sample.description,
       designNotes: sample.designNotes,
-      topicNames: motifContext.topicNames
+      topicNames: motifContext.topicNames,
+      motifScope: motifContext.scriptureScope,
+      primaryThemes: motifContext.primaryThemeCandidates,
+      secondaryThemes: motifContext.secondaryThemeCandidates,
+      sceneMotifs: motifContext.sceneMotifCandidates,
+      sceneMotifRequested: motifContext.sceneMotifRequested
     });
     const selectedFamilies = directionPlan
       .map((direction) => direction.styleFamily)
       .filter((family): family is StyleFamilyKey => Boolean(family));
+    const selectedBuckets = directionPlan
+      .map((direction) => direction.styleBucket)
+      .filter((bucket): bucket is StyleBucketKey => typeof bucket === "string" && bucket.length > 0);
+    const selectedTones = directionPlan
+      .map((direction) =>
+        direction.styleTone || (direction.styleFamily ? STYLE_FAMILY_BANK[direction.styleFamily].tone : null)
+      )
+      .filter((tone): tone is StyleToneKey => typeof tone === "string" && tone.length > 0);
+    const selectedMediums = directionPlan
+      .map((direction) =>
+        direction.styleMedium || (direction.styleFamily ? STYLE_FAMILY_BANK[direction.styleFamily].medium : null)
+      )
+      .filter((medium): medium is StyleMediumKey => typeof medium === "string" && medium.length > 0);
     const distinctCount = new Set(selectedFamilies).size;
+    const distinctBucketCount = new Set(selectedBuckets).size;
+    const distinctMediumCount = new Set(selectedMediums).size;
+    const hasLightOrVivid = selectedTones.some((tone) => tone === "light" || tone === "vivid");
     const playfulChosenCount = selectedFamilies.filter((family) => PLAYFUL_STYLE_FAMILIES.has(family)).length;
     const chosenFamilyLine = directionPlan
       .map((direction) => {
@@ -252,9 +326,21 @@ function main() {
         return `${direction.optionLabel}=${key || "missing"}`;
       })
       .join(" | ");
+    const chosenBucketToneMediumLine = directionPlan
+      .map((direction) => {
+        const family = direction.styleFamily;
+        const tone = direction.styleTone || (family ? STYLE_FAMILY_BANK[family].tone : null);
+        const medium = direction.styleMedium || (family ? STYLE_FAMILY_BANK[family].medium : null);
+        return `${direction.optionLabel}=${direction.styleBucket || "missing"}/${tone || "missing"}/${medium || "missing"}`;
+      })
+      .join(" | ");
+    const chosenBucketFamilyLine = directionPlan
+      .map((direction) => `${direction.optionLabel}=${direction.styleBucket || "missing"}/${direction.styleFamily || "missing"}`)
+      .join(" | ");
 
     console.log(`\n=== ${sample.title} (${sample.brandMode}) ===`);
     console.log(`Run seed: ${runSeed}`);
+    console.log(`Exploration mode: ${explorationMode ? "true" : "false"}`);
     console.log(
       `Playful intent: ${playfulIntent.isPlayful ? "true" : "false"} (${playfulIntent.level}; keywords: ${
         playfulIntent.reasonKeywords.join(", ") || "none"
@@ -262,8 +348,13 @@ function main() {
     );
     console.log(`Books: ${fmtList(motifContext.bookNames)}`);
     console.log(`Topics: ${fmtList(motifContext.topicNames)}`);
+    console.log(`Chosen A/B/C bucket+tone+medium: ${chosenBucketToneMediumLine}`);
+    console.log(`Chosen A/B/C bucket+family: ${chosenBucketFamilyLine}`);
     console.log(`Chosen A/B/C families: ${chosenFamilyLine}`);
     console.log(`Distinctness check: ${distinctCount}/3`);
+    console.log(`Distinct buckets check: ${distinctBucketCount}/3`);
+    console.log(`hasLightOrVivid: ${hasLightOrVivid ? "true" : "false"}`);
+    console.log(`Distinct mediums check: ${distinctMediumCount}/3`);
     console.log(`Playful family picks: ${playfulChosenCount}/3`);
 
     for (const direction of directionPlan) {
@@ -283,6 +374,7 @@ function main() {
     }
 
     recentStyleFamilies = upsertRecentFamilies(recentStyleFamilies, selectedFamilies);
+    recentStyleBuckets = upsertRecentBuckets(recentStyleBuckets, selectedBuckets);
     console.log(`Recent family cache: ${recentStyleFamilies.slice(0, 8).join(", ") || "none"}`);
   }
 }
