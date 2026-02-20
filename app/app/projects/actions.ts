@@ -163,13 +163,21 @@ const LIGHT_TONE_MIN_LUMINANCE = 175;
 const LIGHT_TONE_MAX_SEPIA_LIKELIHOOD = 0.35;
 const VIVID_TONE_MIN_SATURATION = 120;
 const VIVID_TONE_MIN_LUMINANCE = 115;
+const DARK_MONO_TONE_MIN_LUMINANCE = 55;
+const DARK_TONE_MAX_LUMINANCE = 125;
 const MONO_TONE_MAX_SATURATION = 30;
+const MONO_TONE_MAX_LUMINANCE = 125;
+const DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV = 35;
+const DESIGN_PRESENCE_MIN_EDGE_DENSITY = 0.012;
+const DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD = 68;
 const LIGHT_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must satisfy tone targets. LIGHT must be high-key bright/clean (white or near-white background), NOT parchment/sepia/vintage. Avoid filmic grading, avoid desaturation, avoid heavy grain. Prioritize tone compliance over atmosphere.";
 const VIVID_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must be high-chroma, bold palette, strong saturation. Avoid muted/dusty colors.";
 const MONO_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Strict monochrome/grayscale; near-zero saturation.";
+const DARK_TONE_OVERRIDE_RETRY_BOOST =
+  "DARK OVERRIDE RETRY: dark but readable; avoid pure black; include visible midtones and highlights; clear forms and structure; maintain strong contrast for title-safe area.";
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
 const LOCKUP_ASSET_SLOT = "series_lockup";
 const LOCKUP_LAYOUT_ARCHETYPES = [
@@ -405,6 +413,8 @@ type ImageToneStats = {
   meanLuminance: number;
   meanSaturation: number;
   sepiaLikelihood: number;
+  luminanceStdDev: number;
+  edgeDensity: number;
 };
 
 type ToneCheckSummary = {
@@ -413,6 +423,8 @@ type ToneCheckSummary = {
   statsBefore: ImageToneStats | null;
   statsAfter: ImageToneStats | null;
   retried: boolean;
+  failuresBefore: string[];
+  failuresAfter: string[];
 };
 
 type BackgroundTextCheckSummary = {
@@ -530,30 +542,40 @@ async function computeImageToneStatsFromBuffer(imageBuffer: Buffer): Promise<Ima
       .raw()
       .toBuffer({ resolveWithObject: true });
     const { data, info } = raster;
+    const width = Math.max(1, info.width || TONE_STATS_SAMPLE_SIZE);
+    const height = Math.max(1, info.height || TONE_STATS_SAMPLE_SIZE);
     const channels = Math.max(4, info.channels || 4);
+    const totalPixels = width * height;
+    const luminanceByPixel = new Float32Array(totalPixels);
+    const opaqueMask = new Uint8Array(totalPixels);
 
     let sampleCount = 0;
     let luminanceSum = 0;
     let saturationSum = 0;
     let sepiaLikeCount = 0;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const pixelIndex = y * width + x;
+        const offset = pixelIndex * channels;
+        const alpha = data[offset + 3];
+        const r = data[offset];
+        const g = data[offset + 1];
+        const b = data[offset + 2];
+        const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        luminanceByPixel[pixelIndex] = luminance;
 
-    for (let offset = 0; offset <= data.length - channels; offset += channels) {
-      const alpha = data[offset + 3];
-      if (alpha <= 10) {
-        continue;
-      }
+        if (alpha <= 10) {
+          continue;
+        }
 
-      const r = data[offset];
-      const g = data[offset + 1];
-      const b = data[offset + 2];
-      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      const { hue, saturation } = rgbToHueAndSaturation(r, g, b);
-
-      sampleCount += 1;
-      luminanceSum += luminance;
-      saturationSum += saturation;
-      if (hue >= 15 && hue <= 55 && saturation >= 20 && saturation <= 120 && luminance > 120) {
-        sepiaLikeCount += 1;
+        opaqueMask[pixelIndex] = 1;
+        const { hue, saturation } = rgbToHueAndSaturation(r, g, b);
+        sampleCount += 1;
+        luminanceSum += luminance;
+        saturationSum += saturation;
+        if (hue >= 15 && hue <= 55 && saturation >= 20 && saturation <= 120 && luminance > 120) {
+          sepiaLikeCount += 1;
+        }
       }
     }
 
@@ -561,17 +583,123 @@ async function computeImageToneStatsFromBuffer(imageBuffer: Buffer): Promise<Ima
       return null;
     }
 
+    const meanLuminance = luminanceSum / sampleCount;
+    let luminanceVarianceSum = 0;
+    for (let index = 0; index < totalPixels; index += 1) {
+      if (!opaqueMask[index]) {
+        continue;
+      }
+      const delta = luminanceByPixel[index] - meanLuminance;
+      luminanceVarianceSum += delta * delta;
+    }
+    const luminanceStdDev = Math.sqrt(luminanceVarianceSum / sampleCount);
+
+    let edgeCount = 0;
+    let edgeSampleCount = 0;
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const idx = y * width + x;
+        const left = idx - 1;
+        const right = idx + 1;
+        const up = idx - width;
+        const down = idx + width;
+        if (!opaqueMask[idx] || !opaqueMask[left] || !opaqueMask[right] || !opaqueMask[up] || !opaqueMask[down]) {
+          continue;
+        }
+
+        edgeSampleCount += 1;
+        const gx = Math.abs(luminanceByPixel[right] - luminanceByPixel[left]);
+        const gy = Math.abs(luminanceByPixel[down] - luminanceByPixel[up]);
+        if (gx + gy >= DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD) {
+          edgeCount += 1;
+        }
+      }
+    }
+    const edgeDensity = edgeSampleCount > 0 ? edgeCount / edgeSampleCount : 0;
+
     return {
       sampleCount,
-      meanLuminance: luminanceSum / sampleCount,
+      meanLuminance,
       meanSaturation: saturationSum / sampleCount,
-      sepiaLikelihood: sepiaLikeCount / sampleCount
+      sepiaLikelihood: sepiaLikeCount / sampleCount,
+      luminanceStdDev,
+      edgeDensity
     };
   } catch {
     return null;
   }
 }
 
+type ToneComplianceResult = {
+  passed: boolean;
+  failures: string[];
+};
+
+function evaluateToneCompliance(tone: "light" | "vivid" | "dark" | "mono", stats: ImageToneStats): ToneComplianceResult {
+  const failures: string[] = [];
+  if (stats.meanLuminance < DARK_MONO_TONE_MIN_LUMINANCE) {
+    failures.push("too-dark");
+  }
+
+  if (tone === "light") {
+    if (stats.meanLuminance < LIGHT_TONE_MIN_LUMINANCE) {
+      failures.push("light-luminance-low");
+    }
+    if (stats.sepiaLikelihood > LIGHT_TONE_MAX_SEPIA_LIKELIHOOD) {
+      failures.push("light-sepia-too-high");
+    }
+    return { passed: failures.length === 0, failures };
+  }
+
+  if (tone === "vivid") {
+    if (stats.meanSaturation < VIVID_TONE_MIN_SATURATION) {
+      failures.push("vivid-saturation-low");
+    }
+    if (stats.meanLuminance < VIVID_TONE_MIN_LUMINANCE) {
+      failures.push("vivid-luminance-low");
+    }
+    return { passed: failures.length === 0, failures };
+  }
+
+  if (tone === "dark") {
+    if (stats.meanLuminance > DARK_TONE_MAX_LUMINANCE) {
+      failures.push("dark-luminance-high");
+    }
+  } else {
+    if (stats.meanSaturation > MONO_TONE_MAX_SATURATION) {
+      failures.push("mono-saturation-high");
+    }
+    if (stats.meanLuminance > MONO_TONE_MAX_LUMINANCE) {
+      failures.push("mono-luminance-high");
+    }
+  }
+
+  if (stats.luminanceStdDev < DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV) {
+    failures.push("design-presence-low-luminance-stddev");
+  }
+  if (stats.edgeDensity < DESIGN_PRESENCE_MIN_EDGE_DENSITY) {
+    failures.push("design-presence-low-edge-density");
+  }
+
+  return { passed: failures.length === 0, failures };
+}
+
+function shouldCheckToneCompliance(tone: StyleToneKey | null): tone is "light" | "vivid" | "dark" | "mono" {
+  return tone === "light" || tone === "vivid" || tone === "dark" || tone === "mono";
+}
+
+function toneOverrideRetryBoost(tone: "light" | "vivid" | "dark" | "mono"): string {
+  if (tone === "light") {
+    return LIGHT_TONE_OVERRIDE_RETRY_BOOST;
+  }
+  if (tone === "vivid") {
+    return VIVID_TONE_OVERRIDE_RETRY_BOOST;
+  }
+  if (tone === "dark") {
+    return DARK_TONE_OVERRIDE_RETRY_BOOST;
+  }
+  return `${MONO_TONE_OVERRIDE_RETRY_BOOST} ${DARK_TONE_OVERRIDE_RETRY_BOOST}`;
+}
 async function computeImageToneStatsFromUrl(url: string): Promise<ImageToneStats | null> {
   const source = url.trim();
   if (!source) {
@@ -588,30 +716,6 @@ async function computeImageToneStatsFromUrl(url: string): Promise<ImageToneStats
   } catch {
     return null;
   }
-}
-
-function shouldCheckToneCompliance(tone: StyleToneKey | null): tone is "light" | "vivid" | "mono" {
-  return tone === "light" || tone === "vivid" || tone === "mono";
-}
-
-function passesToneCompliance(tone: "light" | "vivid" | "mono", stats: ImageToneStats): boolean {
-  if (tone === "light") {
-    return stats.meanLuminance >= LIGHT_TONE_MIN_LUMINANCE && stats.sepiaLikelihood <= LIGHT_TONE_MAX_SEPIA_LIKELIHOOD;
-  }
-  if (tone === "vivid") {
-    return stats.meanSaturation >= VIVID_TONE_MIN_SATURATION && stats.meanLuminance >= VIVID_TONE_MIN_LUMINANCE;
-  }
-  return stats.meanSaturation <= MONO_TONE_MAX_SATURATION;
-}
-
-function toneOverrideRetryBoost(tone: "light" | "vivid" | "mono"): string {
-  if (tone === "light") {
-    return LIGHT_TONE_OVERRIDE_RETRY_BOOST;
-  }
-  if (tone === "vivid") {
-    return VIVID_TONE_OVERRIDE_RETRY_BOOST;
-  }
-  return MONO_TONE_OVERRIDE_RETRY_BOOST;
 }
 
 function pngBufferToDataUrl(png: Buffer): string {
@@ -3509,7 +3613,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               passed: true,
               statsBefore: null,
               statsAfter: null,
-              retried: false
+              retried: false,
+              failuresBefore: [],
+              failuresAfter: []
             }
           : null;
         let backgroundTextCheck: BackgroundTextCheckSummary | null = shouldRunExplorationToneCheck
@@ -3564,19 +3670,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             passed: true,
             statsBefore: null,
             statsAfter: null,
-            retried: false
+            retried: false,
+            failuresBefore: [],
+            failuresAfter: []
           };
           const statsBefore =
             (await computeImageToneStatsFromUrl(pngBufferToDataUrl(validatedBackground.backgroundPng))) ||
             (await computeImageToneStatsFromBuffer(validatedBackground.backgroundPng));
           toneCheck.statsBefore = statsBefore;
           toneCheck.statsAfter = statsBefore;
-          const tonePassedBefore = statsBefore ? passesToneCompliance(toneTargetForCompliance, statsBefore) : false;
-          toneCheck.passed = tonePassedBefore;
+          const toneEvaluationBefore = statsBefore
+            ? evaluateToneCompliance(toneTargetForCompliance, statsBefore)
+            : { passed: false, failures: ["stats-unavailable"] };
+          toneCheck.failuresBefore = toneEvaluationBefore.failures;
+          toneCheck.failuresAfter = toneEvaluationBefore.failures;
+          toneCheck.passed = toneEvaluationBefore.passed;
 
-          if (!tonePassedBefore) {
+          if (!toneEvaluationBefore.passed) {
             console.warn(
-              `[tone-compliance-retry] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} tone=${toneTargetForCompliance}`
+              `[tone-compliance-retry] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} tone=${toneTargetForCompliance} reasons=${toneEvaluationBefore.failures.join(",")}`
             );
             toneRetryCount = 1;
             toneCheck.retried = true;
@@ -3614,7 +3726,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               (await computeImageToneStatsFromUrl(pngBufferToDataUrl(validatedBackground.backgroundPng))) ||
               (await computeImageToneStatsFromBuffer(validatedBackground.backgroundPng));
             toneCheck.statsAfter = statsAfter;
-            toneCheck.passed = statsAfter ? passesToneCompliance(toneTargetForCompliance, statsAfter) : false;
+            const toneEvaluationAfter = statsAfter
+              ? evaluateToneCompliance(toneTargetForCompliance, statsAfter)
+              : { passed: false, failures: ["stats-unavailable"] };
+            toneCheck.failuresAfter = toneEvaluationAfter.failures;
+            toneCheck.passed = toneEvaluationAfter.passed;
           }
         }
 
@@ -3669,7 +3785,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 (await computeImageToneStatsFromUrl(pngBufferToDataUrl(validatedBackground.backgroundPng))) ||
                 (await computeImageToneStatsFromBuffer(validatedBackground.backgroundPng));
               toneCheck.statsAfter = statsAfterTextRetry;
-              toneCheck.passed = statsAfterTextRetry ? passesToneCompliance(toneTargetForCompliance, statsAfterTextRetry) : false;
+              const toneEvaluationAfterTextRetry = statsAfterTextRetry
+                ? evaluateToneCompliance(toneTargetForCompliance, statsAfterTextRetry)
+                : { passed: false, failures: ["stats-unavailable"] };
+              toneCheck.failuresAfter = toneEvaluationAfterTextRetry.failures;
+              toneCheck.passed = toneEvaluationAfterTextRetry.passed;
             }
           }
         }
@@ -3895,7 +4015,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                   passed: true,
                   statsBefore: null,
                   statsAfter: null,
-                  retried: false
+                  retried: false,
+                  failuresBefore: [],
+                  failuresAfter: []
                 },
                 backgroundTextCheck: masterAttempt.backgroundTextCheck || {
                   attempted: false,
