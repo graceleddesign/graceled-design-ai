@@ -1,14 +1,19 @@
-import { loadReferenceIndex, pickReferences } from "@/lib/reference-library";
 import { access } from "fs/promises";
 import path from "path";
+import { loadIndex, sampleRefsForOption } from "@/lib/referenceLibrary";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const refs = await loadReferenceIndex();
-  const sample = await pickReferences({ count: 6, mode: "clean-minimal" });
-  const indexPath = path.join(process.cwd(), "reference", "index.json");
+  const refs = await loadIndex();
+  const sample = await sampleRefsForOption({
+    projectId: "debug",
+    round: 1,
+    optionIndex: 0,
+    n: 3
+  });
+  const indexPath = path.join(process.cwd(), "data", "reference-library.json");
   const hasIndex = await access(indexPath)
     .then(() => true)
     .catch(() => false);
@@ -16,6 +21,6 @@ export async function GET() {
   return Response.json({
     referenceCount: refs.length,
     hasIndex,
-    sample: sample.map((item) => item.relativePath)
+    sample: sample.map((item) => item.path)
   });
 }

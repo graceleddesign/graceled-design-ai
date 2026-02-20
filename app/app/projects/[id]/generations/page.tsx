@@ -1,21 +1,28 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { approveFinalDesignAction } from "@/app/app/projects/actions";
-import { GenerationPreviewPane } from "@/components/generation-preview-pane";
+import { DirectionOptionCard } from "@/components/direction-option-card";
 import { requireSession } from "@/lib/auth";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 
 type PreviewFields = {
-  square_main: string;
-  widescreen_main: string;
-  vertical_main: string;
+  square: string;
+  wide: string;
+  tall: string;
 };
 
 type GenerationAssetRecord = {
-  kind: "IMAGE" | "ZIP" | "OTHER";
+  kind: "IMAGE" | "BACKGROUND" | "LOCKUP" | "ZIP" | "OTHER";
   slot: string | null;
   file_path: string;
+};
+
+type OptionDesignSpecSummary = {
+  wantsTitleStage: boolean;
+  wantsSeriesMark: boolean;
+  lockupLayout: string | null;
+  motifFocus: string[];
 };
 
 const OPTION_TINTS = [
@@ -41,16 +48,18 @@ function normalizeAssetUrl(filePath: string): string {
 }
 
 function readAssetPreview(assets: GenerationAssetRecord[]): PreviewFields {
-  const resolved = {
-    square_main: "",
-    widescreen_main: "",
-    vertical_main: ""
+  const resolved: Record<PreviewShape, { final: string; background: string }> = {
+    square: { final: "", background: "" },
+    wide: { final: "", background: "" },
+    tall: { final: "", background: "" }
   };
 
-  const imageAssets = assets.filter((asset) => asset.kind === "IMAGE" && Boolean(asset.file_path?.trim()));
-  const fallback = imageAssets[0] ? normalizeAssetUrl(imageAssets[0].file_path) : "";
+  const imageLikeAssets = assets.filter(
+    (asset) => (asset.kind === "IMAGE" || asset.kind === "BACKGROUND") && Boolean(asset.file_path?.trim())
+  );
+  const fallback = imageLikeAssets[0] ? normalizeAssetUrl(imageLikeAssets[0].file_path) : "";
 
-  for (const asset of imageAssets) {
+  for (const asset of imageLikeAssets) {
     const slot = asset.slot?.trim().toLowerCase();
     const filePath = normalizeAssetUrl(asset.file_path);
     if (!filePath) {
@@ -58,30 +67,123 @@ function readAssetPreview(assets: GenerationAssetRecord[]): PreviewFields {
     }
 
     if (slot === "square" || slot === "square_main") {
-      resolved.square_main = filePath;
+      if (!resolved.square.final) {
+        resolved.square.final = filePath;
+      }
       continue;
     }
-
-    if (slot === "wide" || slot === "widescreen" || slot === "widescreen_main") {
-      resolved.widescreen_main = filePath;
+    if (slot === "wide" || slot === "wide_main" || slot === "widescreen" || slot === "widescreen_main") {
+      if (!resolved.wide.final) {
+        resolved.wide.final = filePath;
+      }
       continue;
     }
-
-    if (slot === "tall" || slot === "vertical" || slot === "vertical_main") {
-      resolved.vertical_main = filePath;
+    if (slot === "tall" || slot === "tall_main" || slot === "vertical" || slot === "vertical_main") {
+      if (!resolved.tall.final) {
+        resolved.tall.final = filePath;
+      }
+      continue;
+    }
+    if (slot === "square_bg") {
+      if (!resolved.square.background) {
+        resolved.square.background = filePath;
+      }
+      continue;
+    }
+    if (slot === "wide_bg" || slot === "widescreen_bg") {
+      if (!resolved.wide.background) {
+        resolved.wide.background = filePath;
+      }
+      continue;
+    }
+    if (slot === "tall_bg" || slot === "vertical_bg") {
+      if (!resolved.tall.background) {
+        resolved.tall.background = filePath;
+      }
     }
   }
 
   return {
-    square_main: resolved.square_main || fallback,
-    widescreen_main: resolved.widescreen_main || fallback,
-    vertical_main: resolved.vertical_main || fallback
+    square: resolved.square.final || resolved.square.background || fallback,
+    wide: resolved.wide.final || resolved.wide.background || fallback,
+    tall: resolved.tall.final || resolved.tall.background || fallback
+  };
+}
+
+function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
+  const fallback: OptionDesignSpecSummary = {
+    wantsTitleStage: false,
+    wantsSeriesMark: false,
+    lockupLayout: null,
+    motifFocus: []
+  };
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return fallback;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return fallback;
+  }
+
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return fallback;
+  }
+
+  const nestedDirectionSpec = (
+    designSpec as {
+      directionSpec?:
+        | {
+            wantsTitleStage?: unknown;
+            wantsSeriesMark?: unknown;
+            lockupLayout?: unknown;
+            motifFocus?: unknown;
+          }
+        | null;
+    }
+  ).directionSpec;
+  const directWantsTitleStage = (designSpec as { wantsTitleStage?: unknown }).wantsTitleStage;
+  const directWantsSeriesMark = (designSpec as { wantsSeriesMark?: unknown }).wantsSeriesMark;
+  const directLockupLayout = (designSpec as { lockupLayout?: unknown }).lockupLayout;
+  const directMotifFocus = (designSpec as { motifFocus?: unknown }).motifFocus;
+  const nestedWantsTitleStage = nestedDirectionSpec?.wantsTitleStage;
+  const nestedWantsSeriesMark = nestedDirectionSpec?.wantsSeriesMark;
+  const nestedLockupLayout = nestedDirectionSpec?.lockupLayout;
+  const nestedMotifFocus = nestedDirectionSpec?.motifFocus;
+
+  const lockupLayoutCandidate = typeof directLockupLayout === "string" ? directLockupLayout : nestedLockupLayout;
+  const motifFocusCandidate = Array.isArray(directMotifFocus) ? directMotifFocus : nestedMotifFocus;
+  const motifFocus = Array.isArray(motifFocusCandidate)
+    ? motifFocusCandidate
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .slice(0, 2)
+    : [];
+
+  return {
+    wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
+    wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
+    lockupLayout: typeof lockupLayoutCandidate === "string" && lockupLayoutCandidate.trim() ? lockupLayoutCandidate : null,
+    motifFocus
   };
 }
 
 type PreviewShape = "square" | "wide" | "tall";
 
-function getGenerationPreviewUrl(projectId: string, generationId: string, shape: PreviewShape, updatedAt: Date, assetUrl?: string): string {
+function getGenerationPreviewUrl(
+  projectId: string,
+  generationId: string,
+  shape: PreviewShape,
+  updatedAt: Date,
+  assetUrl?: string,
+  options?: { debugStage?: boolean }
+): string {
+  if (options?.debugStage) {
+    return `/api/projects/${projectId}/generations/${generationId}/preview?shape=${shape}&debugStage=1&v=${updatedAt.getTime()}`;
+  }
+
   if (assetUrl) {
     const separator = assetUrl.includes("?") ? "&" : "?";
     return `${assetUrl}${separator}v=${updatedAt.getTime()}`;
@@ -114,10 +216,18 @@ function DeliverableDownloadLink({
   );
 }
 
-export default async function ProjectGenerationsPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function ProjectGenerationsPage({
+  params,
+  searchParams
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ debugStage?: string }>;
+}) {
   // Placeholder route protection for generation flow.
   const session = await requireSession();
   const { id } = await params;
+  const { debugStage } = await searchParams;
+  const debugStageEnabled = process.env.NODE_ENV !== "production" && debugStage === "1";
 
   const project = await prisma.project.findFirst({
     where: {
@@ -127,6 +237,7 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
     select: {
       id: true,
       series_title: true,
+      brandMode: true,
       finalDesign: {
         select: {
           id: true,
@@ -154,13 +265,6 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
       output: true,
       createdAt: true,
       updatedAt: true,
-      preset: {
-        select: {
-          name: true,
-          subtitle: true,
-          key: true
-        }
-      },
       assets: {
         select: {
           kind: true,
@@ -200,6 +304,7 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h2 className="text-base font-semibold text-slate-900">Final Deliverables</h2>
+            <p className="text-xs text-slate-500">Available after you finalize a design.</p>
             {project.finalDesign ? (
               <p className="text-sm text-slate-600">
                 Approved: {project.finalDesign.optionLabel} from round {project.finalDesign.round} (updated{" "}
@@ -214,6 +319,7 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
             <DeliverableDownloadLink href={`/api/projects/${project.id}/final/svg`} label="Download SVG" disabled={!project.finalDesign} />
             <DeliverableDownloadLink href={`/api/projects/${project.id}/final/bundle`} label="Download ZIP" disabled={!project.finalDesign} />
           </div>
+          {!project.finalDesign ? <p className="w-full text-right text-xs text-slate-500">Finalize to unlock downloads.</p> : null}
         </div>
       </div>
 
@@ -241,64 +347,41 @@ export default async function ProjectGenerationsPage({ params }: { params: Promi
                   const isApprovedFinal =
                     project.finalDesign?.generationId === generation.id ||
                     (project.finalDesign?.round === round && project.finalDesign.optionKey === optionKey);
+                  const styleRefCount = (
+                    generation.output as { meta?: { styleRefCount?: unknown } } | null
+                  )?.meta?.styleRefCount;
+                  const designSpecSummary = readDesignSpecSummary(generation.output);
+                  const previewUrls = {
+                    square: getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, preview.square, {
+                      debugStage: debugStageEnabled
+                    }),
+                    wide: getGenerationPreviewUrl(project.id, generation.id, "wide", generation.updatedAt, preview.wide, {
+                      debugStage: debugStageEnabled
+                    }),
+                    tall: getGenerationPreviewUrl(project.id, generation.id, "tall", generation.updatedAt, preview.tall, {
+                      debugStage: debugStageEnabled
+                    })
+                  };
+                  const finalizeAction = approveFinalDesignAction.bind(null, project.id, generation.id, optionKey);
 
                   return (
-                    <article key={generation.id} className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                      <div>
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</p>
-                          {isApprovedFinal ? (
-                            <span className="rounded-full bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">Final</span>
-                          ) : null}
-                        </div>
-                        <h3 className="text-base font-semibold text-slate-900">{generation.preset?.name || "Custom direction"}</h3>
-                        <p className="text-sm text-slate-600">{generation.preset?.subtitle || generation.preset?.key || "Preset unavailable"}</p>
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-2">
-                        <GenerationPreviewPane
-                          label="Square"
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, preview.square_main)}
-                          aspectClass="aspect-square"
-                          tintClass={tintClass}
-                          width={1080}
-                          height={1080}
-                        />
-                        <GenerationPreviewPane
-                          label="Widescreen"
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "wide", generation.updatedAt, preview.widescreen_main)}
-                          aspectClass="aspect-[16/9]"
-                          tintClass={tintClass}
-                          width={1920}
-                          height={1080}
-                        />
-                        <GenerationPreviewPane
-                          label="Vertical"
-                          imageUrl={getGenerationPreviewUrl(project.id, generation.id, "tall", generation.updatedAt, preview.vertical_main)}
-                          aspectClass="aspect-[9/16]"
-                          tintClass={tintClass}
-                          width={1080}
-                          height={1920}
-                        />
-                      </div>
-
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Link
-                          href={`/app/projects/${project.id}/feedback?round=${round}&generationId=${generation.id}`}
-                          className="inline-flex rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700"
-                        >
-                          Choose this direction
-                        </Link>
-                        <form action={approveFinalDesignAction.bind(null, project.id, generation.id, optionKey)}>
-                          <button
-                            type="submit"
-                            className="inline-flex rounded-md bg-pine px-3 py-1.5 text-sm font-medium text-white hover:bg-pine/90"
-                          >
-                            Approve as Final
-                          </button>
-                        </form>
-                      </div>
-                    </article>
+                    <DirectionOptionCard
+                      key={generation.id}
+                      projectId={project.id}
+                      round={round}
+                      generationId={generation.id}
+                      optionLabel={label}
+                      tintClass={tintClass}
+                      isApprovedFinal={isApprovedFinal}
+                      styleRefCount={typeof styleRefCount === "number" ? styleRefCount : null}
+                      isTitleStage={designSpecSummary.wantsTitleStage}
+                      wantsSeriesMark={designSpecSummary.wantsSeriesMark}
+                      lockupLayout={designSpecSummary.lockupLayout}
+                      motifFocus={designSpecSummary.motifFocus}
+                      brandMode={project.brandMode === "brand" ? "brand" : "fresh"}
+                      previewUrls={previewUrls}
+                      finalizeAction={finalizeAction}
+                    />
                   );
                 })}
               </div>

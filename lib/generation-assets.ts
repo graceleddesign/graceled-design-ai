@@ -6,6 +6,8 @@ import sharp from "sharp";
 import { buildFallbackDesignDoc, normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import { buildFinalSvg } from "@/lib/final-deliverables";
 import { generateBackgroundPng, type OpenAiImageQuality, type OpenAiImageSize } from "@/lib/ai/openai-images";
+import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
+import { resolveEffectiveBrandKit } from "@/lib/brand-kit";
 import { prisma } from "@/lib/prisma";
 
 const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
@@ -290,12 +292,15 @@ export async function createGenerationPreviewAssets(params: {
       },
       project: {
         select: {
+          organizationId: true,
           series_title: true,
           series_subtitle: true,
           scripture_passages: true,
           series_description: true,
           brandKit: {
             select: {
+              websiteUrl: true,
+              typographyDirection: true,
               logoPath: true,
               paletteJson: true
             }
@@ -309,10 +314,16 @@ export async function createGenerationPreviewAssets(params: {
     throw new Error(`Generation ${params.generationId} was not found for project ${params.projectId}`);
   }
 
+  const effectiveBrandKit = await resolveEffectiveBrandKit({
+    organizationId: generation.project.organizationId,
+    projectId: generation.projectId,
+    projectBrandKit: generation.project.brandKit
+  });
+
   const uploadDirectory = path.join(process.cwd(), "public", "uploads");
   await mkdir(uploadDirectory, { recursive: true });
 
-  const palette = parsePaletteJson(generation.project.brandKit?.paletteJson);
+  const palette = parsePaletteJson(effectiveBrandKit?.paletteJson);
   const backgroundPrompt = buildBackgroundPrompt({
     presetKey: generation.preset?.key || null,
     seriesTitle: generation.project.series_title,
@@ -346,7 +357,15 @@ export async function createGenerationPreviewAssets(params: {
       shape,
       outputWidth: config.outputWidth,
       outputHeight: config.outputHeight,
-      project: generation.project
+      project: {
+        ...generation.project,
+        brandKit: effectiveBrandKit
+          ? {
+              logoPath: effectiveBrandKit.logoPath,
+              paletteJson: effectiveBrandKit.paletteJson
+            }
+          : null
+      }
     });
 
     const overlaySvg = await buildFinalSvg(overlayDesignDoc, {
@@ -354,15 +373,11 @@ export async function createGenerationPreviewAssets(params: {
       includeImages: true
     });
 
-    const resizedBackground = await sharp(masterBackgroundPng)
-      .resize({
-        width: config.outputWidth,
-        height: config.outputHeight,
-        fit: "cover",
-        position: "center"
-      })
-      .png()
-      .toBuffer();
+    const resizedBackground = await resizeCoverWithFocalPoint({
+      input: masterBackgroundPng,
+      width: config.outputWidth,
+      height: config.outputHeight
+    });
 
     const composited = await sharp(resizedBackground)
       .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])

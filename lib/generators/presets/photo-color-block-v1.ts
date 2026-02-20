@@ -46,17 +46,6 @@ export const generatePhotoColorBlockV1: PresetGenerator = (context) => {
       stroke: mixHex(photoTone, "#FFFFFF", 0.12),
       strokeWidth: 1
     },
-    createTitleLayer({
-      x: photoX + 58,
-      y: photoY + photoH / 2 - 72,
-      w: 280,
-      h: 180,
-      text: "PHOTO",
-      color: mixHex("#FFFFFF", photoTone, 0.35),
-      fontSize: 60,
-      fontWeight: 700,
-      fontFamily: "Arial"
-    }),
     {
       type: "shape",
       x: photoX + photoW - 560,

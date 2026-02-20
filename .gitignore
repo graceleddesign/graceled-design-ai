@@ -12,3 +12,4 @@ public/uploads/
 public/style_library/*
 !public/style_library/README.md
 reference/
+reference_zips/*.zip

@@ -4,6 +4,9 @@ import { openai } from "@/lib/openai";
 
 export type OpenAiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
 export type OpenAiImageQuality = "low" | "medium" | "high";
+export type OpenAiImageReference = {
+  dataUrl: string;
+};
 
 const DEFAULT_IMAGE_MODEL = "gpt-image-1-mini";
 const DEFAULT_IMAGE_QUALITY: OpenAiImageQuality = "medium";
@@ -55,6 +58,7 @@ export async function generatePngFromPrompt(params: {
   prompt: string;
   size: OpenAiImageSize;
   quality?: OpenAiImageQuality;
+  references?: OpenAiImageReference[];
 }): Promise<Buffer> {
   if (!process.env.OPENAI_API_KEY?.trim()) {
     throw new Error("OPENAI_API_KEY is not configured");
@@ -67,9 +71,23 @@ export async function generatePngFromPrompt(params: {
 
   for (const model of models) {
     try {
+      const referenceItems = (params.references || [])
+        .map((reference) => reference.dataUrl?.trim())
+        .filter((value): value is string => Boolean(value) && /^data:image\//i.test(value))
+        .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
+      const input =
+        referenceItems.length > 0
+          ? [
+              {
+                role: "user" as const,
+                content: [{ type: "input_text" as const, text: params.prompt }, ...referenceItems]
+              }
+            ]
+          : params.prompt;
+
       const response = await openai.responses.create({
         model,
-        input: params.prompt,
+        input,
         tool_choice: { type: "image_generation" },
         tools: [
           {

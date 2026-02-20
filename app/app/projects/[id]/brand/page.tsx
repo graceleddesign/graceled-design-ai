@@ -1,24 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { BrandKitForm } from "@/components/brand-kit-form";
 import { requireSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-
-function parsePalette(paletteJson: string | null): string[] {
-  if (!paletteJson) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(paletteJson);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.filter((color): color is string => typeof color === "string");
-  } catch {
-    return [];
-  }
-}
 
 export default async function ProjectBrandKitPage({ params }: { params: Promise<{ id: string }> }) {
   const session = await requireSession();
@@ -29,8 +12,8 @@ export default async function ProjectBrandKitPage({ params }: { params: Promise<
       id,
       organizationId: session.organizationId
     },
-    include: {
-      brandKit: true
+    select: {
+      id: true
     }
   });
 
@@ -44,14 +27,14 @@ export default async function ProjectBrandKitPage({ params }: { params: Promise<
         Back to project
       </Link>
 
-      <BrandKitForm
-        projectId={project.id}
-        projectTitle={project.series_title}
-        initialWebsiteUrl={project.brandKit?.websiteUrl}
-        initialLogoPath={project.brandKit?.logoPath}
-        initialPalette={parsePalette(project.brandKit?.paletteJson || null)}
-        initialTypographyDirection={project.brandKit?.typographyDirection || "match_site"}
-      />
+      <div className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900">
+        <p>Brand Kit is now managed in Settings.</p>
+        <div className="mt-3">
+          <Link href="/app/settings" className="inline-flex rounded-md border border-amber-300 bg-white px-3 py-1.5 font-medium">
+            Go to Settings
+          </Link>
+        </div>
+      </div>
     </section>
   );
 }

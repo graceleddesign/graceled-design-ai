@@ -146,6 +146,8 @@ npm run build          # production build
 npm run start          # run production server
 npm run lint           # lint (Next.js)
 npm run verify:fonts   # check all manifest fonts exist in public/fonts
+npm run fonts:add -- --family "Fraunces" --weights "400,600,700" --ital
+npm run fonts:sync
 npm run test:font-assets
 npm run test:font-render
 npm run prisma:generate
@@ -155,29 +157,39 @@ npm run db:seed
 npm run ingest:refs
 ```
 
-## Adding Fonts
+## Adding Fonts Via Google Fonts
 
-1. Create `public/fonts/`.
-2. Add local `.woff2` files (no runtime downloads). Suggested categories:
-   - Display serif: Playfair Display, DM Serif Display, Abril Fatface, or Fraunces
-   - Editorial serif: Source Serif 4 or Newsreader
-   - Condensed sans: Oswald, Archivo Narrow, or IBM Plex Sans Condensed
-   - Grotesk: Space Grotesk, Sora, or Manrope
-   - Slab: Roboto Slab or Arvo
-3. Use consistent naming, for example:
-   - `public/fonts/PlayfairDisplay-Regular.woff2`
-   - `public/fonts/PlayfairDisplay-Bold.woff2`
-4. Register/edit assets in `/Users/robrussell/Documents/GraceLed Designs AI/src/design/fonts/font-assets.ts`.
-5. Validate before running previews/exports:
+Use on-demand download + local caching (no npm font package installs required).
+
+```bash
+# Add one family/weight set and cache WOFF2 under public/fonts/google/<family-slug>/
+npm run fonts:add -- --family "Fraunces" --weights "400,600,700" --ital
+
+# Sync manifest + lockup requirements (fetches missing source:\"google\" files)
+npm run fonts:sync
+```
+
+How it works:
+- Downloads CSS from Google Fonts CSS2 (`display=swap`), extracts WOFF2 URLs, and writes deterministic files:
+  - `/public/fonts/google/<family-slug>/<family-slug>-w<weight>-<style>.woff2`
+- Updates the google manifest file at `/Users/robrussell/Documents/GraceLed Designs AI/src/design/fonts/font-assets.google.json`.
+- Merged manifest remains deterministic for previews/exports because runtime references local file paths after first fetch.
+
+Validation:
 
 ```bash
 npm run verify:fonts
+npm run test:font-assets
+npm run test:font-render
 ```
 
-Notes:
-- Preview rendering loads registered assets through global `@font-face` rules.
-- SVG export paths embed requested font data for deterministic SVG->PNG rendering.
-- If a requested font id is missing, typography falls back to the embedded default family set.
+Optional dev-only runtime auto-fetch fallback:
+
+```bash
+GOOGLE_FONTS_AUTO_FETCH=1 npm run dev
+```
+
+When enabled, missing `source:\"google\"` variants can be fetched on demand during rendering. If disabled, renderer/export falls back to the embedded curated set and logs a warning.
 
 ## Switching to PostgreSQL in Production
 

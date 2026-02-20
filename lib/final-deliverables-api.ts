@@ -6,6 +6,8 @@ type FinalDesignLookupResult =
   | {
       ok: true;
       designDoc: DesignDoc;
+      generationId: string | null;
+      optionLabel: string;
     }
   | {
       ok: false;
@@ -31,6 +33,8 @@ export async function loadAuthorizedFinalDesign(projectId: string): Promise<Fina
 
   return {
     ok: true,
-    designDoc: readStoredDesignDoc(finalDesign.designJson, finalDesign.optionLabel)
+    designDoc: readStoredDesignDoc(finalDesign.designJson, finalDesign.optionLabel),
+    generationId: finalDesign.generationId,
+    optionLabel: finalDesign.optionLabel
   };
 }

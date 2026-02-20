@@ -251,17 +251,6 @@ export function generatePhotoPreset(context: PresetGeneratorContext, variant: Ph
       fontSize: 32,
       fontFamily: variant === "warm" ? "Georgia" : "Arial"
     }),
-    createTitleLayer({
-      x: 160,
-      y: 130,
-      w: 280,
-      h: 150,
-      text: "PHOTO",
-      color: mixHex("#FFFFFF", dark, 0.35),
-      fontFamily: "Arial",
-      fontSize: 52,
-      fontWeight: 700
-    }),
     ...createLogoLayers(context, 1570, 78, 210, 90)
   );
 
@@ -462,7 +451,7 @@ export function generateSeasonalPreset(context: PresetGeneratorContext): PresetG
       y: 620,
       w: 1320,
       h: 200,
-      text: `${season} | ${context.subtitle}${context.scripture ? `\n${context.scripture}` : ""}`,
+      text: `${context.subtitle}${context.scripture ? `\n${context.scripture}` : ""}`,
       color: mixHex("#FFFFFF", seasonColor, 0.35),
       fontFamily: "Georgia",
       fontWeight: 500,

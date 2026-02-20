@@ -19,6 +19,7 @@ export type DesignTextLayer = {
   fontFamily: string;
   fontWeight: number;
   letterSpacing?: number;
+  opacity?: number;
   color: string;
   align: DesignTextAlign;
   purpose?: DesignLayerPurpose;
@@ -182,6 +183,16 @@ function normalizeLetterSpacing(input: unknown): number | undefined {
   return input;
 }
 
+function normalizeOpacity(input: unknown): number | undefined {
+  if (typeof input !== "number" || Number.isNaN(input) || !Number.isFinite(input)) {
+    return undefined;
+  }
+  if (input < 0 || input > 1) {
+    return undefined;
+  }
+  return input;
+}
+
 function normalizeImageSource(input: unknown): string | null {
   if (typeof input !== "string") {
     return null;
@@ -210,9 +221,10 @@ function normalizeTextLayer(input: Record<string, unknown>): DesignTextLayer | n
     rotation: normalizeRotation(input.rotation),
     text,
     fontSize: clampNumber(input.fontSize, 42),
-    fontFamily: typeof input.fontFamily === "string" && input.fontFamily.trim() ? input.fontFamily.trim() : "Arial",
+    fontFamily: typeof input.fontFamily === "string" && input.fontFamily.trim() ? input.fontFamily.trim() : "Inter",
     fontWeight: clampNumber(input.fontWeight, 700),
     letterSpacing: normalizeLetterSpacing(input.letterSpacing),
+    opacity: normalizeOpacity(input.opacity),
     color: normalizeColor(input.color, "#FFFFFF"),
     align: normalizeAlign(input.align, "left"),
     purpose: normalizePurpose(input.purpose)
@@ -443,7 +455,7 @@ function buildDefaultFallbackDesignDoc(params: BuildFinalDesignDocParams): Desig
       h: 180,
       text: displayContent.title,
       fontSize: 72,
-      fontFamily: "Arial",
+      fontFamily: "Inter",
       fontWeight: 700,
       color: primary,
       align: "left"
@@ -459,7 +471,7 @@ function buildDefaultFallbackDesignDoc(params: BuildFinalDesignDocParams): Desig
       h: 90,
       text: subtitle,
       fontSize: 36,
-      fontFamily: "Arial",
+      fontFamily: "Inter",
       fontWeight: 500,
       color: accent,
       align: "left"
@@ -564,7 +576,7 @@ function buildCleanMinimalFallbackDesignDoc(params: BuildFinalDesignDocParams): 
       h: Math.max(180, Math.round(titleLineCount * titleFontSize * 1.16)),
       text: titleText,
       fontSize: titleFontSize,
-      fontFamily: "Arial",
+      fontFamily: "Inter",
       fontWeight: 800,
       color: "#0F172A",
       align: "left"
@@ -621,7 +633,7 @@ function buildCleanMinimalFallbackDesignDoc(params: BuildFinalDesignDocParams): 
       h: Math.max(64, Math.round(subtitleLineCount * subtitleFontSize * 1.3)),
       text: subtitleText,
       fontSize: subtitleFontSize,
-      fontFamily: "Arial",
+      fontFamily: "Inter",
       fontWeight: 600,
       color: "#334155",
       align: "left"

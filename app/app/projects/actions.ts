@@ -1,6 +1,6 @@
 "use server";
 
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import { Prisma } from "@prisma/client";
@@ -9,15 +9,32 @@ import { redirect } from "next/navigation";
 import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
-import { buildFallbackDesignDoc, buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { buildDesignBrief, type DesignBrief, validateDesignBrief } from "@/lib/design-brief";
+import { buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import {
+  buildDesignBrief,
+  type DesignBrief,
+  type LockupRecipe,
+  type ResolvedLockupPalette,
+  type StyleFamily,
+  validateDesignBrief
+} from "@/lib/design-brief";
+import {
+  planDirectionSet,
+  type PlannedDirectionSpec,
+  type StyleFamily as DirectionStyleFamily
+} from "@/lib/direction-planner";
+import { extractBibleCreativeBrief, type BibleCreativeBrief } from "@/lib/bible-creative-brief";
+import { getMotifBankContext, type MotifBankContext } from "@/lib/bible-motif-bank";
 import { buildFinalSvg } from "@/lib/final-deliverables";
+import { resizeCoverWithFocalPoint, type FocalPoint } from "@/lib/image-cover";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
+import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
 import { generatePngFromPrompt } from "@/lib/openai-image";
 import { openai } from "@/lib/openai";
 import { optionLabel } from "@/lib/option-label";
 import { buildOverlayDisplayContent, normalizeLine } from "@/lib/overlay-lines";
-import { ensureThree, filterToEnabledPresets, pickInitialPresetKeys, pickPresetKeysForStyle } from "@/lib/preset-picker";
+import { GENERIC_CHRISTIAN_MOTIFS } from "@/lib/motif-guardrails";
+import { resolveEffectiveBrandKit } from "@/lib/brand-kit";
 import { prisma } from "@/lib/prisma";
 import {
   loadIndex,
@@ -25,13 +42,23 @@ import {
   sampleRefsForOption,
   type ReferenceLibraryItem
 } from "@/lib/referenceLibrary";
-import { normalizeStyleDirection } from "@/lib/style-direction";
+import { normalizeStyleDirection, type StyleDirection } from "@/lib/style-direction";
+import { buildBackgroundPrompt, renderTemplate, type TemplateBrief } from "@/lib/templates";
 import {
-  buildCleanMinimalDesignDoc,
   buildCleanMinimalOverlaySvg,
   chooseTextPaletteForBackground,
-  computeCleanMinimalLayout
+  computeCleanMinimalLayout,
+  resolveLockupPaletteForBackground
 } from "@/lib/templates/type-clean-min";
+import {
+  composeLockupOnBackground,
+  LOCKUP_SAFE_REGION_RATIOS,
+  type LockupIntegrationMode,
+  PREVIEW_DIMENSIONS,
+  PREVIEW_SHAPES,
+  renderTrimmedLockupPngFromSvg,
+  type PreviewShape
+} from "@/lib/lockup-compositor";
 
 export type ProjectActionState = {
   error?: string;
@@ -49,11 +76,17 @@ export type RoundFeedbackActionState = {
   error?: string;
 };
 
+type ProjectBrandMode = "brand" | "fresh";
+
 const createProjectSchema = z.object({
   series_title: z.string().trim().min(1),
   series_subtitle: z.string().trim().optional(),
   scripture_passages: z.string().trim().optional(),
-  series_description: z.string().trim().optional()
+  series_description: z.string().trim().optional(),
+  brandMode: z.enum(["brand", "fresh"]).default("fresh"),
+  preferredAccentColors: z.string().trim().max(300).optional(),
+  avoidColors: z.string().trim().max(300).optional(),
+  designNotes: z.string().trim().max(300).optional()
 });
 
 const HEX_COLOR_REGEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -75,20 +108,16 @@ const generateRoundTwoSchema = z.object({
   emphasis: z.enum(["title", "quote"]),
   expressiveness: z.coerce.number().int().min(0).max(100),
   temperature: z.coerce.number().int().min(0).max(100),
+  regenerateLockup: z.boolean().optional(),
+  explicitNewTitleStyle: z.boolean().optional(),
+  regenerateBackground: z.boolean().optional(),
   styleDirection: z.unknown().optional()
 });
 const ROUND_OPTION_COUNT = 3;
-const PREVIEW_SHAPES = ["square", "wide", "tall"] as const;
-type PreviewShape = (typeof PREVIEW_SHAPES)[number];
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
 type FinalAssetSlot = "square" | "wide" | "tall";
 type LegacyPreviewAssetSlot = "square_main" | "wide_main" | "tall_main" | "widescreen_main" | "vertical_main";
 
-const PREVIEW_DIMENSIONS: Record<PreviewShape, { width: number; height: number }> = {
-  square: { width: 1080, height: 1080 },
-  wide: { width: 1920, height: 1080 },
-  tall: { width: 1080, height: 1920 }
-};
 const FINAL_ASSET_SLOT_BY_SHAPE: Record<PreviewShape, FinalAssetSlot> = {
   square: "square",
   wide: "wide",
@@ -111,11 +140,40 @@ const OPENAI_IMAGE_SIZE_BY_SHAPE: Record<PreviewShape, "1024x1024" | "1536x1024"
   wide: "1536x1024",
   tall: "1024x1536"
 };
+const BRAND_NEUTRAL_HEXES = ["#000000", "#111827", "#334155", "#64748B", "#CBD5E1", "#F8FAFC", "#FFFFFF"] as const;
+const BRAND_PALETTE_SAMPLE_COLUMNS = 40;
+const BRAND_PALETTE_SAMPLE_ROWS = 20;
+const BRAND_PALETTE_DISTANCE_THRESHOLD = 58;
+const BRAND_PALETTE_FAR_SAMPLE_RATIO_THRESHOLD = 0.15;
+const BRAND_PALETTE_STRICT_RETRY_BOOST =
+  "HARD CONSTRAINT RETRY: Use flat/vector-like color fields with only very subtle neutral monochrome texture. NO warm hues, NO orange/red/yellow, NO photographic color grading, and no hue shifts.";
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
+const LOCKUP_ASSET_SLOT = "series_lockup";
+const LOCKUP_LAYOUT_ARCHETYPES = [
+  "editorial_stack",
+  "banner_strip",
+  "seal_arc",
+  "split_title",
+  "framed_type",
+  "monogram_mark",
+  "vertical_spine",
+  "centered_classic",
+  "stepped_baseline",
+  "offset_kicker"
+] as const;
+type LockupLayoutArchetype = (typeof LOCKUP_LAYOUT_ARCHETYPES)[number];
+const LOCKUP_LAYOUT_ARCHETYPE_SET = new Set<string>(LOCKUP_LAYOUT_ARCHETYPES);
+const LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE: Record<LockupStyleMode, readonly LockupLayoutArchetype[]> = {
+  engraved_stamp: ["seal_arc", "centered_classic", "monogram_mark", "banner_strip", "stepped_baseline"],
+  modern_editorial: ["editorial_stack", "split_title", "vertical_spine", "framed_type", "offset_kicker"]
+};
+const VINTAGE_REFERENCE_TAG_PATTERN =
+  /engrav|etch|stamp|seal|badge|vintage|heritage|retro|antique|letterpress|victorian|ornate/i;
 const PREVIEW_ASSET_SLOTS_TO_CLEAR: readonly string[] = [
   ...LEGACY_PREVIEW_ASSET_SLOTS,
   ...PREVIEW_SHAPES,
-  ...Object.values(BACKGROUND_ASSET_SLOT_BY_SHAPE)
+  ...Object.values(BACKGROUND_ASSET_SLOT_BY_SHAPE),
+  LOCKUP_ASSET_SLOT
 ];
 
 function normalizeWebsiteUrl(input: string): string | null {
@@ -170,6 +228,16 @@ function parsePalette(raw: FormDataEntryValue | null): string[] | null {
   }
 }
 
+function parseOptionalBooleanFormValue(raw: FormDataEntryValue | null): boolean | undefined {
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  return undefined;
+}
+
 function inferExtension(file: File): string {
   const ext = path.extname(file.name).toLowerCase();
   if (ALLOWED_LOGO_EXTENSIONS.has(ext)) {
@@ -220,6 +288,161 @@ function parsePaletteJson(raw: string): string[] {
   }
 }
 
+function normalizeHexColorToken(value: string): string | null {
+  const trimmed = value.trim();
+  if (!HEX_COLOR_REGEX.test(trimmed)) {
+    return null;
+  }
+  if (trimmed.length === 4) {
+    const [_, r, g, b] = trimmed;
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return trimmed.toUpperCase();
+}
+
+function normalizeHexPalette(values: string[]): string[] {
+  const normalized = values.map(normalizeHexColorToken).filter((value): value is string => Boolean(value));
+  return [...new Set(normalized)];
+}
+
+function parseAllowedPaletteFromOrgBrandKit(brandKit: {
+  paletteJson: string;
+  source: "organization" | "project" | "project_fallback";
+} | null): string[] {
+  if (!brandKit || brandKit.source !== "organization") {
+    return [];
+  }
+  return normalizeHexPalette(parsePaletteJson(brandKit.paletteJson));
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const normalized = normalizeHexColorToken(hex) || "#000000";
+  return [
+    Number.parseInt(normalized.slice(1, 3), 16),
+    Number.parseInt(normalized.slice(3, 5), 16),
+    Number.parseInt(normalized.slice(5, 7), 16)
+  ];
+}
+
+function mixRgb(a: [number, number, number], b: [number, number, number], amount: number): [number, number, number] {
+  const t = clampNumber(amount, 0, 1);
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t)
+  ];
+}
+
+function rgbToHex(rgb: [number, number, number]): string {
+  return `#${rgb[0].toString(16).padStart(2, "0")}${rgb[1].toString(16).padStart(2, "0")}${rgb[2]
+    .toString(16)
+    .padStart(2, "0")}`.toUpperCase();
+}
+
+function expandTintShadePalette(hexes: string[]): string[] {
+  const expanded = new Set<string>();
+  for (const hex of normalizeHexPalette(hexes)) {
+    const base = hexToRgb(hex);
+    expanded.add(hex);
+    expanded.add(rgbToHex(mixRgb(base, [255, 255, 255], 0.22)));
+    expanded.add(rgbToHex(mixRgb(base, [255, 255, 255], 0.4)));
+    expanded.add(rgbToHex(mixRgb(base, [0, 0, 0], 0.18)));
+    expanded.add(rgbToHex(mixRgb(base, [0, 0, 0], 0.35)));
+  }
+  return [...expanded];
+}
+
+function buildBrandPaletteHardConstraintPrompt(allowedBrandHexes: string[]): string {
+  if (allowedBrandHexes.length === 0) {
+    return "";
+  }
+
+  return [
+    `HARD CONSTRAINT: Use ONLY these HEX colors + neutrals. Allowed brand HEX: ${allowedBrandHexes.join(", ")}.`,
+    `Allowed neutrals: ${BRAND_NEUTRAL_HEXES.join(", ")}.`,
+    "Forbid any other hues. Especially NO orange/red/yellow unless one of those hues is explicitly present in the allowed brand HEX set.",
+    "Only tints/shades (lighter/darker variants) of allowed colors are permitted. No hue shifts."
+  ].join(" ");
+}
+
+type PaletteComplianceScore = {
+  sampleCount: number;
+  farSampleCount: number;
+  farSampleRatio: number;
+  distanceThreshold: number;
+  farSampleRatioThreshold: number;
+  averageNearestDistance: number;
+  isCompliant: boolean;
+};
+
+async function scorePaletteCompliance(
+  imagePathOrBuffer: string | Buffer,
+  allowedHexes: string[]
+): Promise<PaletteComplianceScore | null> {
+  const allowedPalette = normalizeHexPalette(allowedHexes);
+  if (allowedPalette.length === 0) {
+    return null;
+  }
+
+  const scoredPalette = expandTintShadePalette(allowedPalette).map(hexToRgb);
+  const sourceBuffer = typeof imagePathOrBuffer === "string" ? await readFile(imagePathOrBuffer) : imagePathOrBuffer;
+  const raster = await sharp(sourceBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = raster;
+  const width = Math.max(1, info.width || 1);
+  const height = Math.max(1, info.height || 1);
+  const channels = Math.max(3, info.channels || 4);
+
+  let sampleCount = 0;
+  let farSampleCount = 0;
+  let distanceSum = 0;
+
+  for (let yIndex = 0; yIndex < BRAND_PALETTE_SAMPLE_ROWS; yIndex += 1) {
+    for (let xIndex = 0; xIndex < BRAND_PALETTE_SAMPLE_COLUMNS; xIndex += 1) {
+      const x = Math.min(width - 1, Math.max(0, Math.round(((xIndex + 0.5) / BRAND_PALETTE_SAMPLE_COLUMNS) * (width - 1))));
+      const y = Math.min(height - 1, Math.max(0, Math.round(((yIndex + 0.5) / BRAND_PALETTE_SAMPLE_ROWS) * (height - 1))));
+      const offset = (y * width + x) * channels;
+      const alpha = channels > 3 ? data[offset + 3] : 255;
+      if (alpha <= 10) {
+        continue;
+      }
+
+      const r = data[offset];
+      const g = data[offset + 1];
+      const b = data[offset + 2];
+      let nearestDistance = Number.POSITIVE_INFINITY;
+
+      for (const [allowedR, allowedG, allowedB] of scoredPalette) {
+        const dr = r - allowedR;
+        const dg = g - allowedG;
+        const db = b - allowedB;
+        const distance = Math.sqrt(dr * dr + dg * dg + db * db);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+        }
+      }
+
+      sampleCount += 1;
+      distanceSum += nearestDistance;
+      if (nearestDistance > BRAND_PALETTE_DISTANCE_THRESHOLD) {
+        farSampleCount += 1;
+      }
+    }
+  }
+
+  const farSampleRatio = sampleCount > 0 ? farSampleCount / sampleCount : 0;
+  const averageNearestDistance = sampleCount > 0 ? distanceSum / sampleCount : 0;
+
+  return {
+    sampleCount,
+    farSampleCount,
+    farSampleRatio,
+    distanceThreshold: BRAND_PALETTE_DISTANCE_THRESHOLD,
+    farSampleRatioThreshold: BRAND_PALETTE_FAR_SAMPLE_RATIO_THRESHOLD,
+    averageNearestDistance,
+    isCompliant: farSampleRatio <= BRAND_PALETTE_FAR_SAMPLE_RATIO_THRESHOLD
+  };
+}
+
 function truncateForPrompt(value: string | null | undefined, maxLength: number): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (!text) {
@@ -241,18 +464,690 @@ function shapeCompositionHint(shape: PreviewShape): string {
   return "Reserve large left-center negative space for typography and keep accents subtle near edges.";
 }
 
-function readFeedbackRequest(input: unknown): string {
+type SafeAreaAnchor = "upper-left" | "upper-center";
+
+function resolveSafeAreaAnchor(directionSpec?: PlannedDirectionSpec | null): SafeAreaAnchor {
+  if (!directionSpec) {
+    return "upper-left";
+  }
+
+  if (
+    directionSpec.compositionType === "centered_stack" ||
+    directionSpec.compositionType === "badge_emblem" ||
+    directionSpec.compositionType === "monumental_overprint"
+  ) {
+    return "upper-center";
+  }
+
+  return "upper-left";
+}
+
+function describeLockupSafeArea(shape: PreviewShape, anchor: SafeAreaAnchor): string {
+  const ratios = LOCKUP_SAFE_REGION_RATIOS[shape];
+  const leftPct = Math.round(ratios.left * 100);
+  const topPct = Math.round(ratios.top * 100);
+  const widthPct = Math.round(ratios.width * 100);
+  const heightPct = Math.round(ratios.height * 100);
+  const rightPct = clampNumber(leftPct + widthPct, 0, 100);
+  const bottomPct = clampNumber(topPct + heightPct, 0, 100);
+  const anchorHint =
+    anchor === "upper-center"
+      ? "Prioritize the upper-center of this safe area for the cleanest negative space."
+      : "Prioritize the upper-left of this safe area for the cleanest negative space.";
+
+  return `${shape.toUpperCase()}: reserve lockup safe area at x ${leftPct}-${rightPct}% and y ${topPct}-${bottomPct}%. ${anchorHint} Keep this region clean, low texture, low contrast, no focal elements, no strong lines, no scanline/banding artifacts, no moire.`;
+}
+
+function buildLockupSafeAreaInstructions(directionSpec?: PlannedDirectionSpec | null): string {
+  const anchor = resolveSafeAreaAnchor(directionSpec);
+  const directionLine = directionSpec
+    ? `Direction-aware lockup reservation: ${directionSpec.compositionType} should protect the ${anchor} lockup lane.`
+    : "Direction-aware lockup reservation: default to upper-left lockup lane.";
+
+  return [
+    directionLine,
+    describeLockupSafeArea("wide", anchor),
+    describeLockupSafeArea("square", anchor),
+    describeLockupSafeArea("tall", anchor)
+  ].join(" ");
+}
+
+function describeTitleStageFocusBounds(shape: PreviewShape, placementHint: SafeAreaAnchor): string {
+  const ratios = LOCKUP_SAFE_REGION_RATIOS[shape];
+  const leftPct = Math.round(ratios.left * 100);
+  const topPct = Math.round(ratios.top * 100);
+  const widthPct = Math.round(ratios.width * 100);
+  const heightPct = Math.round(ratios.height * 100);
+  const rightPct = clampNumber(leftPct + widthPct, 0, 100);
+  const bottomPct = clampNumber(topPct + heightPct, 0, 100);
+  const placementNote =
+    placementHint === "upper-center"
+      ? "bias the cleanest negative space to the upper-center."
+      : "bias the cleanest negative space to the upper-left.";
+  return `${shape.toUpperCase()} composition support zone (planning coordinates only, never a drawn frame): x ${leftPct}-${rightPct}% and y ${topPct}-${bottomPct}%; ${placementNote}`;
+}
+
+function describeFormatStagePlacement(shape: PreviewShape, placementHint: SafeAreaAnchor): string {
+  const stageArea = describeTitleStageFocusBounds(shape, placementHint);
+  if (shape === "wide") {
+    return `WIDE guidance: ${stageArea} Build this zone through negative-space gradients, lower texture density, and gentle tonal easing; let arcs, diagonals, or cropped forms taper toward it without drawing borders.`;
+  }
+  if (shape === "square") {
+    return `SQUARE guidance: ${stageArea} Keep the stage compact in the top third using soft gradients, calmer texture, and cropped form rhythm; avoid framing that depends on wide side margins.`;
+  }
+  return `TALL guidance: ${stageArea} Keep stage in the upper third with vertical breathing room, tonal texture shifts, and shape-led framing; avoid long horizontal framing that crops awkwardly.`;
+}
+
+function buildTitleStageInstructions(params: {
+  format: PreviewShape;
+  placementHint: SafeAreaAnchor;
+  mode: ProjectBrandMode;
+}): string {
+  const formatOrder = [params.format, ...PREVIEW_SHAPES].filter(
+    (shape, index, items): shape is PreviewShape => items.indexOf(shape) === index
+  );
+  const modeLine =
+    params.mode === "brand"
+      ? "Brand mode discipline: keep the stage minimal, controlled, and palette-safe while preserving clear hierarchy."
+      : "Fresh mode discipline: expressive motifs are allowed outside the stage, but keep stage calm and clean.";
+
+  return [
+    "Title-stage objective: create an integrated stage that feels native to the artwork, never a separate panel.",
+    "Do NOT draw any visible rectangle/frame to indicate the stage.",
+    "Do NOT add faint rectangles, frames, guide boxes, UI overlays, wireframes, or thin outline borders anywhere (even subtly).",
+    "Do NOT use obvious spotlight cones, rays, or beam effects to fake stage lighting.",
+    ...formatOrder.map((shape) => describeFormatStagePlacement(shape, params.placementHint)),
+    "Build the stage through composition: negative-space gradients, lower texture density, lower local contrast, controlled tonal transitions, and shape-led framing via arcs/diagonals/cropped forms.",
+    "Use subtle surrounding composition to point toward the lockup area; composition should support the lockup zone rather than mark it with a container.",
+    "Keep a clear foreground/background hierarchy with the title stage as the quietest area, and make it feel native to the artwork.",
+    "Stage region should be calm/low-contrast, but NOT blank; use tasteful texture/tonal shift only.",
+    modeLine,
+    "The stage must look like part of the artwork, not an overlay or detached panel.",
+    "FORBID: thin outline rectangles, wireframe frames, guide boxes, overlay borders, corner brackets, UI-like frames, grids, safe-area outlines, semi-transparent rectangles, bounding boxes.",
+    "Soft framing only; never a literal panel or boxed region.",
+    "Forbid tight linear pinstripes, scanline banding, or moire patterns.",
+    "Forbid busy high-contrast texture in the stage region.",
+    "The stage must look intentional in all three aspect ratios, not only widescreen.",
+    "Do not place key motif elements inside the safe region."
+  ].join(" ");
+}
+
+type LockupStyleMode = "engraved_stamp" | "modern_editorial";
+
+const LOCKUP_DISALLOWED_DECORATIONS =
+  "random thin lines, corner brackets, label pills, text boxes or frames, white outline boxes, decorative underlines that are not part of one cohesive typographic system";
+const SERIES_MARK_REQUEST_PATTERN = /\b(mark|logo|icon|emblem|brand\s*mark|brandmark)\b/i;
+const SERIES_MARK_NEGATION_PATTERN =
+  /\b(no|avoid|without|exclude|skip)\s+(?:a\s+)?(?:series\s+)?(?:mark|logo|icon|emblem|brand\s*mark|brandmark)s?\b/i;
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
+}
+
+function summarizeReferenceTags(references: ReferenceLibraryItem[]): string {
+  const tags = references
+    .flatMap((reference) => reference.styleTags)
+    .map((tag) => tag.trim().toLowerCase())
+    .filter(Boolean);
+  const unique = [...new Set(tags)].slice(0, 10);
+  return unique.join(", ");
+}
+
+function resolveLockupStyleMode(params: {
+  directionSpec?: PlannedDirectionSpec | null;
+  styleFamily: StyleFamily;
+  lockupPresetId?: string | null;
+  references: ReferenceLibraryItem[];
+  brandMode?: ProjectBrandMode;
+  typographyDirection?: "match_site" | "graceled_defaults" | null;
+}): LockupStyleMode {
+  const tagText = summarizeReferenceTags(params.references);
+  const styleFamily = params.styleFamily.toLowerCase();
+  const preset = (params.lockupPresetId || "").toLowerCase();
+  const directionText = [
+    params.directionSpec?.styleFamily || "",
+    params.directionSpec?.compositionType || "",
+    params.directionSpec?.backgroundMode || "",
+    params.directionSpec?.lanePrompt || ""
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const engravedSignal =
+    styleFamily === "illustrated-heritage" ||
+    /engrav|etch|stamp|seal|badge|inscript|vintage|heritage|line-art/.test(`${tagText} ${preset} ${directionText}`);
+
+  if (params.brandMode === "brand" && params.typographyDirection === "match_site") {
+    return "modern_editorial";
+  }
+
+  return engravedSignal ? "engraved_stamp" : "modern_editorial";
+}
+
+function chooseLockupIntegrationMode(styleMode: LockupStyleMode): LockupIntegrationMode {
+  return styleMode === "engraved_stamp" ? "stamp" : "clean";
+}
+
+function isLockupLayoutArchetype(value: unknown): value is LockupLayoutArchetype {
+  return typeof value === "string" && LOCKUP_LAYOUT_ARCHETYPE_SET.has(value);
+}
+
+function hashForDeterministicOrdering(seed: string, value: string): string {
+  return createHash("sha256")
+    .update(`${seed}:${value}`)
+    .digest("hex");
+}
+
+function deterministicOrder<T extends string>(items: readonly T[], seed: string): T[] {
+  return [...items].sort((a, b) => hashForDeterministicOrdering(seed, a).localeCompare(hashForDeterministicOrdering(seed, b)));
+}
+
+function referencesSignalVintageDemand(references: ReferenceLibraryItem[]): boolean {
+  return references.some((reference) => reference.styleTags.some((tag) => VINTAGE_REFERENCE_TAG_PATTERN.test(tag)));
+}
+
+function defaultLockupLayoutForStyleMode(styleMode: LockupStyleMode): LockupLayoutArchetype {
+  return styleMode === "engraved_stamp" ? "seal_arc" : "editorial_stack";
+}
+
+function lockupLayoutInstructionForArchetype(archetype: LockupLayoutArchetype): string {
+  if (archetype === "seal_arc") {
+    return "seal_arc: arched title, subtitle on a straight baseline below, crest-friendly geometry, high-contrast single-ink behavior, and no faint emboss/deboss fade.";
+  }
+  if (archetype === "editorial_stack") {
+    return "editorial_stack: tight hierarchy, assertive kerning decisions, subtitle with disciplined tracking, subtle divider rules allowed, and no boxes.";
+  }
+  if (archetype === "banner_strip") {
+    return "banner_strip: dominant horizontal title strip logic with a secondary subtitle lane, no pill labels, no pasted banner stickers, and no boxed UI blocks.";
+  }
+  if (archetype === "split_title") {
+    return "split_title: intentional two-part title break with controlled contrast between lines/weights and a clearly subordinate subtitle.";
+  }
+  if (archetype === "framed_type") {
+    return "framed_type: use only a subtle typographic rule system for structure; never use a boxed label, panel, or outlined container around text.";
+  }
+  if (archetype === "monogram_mark") {
+    return "monogram_mark: small supporting monogram or emblem integrated with title rhythm, never overpowering the title/subtitle hierarchy.";
+  }
+  if (archetype === "vertical_spine") {
+    return "vertical_spine: vertical spine/rail logic that stays legible when scaled or cropped, especially for tall placements.";
+  }
+  if (archetype === "centered_classic") {
+    return "centered_classic: centered formal hierarchy with balanced vertical spacing and restrained ornament discipline.";
+  }
+  if (archetype === "stepped_baseline") {
+    return "stepped_baseline: staggered baseline progression for title lines with measured spacing and a stable subtitle anchor.";
+  }
+  return "offset_kicker: primary title anchored with a smaller offset kicker/subtitle accent that sharpens hierarchy without decorative clutter.";
+}
+
+function chooseDistinctLockupLayouts(params: {
+  seed: string;
+  styleModes: LockupStyleMode[];
+  exclude?: LockupLayoutArchetype[];
+}): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
+  const excludeSet = new Set(params.exclude || []);
+  const filteredPool = deterministicOrder(LOCKUP_LAYOUT_ARCHETYPES, `${params.seed}:pool`).filter((item) => !excludeSet.has(item));
+  const basePool = filteredPool.length > 0 ? filteredPool : deterministicOrder(LOCKUP_LAYOUT_ARCHETYPES, `${params.seed}:fallback`);
+  const used = new Set<LockupLayoutArchetype>();
+  const picks = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
+    const styleMode = params.styleModes[index] || "modern_editorial";
+    const preferredOrdered = deterministicOrder(
+      LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE[styleMode],
+      `${params.seed}:${styleMode}:${index}`
+    ).filter((item) => basePool.includes(item));
+    const orderedCandidates = [...preferredOrdered, ...basePool];
+    const chosen =
+      orderedCandidates.find((item) => !used.has(item)) ||
+      basePool.find((item) => !used.has(item)) ||
+      defaultLockupLayoutForStyleMode(styleMode);
+    used.add(chosen);
+    return chosen;
+  });
+
+  return [
+    picks[0] || defaultLockupLayoutForStyleMode(params.styleModes[0] || "modern_editorial"),
+    picks[1] || defaultLockupLayoutForStyleMode(params.styleModes[1] || "modern_editorial"),
+    picks[2] || defaultLockupLayoutForStyleMode(params.styleModes[2] || "modern_editorial")
+  ];
+}
+
+function resolvePlannedLockupLayouts(params: {
+  seed: string;
+  directionPlan: PlannedDirectionSpec[];
+  styleFamilies: readonly StyleFamily[];
+  lockupPresetIds: readonly (string | null | undefined)[];
+  referencesByOption: readonly ReferenceLibraryItem[][];
+  keepLayout?: LockupLayoutArchetype | null;
+  forceNewLayout?: boolean;
+  brandMode?: ProjectBrandMode;
+  typographyDirection?: "match_site" | "graceled_defaults" | null;
+}): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
+  if (params.keepLayout && !params.forceNewLayout) {
+    return [params.keepLayout, params.keepLayout, params.keepLayout];
+  }
+
+  const styleModes = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) =>
+    resolveLockupStyleMode({
+      directionSpec: params.directionPlan[index] || null,
+      styleFamily: (params.styleFamilies[index] || params.styleFamilies[0] || "clean-min") as StyleFamily,
+      lockupPresetId: params.lockupPresetIds[index] || null,
+      references: params.referencesByOption[index] || [],
+      brandMode: params.brandMode,
+      typographyDirection: params.typographyDirection
+    })
+  );
+
+  return chooseDistinctLockupLayouts({
+    seed: params.seed,
+    styleModes,
+    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined
+  });
+}
+
+function buildLockupGenerationPrompt(params: {
+  title: string;
+  subtitle: string;
+  styleMode: LockupStyleMode;
+  lockupLayout: LockupLayoutArchetype;
+  directionSpec?: PlannedDirectionSpec | null;
+  references: ReferenceLibraryItem[];
+  bibleCreativeBrief?: BibleCreativeBrief | null;
+  wantsSeriesMark?: boolean;
+  brandMode?: ProjectBrandMode;
+  typographyDirection?: "match_site" | "graceled_defaults" | null;
+  optionalMarkAccentHexes?: string[];
+}): string {
+  const subtitleLine = params.subtitle
+    ? `Series subtitle (must be secondary): ${truncateForPrompt(params.subtitle, 140)}`
+    : "Series subtitle: none (render only the title).";
+  const directionLine = params.directionSpec
+    ? `Direction context: ${params.directionSpec.styleFamily} / ${params.directionSpec.compositionType} / ${params.directionSpec.backgroundMode}.`
+    : "";
+  const referenceTags = summarizeReferenceTags(params.references);
+  const referenceLine = referenceTags
+    ? `Style reference tags: ${referenceTags}.`
+    : "";
+  const styleSpecificLine =
+    params.styleMode === "engraved_stamp"
+      ? "Style mode: engraved/stamped treatment. Mimic engraved, stamped, debossed, or etched print behavior with tactile ink-like edges. Use a one-ink print look at high opacity (85-100%). Do not use faint emboss/deboss effects where title/subtitle disappear."
+      : "Style mode: abstract/modern/geometric treatment. Use modern editorial typography and avoid faux scripts.";
+  const vintageDemand = referencesSignalVintageDemand(params.references);
+  const styleModeLayoutBiasLine =
+    params.styleMode === "engraved_stamp"
+      ? "Style/archetype pairing bias: engraved_stamp should commonly land like seal_arc or similarly crest-disciplined structure."
+      : vintageDemand
+        ? "Modern style mode with heritage signals from references: keep modern editorial structure first, and only borrow restrained vintage cues where the references clearly justify it."
+        : "Modern style mode bias: favor editorial_stack or split_title pacing and avoid faux vintage cues when references do not demand them.";
+  const archetypeLine = `Lockup layout archetype: ${params.lockupLayout}. Follow this layout strongly.`;
+  const archetypeInstructionLine = lockupLayoutInstructionForArchetype(params.lockupLayout);
+  // Bible brief motifs/markIdeas provide symbolic lockup accents without introducing extra copy.
+  const motifsLine =
+    params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
+      ? `Motif cues (symbolic): ${params.bibleCreativeBrief.motifs.slice(0, 6).join(", ")}.`
+      : "";
+  const typographyMoodLine =
+    params.bibleCreativeBrief && params.bibleCreativeBrief.typographyMood.length > 0
+      ? `Typography mood: ${params.bibleCreativeBrief.typographyMood.join(", ")}.`
+      : "";
+  const markIdeasLine =
+    params.wantsSeriesMark && params.bibleCreativeBrief && params.bibleCreativeBrief.markIdeas.length > 0
+      ? `Series mark ideas (choose one): ${params.bibleCreativeBrief.markIdeas.slice(0, 4).join(" | ")}.`
+      : "";
+  const markIntentLine = params.wantsSeriesMark
+    ? "Series mark requested for this direction: include one small reusable secondary emblem derived from motifs. Keep it single-color, monoline or geometric, clearly secondary, and never add extra words."
+    : "Do not create a standalone series mark for this option; keep any ornament secondary to the title lockup.";
+  const brandTypographyLine =
+    params.brandMode === "brand" && params.typographyDirection === "match_site"
+      ? "Brand typography directive (HARD): match_site means modern editorial type, clean hierarchy, disciplined spacing, and no decorative scripts."
+      : params.brandMode === "brand" && params.typographyDirection === "graceled_defaults"
+        ? "Brand typography directive (HARD): graceled_defaults means clean, contemporary church typography with disciplined hierarchy and no decorative scripts."
+        : "";
+  const brandInkContrastLine =
+    params.brandMode === "brand"
+      ? "Brand lockup ink/contrast behavior: prefer high-contrast single-ink readability (dark ink on light zones or light ink on dark zones), never low-opacity or muddy contrast."
+      : "";
+  const optionalMarkAccentLine =
+    params.brandMode === "brand" && (params.optionalMarkAccentHexes || []).length > 0
+      ? `Optional mark accents may use brand palette sparingly: ${(params.optionalMarkAccentHexes || []).join(", ")}. Do not force the full lockup palette to match brand colors.`
+      : "";
+  const titleStageLockupLine = params.directionSpec?.wantsTitleStage
+    ? "Assume the background will provide a clean title stage; do not add panels/frames behind the text."
+    : "";
+
+  return [
+    "Generate ONLY the SERIES TITLE and optional SERIES SUBTITLE as a crafted typographic lockup.",
+    `Series title (required): ${truncateForPrompt(params.title, 140)}`,
+    subtitleLine,
+    directionLine,
+    referenceLine,
+    styleSpecificLine,
+    archetypeLine,
+    archetypeInstructionLine,
+    styleModeLayoutBiasLine,
+    motifsLine,
+    typographyMoodLine,
+    markIdeasLine,
+    markIntentLine,
+    brandTypographyLine,
+    brandInkContrastLine,
+    optionalMarkAccentLine,
+    titleStageLockupLine,
+    "Output must be a transparent PNG with alpha. No solid background panels or opaque blocks.",
+    "No border boxes, no frames, no white outline boxes, and no UI-like labels.",
+    "No extra words, no scripture text, no logos, and no watermarks.",
+    "Lockup MUST be clearly readable at a glance; do not render at low opacity.",
+    "Typography must feel designed: intentional hierarchy, disciplined kerning/tracking, clean alignment, and subtle texture only when it matches the background style.",
+    "Optional emblem or mark is allowed only when it clearly supports the theme, stays small, and remains secondary to the title.",
+    "Subtitle must support the title: smaller scale, calmer weight, and harmonious style.",
+    "Maintain legibility at small sizes and preserve clean edge quality.",
+    `Explicitly ban: ${LOCKUP_DISALLOWED_DECORATIONS}.`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function applyLockupRecipeGuardrails(params: {
+  lockupRecipe: LockupRecipe;
+  styleMode: LockupStyleMode;
+}): LockupRecipe {
+  const source = params.lockupRecipe;
+  const modernMode = params.styleMode === "modern_editorial";
+
+  const titleTreatment =
+    source.titleTreatment === "boxed" || source.titleTreatment === "badge"
+      ? modernMode
+        ? source.layoutIntent === "bold_modern"
+          ? "overprint"
+          : "split"
+        : "stacked"
+      : source.titleTreatment;
+
+  let ornament: NonNullable<LockupRecipe["ornament"]>;
+  if (modernMode) {
+    ornament = {
+      kind: "none",
+      weight: source.ornament?.weight || "med"
+    };
+  } else if (source.ornament?.kind === "frame" || source.ornament?.kind === "rule_dot") {
+    ornament = {
+      kind: "grain",
+      weight: source.ornament?.weight || "thin"
+    };
+  } else if (source.ornament) {
+    ornament = source.ornament;
+  } else {
+    ornament = {
+      kind: "grain",
+      weight: "thin"
+    };
+  }
+
+  return {
+    ...source,
+    layoutIntent: modernMode
+      ? source.layoutIntent === "classic_serif" || source.layoutIntent === "handmade_organic"
+        ? "editorial"
+        : source.layoutIntent
+      : source.layoutIntent === "bold_modern" || source.layoutIntent === "minimal_clean"
+        ? "classic_serif"
+        : source.layoutIntent,
+    titleTreatment,
+    hierarchy: {
+      ...source.hierarchy,
+      subtitleScale: clampNumber(source.hierarchy.subtitleScale, 0.42, 0.62),
+      tracking: modernMode
+        ? clampNumber(source.hierarchy.tracking, -0.05, 0.08)
+        : clampNumber(source.hierarchy.tracking, 0.01, 0.08),
+      case: modernMode && source.hierarchy.case === "title_case" ? "upper" : source.hierarchy.case
+    },
+    ornament
+  };
+}
+
+type FeedbackGenerationControls = {
+  chosenGenerationId: string | null;
+  regenerateLockup?: boolean;
+  explicitNewTitleStyle?: boolean;
+  regenerateBackground?: boolean;
+};
+
+function readLockupLayoutFromInput(input: unknown): LockupLayoutArchetype | null {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return "";
+    return null;
+  }
+
+  const rawLayout = (input as { lockupLayout?: unknown }).lockupLayout;
+  return isLockupLayoutArchetype(rawLayout) ? rawLayout : null;
+}
+
+function readLockupLayoutFromOutput(output: unknown): LockupLayoutArchetype | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+
+  const rawLayout = (designSpec as { lockupLayout?: unknown }).lockupLayout;
+  return isLockupLayoutArchetype(rawLayout) ? rawLayout : null;
+}
+
+function readLockupLayoutFromGenerationPayload(input: unknown, output: unknown): LockupLayoutArchetype | null {
+  return readLockupLayoutFromInput(input) || readLockupLayoutFromOutput(output);
+}
+
+function readFeedbackGenerationControls(input: unknown): FeedbackGenerationControls {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {
+      chosenGenerationId: null
+    };
   }
 
   const feedback = (input as { feedback?: unknown }).feedback;
   if (!feedback || typeof feedback !== "object" || Array.isArray(feedback)) {
-    return "";
+    return {
+      chosenGenerationId: null
+    };
   }
 
-  const request = (feedback as { request?: unknown }).request;
-  return typeof request === "string" ? truncateForPrompt(request, 220) : "";
+  const typedFeedback = feedback as {
+    chosenGenerationId?: unknown;
+    regenerateLockup?: unknown;
+    explicitNewTitleStyle?: unknown;
+    regenerateBackground?: unknown;
+  };
+  const chosenGenerationId =
+    typeof typedFeedback.chosenGenerationId === "string" && typedFeedback.chosenGenerationId.trim()
+      ? typedFeedback.chosenGenerationId.trim()
+      : null;
+
+  return {
+    chosenGenerationId,
+    regenerateLockup: typeof typedFeedback.regenerateLockup === "boolean" ? typedFeedback.regenerateLockup : undefined,
+    explicitNewTitleStyle:
+      typeof typedFeedback.explicitNewTitleStyle === "boolean" ? typedFeedback.explicitNewTitleStyle : undefined,
+    regenerateBackground:
+      typeof typedFeedback.regenerateBackground === "boolean" ? typedFeedback.regenerateBackground : undefined
+  };
+}
+
+function shouldRequestSeriesMarkFromNotes(notes: Array<string | null | undefined>): boolean {
+  const combined = notes
+    .filter((note): note is string => typeof note === "string" && Boolean(note.trim()))
+    .join(" ")
+    .toLowerCase();
+  if (!combined) {
+    return false;
+  }
+  if (SERIES_MARK_NEGATION_PATTERN.test(combined)) {
+    return false;
+  }
+  return SERIES_MARK_REQUEST_PATTERN.test(combined);
+}
+
+function buildSeriesPreferenceGuidance(project: {
+  preferredAccentColors: string | null;
+  avoidColors: string | null;
+  designNotes: string | null;
+}): string {
+  const guidance: string[] = [];
+
+  const preferredAccentColors = truncateForPrompt(project.preferredAccentColors, 180);
+  const avoidColors = truncateForPrompt(project.avoidColors, 180);
+  const designNotes = truncateForPrompt(project.designNotes, 260);
+
+  if (preferredAccentColors) {
+    guidance.push(`Preferred accent colors: ${preferredAccentColors}.`);
+  }
+  if (avoidColors) {
+    guidance.push(`Avoid these colors: ${avoidColors}.`);
+  }
+  if (designNotes) {
+    guidance.push(`Design notes: ${designNotes}.`);
+  }
+
+  return guidance.join(" ");
+}
+
+function readSeriesPreferencesDesignNotesFromInput(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+
+  const seriesPreferences = (input as { seriesPreferences?: unknown }).seriesPreferences;
+  if (!seriesPreferences || typeof seriesPreferences !== "object" || Array.isArray(seriesPreferences)) {
+    return null;
+  }
+
+  const designNotes = (seriesPreferences as { designNotes?: unknown }).designNotes;
+  if (typeof designNotes !== "string") {
+    return null;
+  }
+
+  const trimmed = designNotes.trim();
+  return trimmed || null;
+}
+
+function resolvePublicAssetAbsolutePath(filePath: string): string | null {
+  if (!filePath.trim() || /^https?:\/\//i.test(filePath) || /^data:/i.test(filePath)) {
+    return null;
+  }
+
+  const publicRoot = path.join(process.cwd(), "public");
+  const relativePath = filePath.replace(/^\/+/, "");
+  const absolutePath = path.resolve(publicRoot, relativePath);
+  const publicPrefix = `${publicRoot}${path.sep}`;
+
+  if (absolutePath !== publicRoot && !absolutePath.startsWith(publicPrefix)) {
+    return null;
+  }
+
+  return absolutePath;
+}
+
+async function readAssetBufferFromPublicPath(filePath: string): Promise<Buffer | null> {
+  const absolutePath = resolvePublicAssetAbsolutePath(filePath);
+  if (!absolutePath) {
+    return null;
+  }
+
+  try {
+    return await readFile(absolutePath);
+  } catch {
+    return null;
+  }
+}
+
+type ReusableGenerationAssets = {
+  sourceGenerationId: string;
+  masterBackgroundPng: Buffer | null;
+  lockupPng: Buffer | null;
+};
+
+function pickAssetPathBySlots(
+  assets: Array<{ kind: string; slot: string | null; file_path: string }>,
+  slots: string[],
+  allowedKinds?: string[]
+): string | null {
+  const normalizedSlots = slots.map((slot) => slot.trim().toLowerCase());
+  const normalizedKinds = allowedKinds?.map((kind) => kind.trim().toUpperCase());
+
+  for (const asset of assets) {
+    const slot = (asset.slot || "").trim().toLowerCase();
+    const kind = asset.kind.trim().toUpperCase();
+    if (!slot || !asset.file_path?.trim()) {
+      continue;
+    }
+    if (!normalizedSlots.includes(slot)) {
+      continue;
+    }
+    if (normalizedKinds && !normalizedKinds.includes(kind)) {
+      continue;
+    }
+    return asset.file_path;
+  }
+
+  return null;
+}
+
+async function loadReusableAssetsFromGeneration(params: {
+  projectId: string;
+  generationId: string;
+}): Promise<ReusableGenerationAssets | null> {
+  const generation = await prisma.generation.findFirst({
+    where: {
+      id: params.generationId,
+      projectId: params.projectId
+    },
+    select: {
+      id: true,
+      assets: {
+        select: {
+          kind: true,
+          slot: true,
+          file_path: true
+        }
+      }
+    }
+  });
+
+  if (!generation) {
+    return null;
+  }
+
+  const backgroundPath =
+    pickAssetPathBySlots(generation.assets, ["wide_bg", "widescreen_bg", "square_bg", "tall_bg", "vertical_bg"], [
+      "BACKGROUND",
+      "IMAGE"
+    ]) || null;
+  const lockupPath =
+    pickAssetPathBySlots(generation.assets, [LOCKUP_ASSET_SLOT], ["LOCKUP", "IMAGE"]) ||
+    pickAssetPathBySlots(generation.assets, [LOCKUP_ASSET_SLOT]) ||
+    null;
+  const [masterBackgroundPng, lockupPng] = await Promise.all([
+    backgroundPath ? readAssetBufferFromPublicPath(backgroundPath) : Promise.resolve(null),
+    lockupPath ? readAssetBufferFromPublicPath(lockupPath) : Promise.resolve(null)
+  ]);
+
+  return {
+    sourceGenerationId: generation.id,
+    masterBackgroundPng,
+    lockupPng
+  };
 }
 
 type StyleBrief = {
@@ -289,6 +1184,25 @@ function laneBriefHint(optionIndex: number): string {
   return "Photo / texture lane with cinematic grain and tactile depth while preserving clarity.";
 }
 
+function preferredDirectionFamiliesForStyleDirection(styleDirection: StyleDirection): DirectionStyleFamily[] {
+  if (styleDirection === "MINIMAL") {
+    return ["minimal", "premium_modern"];
+  }
+  if (styleDirection === "PHOTO") {
+    return ["photo_centric", "editorial"];
+  }
+  if (styleDirection === "ILLUSTRATION") {
+    return ["retro", "editorial"];
+  }
+  if (styleDirection === "ABSTRACT" || styleDirection === "BOLD_TYPE") {
+    return ["premium_modern", "minimal"];
+  }
+  if (styleDirection === "SEASONAL") {
+    return ["retro", "photo_centric"];
+  }
+  return [];
+}
+
 function safeArrayOfStrings(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) {
     return fallback;
@@ -298,6 +1212,66 @@ function safeArrayOfStrings(value: unknown, fallback: string[]): string[] {
     .map((item) => item.trim())
     .filter(Boolean);
   return normalized.length > 0 ? normalized : fallback;
+}
+
+function normalizeMotifToken(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function readMotifFocusFromGenerationOutput(output: unknown): string[] {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return [];
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return [];
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return [];
+  }
+  return safeArrayOfStrings((designSpec as { motifFocus?: unknown }).motifFocus, []);
+}
+
+async function loadRecentProjectMotifs(projectId: string): Promise<string[]> {
+  const recentGenerations = await prisma.generation.findMany({
+    where: {
+      projectId
+    },
+    orderBy: [{ round: "desc" }, { createdAt: "desc" }],
+    take: 12,
+    select: {
+      round: true,
+      output: true
+    }
+  });
+
+  if (recentGenerations.length === 0) {
+    return [];
+  }
+
+  const newestRound = recentGenerations[0]?.round || 1;
+  const minimumRound = Math.max(1, newestRound - 1);
+  const recent = new Set<string>();
+
+  for (const generation of recentGenerations) {
+    if (generation.round < minimumRound) {
+      continue;
+    }
+    const motifFocus = readMotifFocusFromGenerationOutput(generation.output);
+    for (const motif of motifFocus) {
+      const normalized = normalizeMotifToken(motif);
+      if (normalized) {
+        recent.add(normalized);
+      }
+    }
+  }
+
+  return [...recent];
 }
 
 function fallbackStyleBrief(optionIndex: number, palette: string[]): StyleBrief {
@@ -580,26 +1554,6 @@ function hasExplicitPhotoRequest(params: {
   return containsPhotoSceneRequest(source);
 }
 
-function buildTopicMotifHint(project: GenerationProjectContext): string {
-  const source = [
-    project.series_title,
-    project.series_subtitle || "",
-    project.scripture_passages || "",
-    project.series_description || ""
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  if (/\bruth\b/.test(source)) {
-    return "Subtle topic motifs: wheat, barley, gleaning fields, harvest texture, and quiet Bethlehem-era atmosphere.";
-  }
-  if (/\b(psalm|psalms)\b/.test(source)) {
-    return "Subtle topic motifs: layered light rays, gentle gradients, and contemplative abstract rhythm.";
-  }
-
-  return "Keep motif language symbolic and understated for church contexts.";
-}
-
 async function hasTextLikeRasterPattern(image: Buffer): Promise<boolean> {
   const downscaled = await sharp(image, { failOn: "none" })
     .resize({ width: 320, fit: "inside" })
@@ -755,9 +1709,15 @@ type GenerationProjectContext = {
   series_subtitle: string | null;
   scripture_passages: string | null;
   series_description: string | null;
+  brandMode: ProjectBrandMode;
+  preferredAccentColors: string | null;
+  avoidColors: string | null;
+  designNotes: string | null;
   brandKit: {
     paletteJson: string;
     logoPath: string | null;
+    typographyDirection: "match_site" | "graceled_defaults";
+    source: "organization" | "project" | "project_fallback";
   } | null;
 };
 
@@ -770,6 +1730,7 @@ type BuildGenerationOutputParams = {
   optionIndex: number;
   referenceItems?: ReferenceLibraryItem[];
   revisedPrompt?: string;
+  motifBankContext?: MotifBankContext;
 };
 
 type GenerationOutputPayload = {
@@ -829,42 +1790,61 @@ function adaptDesignDocToDimensions(designDoc: DesignDoc, targetWidth: number, t
   };
 }
 
+const DEFAULT_FALLBACK_TEXT_PALETTE = {
+  primary: "#0F172A",
+  secondary: "#334155",
+  tertiary: "#475569",
+  rule: "#334155",
+  accent: "#0F172A",
+  autoScrim: false,
+  scrimTint: "#FFFFFF" as const
+};
+
 function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): GenerationOutputPayload {
   const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-
-  const buildDocForShape = (shape?: PreviewShape) =>
-    buildFallbackDesignDoc({
-      output: null,
-      input: params.input,
-      presetKey: params.presetKey,
-      shape,
-      round: params.round,
-      optionIndex: params.optionIndex,
-      project: {
-        seriesTitle: params.project.series_title,
-        seriesSubtitle: params.project.series_subtitle,
-        scripturePassages: params.project.scripture_passages,
-        seriesDescription: params.project.series_description,
-        logoPath: params.project.brandKit?.logoPath || null,
-        palette
-      }
-    });
+  const validatedDesignBrief = validateDesignBrief((params.input as { designBrief?: unknown }).designBrief);
+  const designBrief = validatedDesignBrief.ok ? validatedDesignBrief.data : null;
+  const lockupLayout = readLockupLayoutFromInput(params.input);
+  const directionSpec = readDirectionSpecFromInput(params.input, params.optionIndex);
+  const wantsTitleStage = directionSpec?.wantsTitleStage === true;
+  const lockupRecipe = designBrief?.lockupRecipe;
+  const lockupPresetId = designBrief?.lockupPresetId;
+  const optionStyleFamily = (designBrief?.styleFamilies[params.optionIndex] || designBrief?.styleFamilies[0] || "clean-min") as StyleFamily;
+  const displayContent = buildOverlayDisplayContent({
+    title: params.project.series_title,
+    subtitle: params.project.series_subtitle,
+    scripturePassages: params.project.scripture_passages
+  });
 
   const designDocByShape = {} as Record<PreviewShape, DesignDoc>;
-  if (params.presetKey === "type_clean_min_v1") {
-    for (const shape of PREVIEW_SHAPES) {
-      designDocByShape[shape] = buildDocForShape(shape);
-    }
-  } else {
-    const fallbackDesignDoc = buildDocForShape();
-    for (const shape of PREVIEW_SHAPES) {
-      const shapeDimensions = PREVIEW_DIMENSIONS[shape];
-      designDocByShape[shape] = adaptDesignDocToDimensions(
-        fallbackDesignDoc,
-        shapeDimensions.width,
-        shapeDimensions.height
-      );
-    }
+
+  const templateBrief: TemplateBrief = {
+    title: displayContent.title,
+    subtitle: displayContent.subtitle,
+    scripture: designBrief?.passage || params.project.scripture_passages || "",
+    keywords: designBrief?.keywords || [],
+    palette,
+    lockupRecipe,
+    lockupPresetId
+  };
+
+  for (const shape of PREVIEW_SHAPES) {
+    designDocByShape[shape] = renderTemplate(optionStyleFamily, templateBrief, params.optionIndex, shape, {
+      backgroundImagePath: null,
+      textPalette: DEFAULT_FALLBACK_TEXT_PALETTE
+    });
+  }
+  const fallbackDesignSpec: Record<string, unknown> = {
+    wantsTitleStage,
+    wantsSeriesMark: directionSpec?.wantsSeriesMark === true,
+    motifFocus: directionSpec?.motifFocus || [],
+    bookKeys: params.motifBankContext?.bookKeys || [],
+    bookNames: params.motifBankContext?.bookNames || [],
+    topicKeys: params.motifBankContext?.topicKeys || [],
+    topicNames: params.motifBankContext?.topicNames || []
+  };
+  if (lockupLayout) {
+    fallbackDesignSpec.lockupLayout = lockupLayout;
   }
 
   return {
@@ -874,13 +1854,14 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     meta: {
       styleRefCount: params.referenceItems?.length || 0,
       usedStylePaths: (params.referenceItems || []).map((ref) => ref.path || ref.thumbPath),
-      revisedPrompt: params.revisedPrompt
+      revisedPrompt: params.revisedPrompt,
+      designSpec: fallbackDesignSpec
     }
   };
 }
 
 async function getProjectForGeneration(projectId: string, organizationId: string) {
-  return prisma.project.findFirst({
+  const project = await prisma.project.findFirst({
     where: {
       id: projectId,
       organizationId
@@ -891,6 +1872,10 @@ async function getProjectForGeneration(projectId: string, organizationId: string
       series_subtitle: true,
       scripture_passages: true,
       series_description: true,
+      brandMode: true,
+      preferredAccentColors: true,
+      avoidColors: true,
+      designNotes: true,
       brandKit: {
         select: {
           websiteUrl: true,
@@ -901,6 +1886,26 @@ async function getProjectForGeneration(projectId: string, organizationId: string
       }
     }
   });
+
+  if (!project) {
+    return null;
+  }
+
+  const brandMode: ProjectBrandMode = project.brandMode === "brand" ? "brand" : "fresh";
+  const effectiveBrandKit =
+    brandMode === "brand"
+      ? await resolveEffectiveBrandKit({
+          organizationId,
+          projectId: project.id,
+          projectBrandKit: project.brandKit
+        })
+      : null;
+
+  return {
+    ...project,
+    brandMode,
+    brandKit: effectiveBrandKit
+  };
 }
 
 function buildGenerationInput(
@@ -909,22 +1914,37 @@ function buildGenerationInput(
     series_subtitle: string | null;
     scripture_passages: string | null;
     series_description: string | null;
+    brandMode: ProjectBrandMode;
+    preferredAccentColors: string | null;
+    avoidColors: string | null;
+    designNotes: string | null;
   },
   brandKit: {
     websiteUrl: string;
     typographyDirection: "match_site" | "graceled_defaults";
     paletteJson: string;
-  },
+  } | null,
   selectedPresetKeys: string[] = [],
-  lockupRecipe?: unknown
+  lockupRecipe?: unknown,
+  lockupPresetId?: string | null,
+  styleFamilySeed?: string,
+  plannedStyleFamilies?: [StyleFamily, StyleFamily, StyleFamily],
+  runSeed?: string,
+  directionPlan?: PlannedDirectionSpec[],
+  lockupLayout?: LockupLayoutArchetype
 ) {
+  const palette = brandKit ? parsePaletteJson(brandKit.paletteJson) : [];
+
   const designBrief = buildDesignBrief({
     seriesTitle: project.series_title,
     seriesSubtitle: project.series_subtitle,
     passage: project.scripture_passages,
     backgroundPrompt: project.series_description,
     selectedPresetKeys,
-    lockupRecipe
+    lockupPresetId,
+    lockupRecipe,
+    styleFamilySeed,
+    styleFamilies: plannedStyleFamilies
   });
 
   return {
@@ -932,25 +1952,23 @@ function buildGenerationInput(
     series_subtitle: project.series_subtitle,
     scripture_passages: project.scripture_passages,
     series_description: project.series_description,
-    websiteUrl: brandKit.websiteUrl,
-    typographyDirection: brandKit.typographyDirection,
-    palette: parsePaletteJson(brandKit.paletteJson),
+    brandMode: project.brandMode,
+    generationMode: "background_lockup_split",
+    assetModes: ["background", "lockup"],
+    seriesPreferences: {
+      preferredAccentColors: project.preferredAccentColors,
+      avoidColors: project.avoidColors,
+      designNotes: project.designNotes
+    },
+    websiteUrl: brandKit?.websiteUrl || null,
+    typographyDirection: brandKit?.typographyDirection || null,
+    palette,
     selectedPresetKeys,
+    runSeed: runSeed || styleFamilySeed || randomUUID(),
+    directionPlan: directionPlan || [],
+    lockupLayout: lockupLayout || null,
     designBrief
   };
-}
-
-function readLockupRecipeFromInput(input: unknown): unknown {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return undefined;
-  }
-
-  const designBrief = (input as { designBrief?: unknown }).designBrief;
-  if (!designBrief || typeof designBrief !== "object" || Array.isArray(designBrief)) {
-    return undefined;
-  }
-
-  return (designBrief as { lockupRecipe?: unknown }).lockupRecipe;
 }
 
 function readDesignBriefFromInput(input: unknown): DesignBrief | null {
@@ -961,6 +1979,83 @@ function readDesignBriefFromInput(input: unknown): DesignBrief | null {
   const designBrief = (input as { designBrief?: unknown }).designBrief;
   const validated = validateDesignBrief(designBrief);
   return validated.ok ? validated.data : null;
+}
+
+function readRunSeedFromInput(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+
+  const runSeed = (input as { runSeed?: unknown }).runSeed;
+  if (typeof runSeed !== "string") {
+    return null;
+  }
+
+  const trimmed = runSeed.trim();
+  return trimmed || null;
+}
+
+function readDirectionSpecFromInput(input: unknown, optionIndex: number): PlannedDirectionSpec | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+
+  const directionPlan = (input as { directionPlan?: unknown }).directionPlan;
+  if (!Array.isArray(directionPlan)) {
+    return null;
+  }
+
+  const candidate = directionPlan[optionIndex];
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+
+  const parsed = candidate as Partial<PlannedDirectionSpec>;
+  if (
+    typeof parsed.presetKey !== "string" ||
+    typeof parsed.lockupPresetId !== "string" ||
+    typeof parsed.styleFamily !== "string" ||
+    typeof parsed.compositionType !== "string" ||
+    typeof parsed.backgroundMode !== "string" ||
+    typeof parsed.typeProfile !== "string" ||
+    typeof parsed.ornamentProfile !== "string" ||
+    typeof parsed.templateStyleFamily !== "string" ||
+    typeof parsed.lanePrompt !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    ...(candidate as PlannedDirectionSpec),
+    optionIndex,
+    optionLabel: optionLane(optionIndex),
+    wantsSeriesMark: parsed.wantsSeriesMark === true,
+    wantsTitleStage: parsed.wantsTitleStage === true,
+    motifFocus: safeArrayOfStrings(parsed.motifFocus, []).slice(0, 2)
+  };
+}
+
+function withResolvedLockupPaletteInput(
+  input: Prisma.InputJsonValue,
+  designBrief: DesignBrief,
+  resolvedPalette: ResolvedLockupPalette
+): Prisma.InputJsonValue {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {
+      designBrief: {
+        ...designBrief,
+        resolvedLockupPalette: resolvedPalette
+      }
+    } as Prisma.InputJsonValue;
+  }
+
+  return {
+    ...(input as Record<string, unknown>),
+    designBrief: {
+      ...designBrief,
+      resolvedLockupPalette: resolvedPalette
+    }
+  } as Prisma.InputJsonValue;
 }
 
 type EnabledPresetRecord = {
@@ -1030,17 +2125,14 @@ async function writeGenerationPreviewFiles(params: {
   return path.posix.join("uploads", params.fileName);
 }
 
-async function normalizePngToShape(png: Buffer, shape: PreviewShape): Promise<Buffer> {
+async function normalizePngToShape(png: Buffer, shape: PreviewShape, focalPoint?: FocalPoint): Promise<Buffer> {
   const dimensions = PREVIEW_DIMENSIONS[shape];
-  return sharp(png)
-    .resize({
-      width: dimensions.width,
-      height: dimensions.height,
-      fit: "cover",
-      position: "center"
-    })
-    .png()
-    .toBuffer();
+  return resizeCoverWithFocalPoint({
+    input: png,
+    width: dimensions.width,
+    height: dimensions.height,
+    focalPoint
+  });
 }
 
 function mimeTypeFromPath(filePath: string): string | null {
@@ -1085,6 +2177,9 @@ async function createStyleBrief(params: {
   references: ReferenceLibraryItem[];
   feedbackRequest: string;
   palette: string[];
+  directionSpec?: PlannedDirectionSpec | null;
+  styleFamily?: StyleFamily;
+  lockupPresetId?: string | null;
 }): Promise<StyleBrief> {
   const fallback = fallbackStyleBrief(params.optionIndex, params.palette);
   const apiKey = process.env.OPENAI_API_KEY?.trim();
@@ -1096,6 +2191,30 @@ async function createStyleBrief(params: {
   const subtitle = truncateForPrompt(params.project.series_subtitle, 120);
   const scripture = truncateForPrompt(params.project.scripture_passages, 140);
   const description = truncateForPrompt(params.project.series_description, 360);
+  const organizationTypographyDirection =
+    params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
+      ? params.project.brandKit.typographyDirection
+      : null;
+  const lockupStyleMode = resolveLockupStyleMode({
+    directionSpec: params.directionSpec,
+    styleFamily: params.styleFamily || "clean-min",
+    lockupPresetId: params.lockupPresetId,
+    references: params.references,
+    brandMode: params.project.brandMode,
+    typographyDirection: organizationTypographyDirection
+  });
+  const lockupAccentPalette = params.project.brandKit ? normalizeHexPalette(parsePaletteJson(params.project.brandKit.paletteJson)) : [];
+  const lockupPrompt = buildLockupGenerationPrompt({
+    title: params.project.series_title,
+    subtitle: params.project.series_subtitle || "",
+    styleMode: lockupStyleMode,
+    lockupLayout: defaultLockupLayoutForStyleMode(lockupStyleMode),
+    directionSpec: params.directionSpec,
+    references: params.references,
+    brandMode: params.project.brandMode,
+    typographyDirection: organizationTypographyDirection,
+    optionalMarkAccentHexes: lockupAccentPalette
+  });
   const referenceSummary = params.references
     .slice(0, 6)
     .map((reference) => {
@@ -1114,9 +2233,15 @@ async function createStyleBrief(params: {
     subtitle ? `Series subtitle: ${subtitle}` : "",
     scripture ? `Scripture passages: ${scripture}` : "",
     description ? `Series description mood context (PROMPT-ONLY, never rendered): ${description}` : "",
+    params.project.preferredAccentColors
+      ? `Preferred accent colors: ${truncateForPrompt(params.project.preferredAccentColors, 180)}`
+      : "",
+    params.project.avoidColors ? `Avoid colors: ${truncateForPrompt(params.project.avoidColors, 180)}` : "",
+    params.project.designNotes ? `Series design notes: ${truncateForPrompt(params.project.designNotes, 240)}` : "",
     params.feedbackRequest ? `User refinement request: ${params.feedbackRequest}` : "",
     params.palette.length > 0 ? `Brand palette: ${params.palette.join(", ")}` : "",
     referenceSummary ? `Reference summaries:\n${referenceSummary}` : "",
+    `Lockup generation brief:\n${lockupPrompt}`,
     "Hard rule: final rendered text must contain only series title + optional series subtitle.",
     "Hard rule: series description is context only and must never be rendered as text."
   ]
@@ -1135,61 +2260,86 @@ async function createStyleBrief(params: {
   }
 }
 
-function buildCleanMinimalBackgroundPrompt(params: {
-  project: GenerationProjectContext;
-  palette: string[];
+function buildTemplateBackgroundPrompt(params: {
+  brief: TemplateBrief;
+  styleFamily: StyleFamily;
   shape: PreviewShape;
   generationId: string;
-  optionIndex: number;
-  feedbackRequest?: string;
-  styleBrief: StyleBrief;
-  creativeBrief: string;
-  avoidWords: string[];
-  originalityBoost?: string;
+  directionSpec?: PlannedDirectionSpec | null;
+  brandMode?: ProjectBrandMode;
+  seriesPreferenceGuidance?: string;
+  bibleCreativeBrief?: BibleCreativeBrief | null;
   noTextBoost?: string;
+  originalityBoost?: string;
+  brandPaletteHardConstraint?: string;
+  paletteComplianceBoost?: string;
 }): string {
-  const description = truncateForPrompt(params.project.series_description, 360);
-  const photoRequested = hasExplicitPhotoRequest({
-    project: params.project,
-    feedbackRequest: params.feedbackRequest || ""
-  });
-  const topicMotifHint = buildTopicMotifHint(params.project);
-  const paletteHint =
-    params.palette.length > 0
-      ? `Use restrained tones influenced by this palette: ${params.palette.join(", ")}.`
-      : "Use a neutral clean-minimal palette with soft whites, warm grays, slate, and one subtle accent.";
-  const avoidWordList = params.avoidWords.slice(0, 16).join(", ");
-  const minimalNegativeList = "highway, road, cars, city, skyscraper, traffic, intersections, street signs, billboards";
+  const directionHint = params.directionSpec
+    ? [
+        `Direction family: ${params.directionSpec.styleFamily}.`,
+        `Composition: ${params.directionSpec.compositionType}.`,
+        `Background mode: ${params.directionSpec.backgroundMode}.`,
+        `Type profile: ${params.directionSpec.typeProfile}.`,
+        `Ornament profile: ${params.directionSpec.ornamentProfile}.`,
+        params.directionSpec.lanePrompt
+      ].join(" ")
+    : "";
+  // Bible creative brief fields are used as symbolic visual guidance for background generation.
+  const bibleSummaryLine = params.bibleCreativeBrief ? `Bible brief summary: ${params.bibleCreativeBrief.summary}` : "";
+  const bibleThemeLine =
+    params.bibleCreativeBrief && params.bibleCreativeBrief.themes.length > 0
+      ? `Themes: ${params.bibleCreativeBrief.themes.join(", ")}.`
+      : "";
+  const bibleMotifLine =
+    params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
+      ? `Motifs (symbolic cues): ${params.bibleCreativeBrief.motifs.slice(0, 8).join(", ")}.`
+      : "";
+  const motifFocus = safeArrayOfStrings(params.directionSpec?.motifFocus, []).slice(0, 2);
+  const motifFocusLine =
+    motifFocus.length > 0 ? `Primary motifs for this direction: ${motifFocus.join(", ")}. Incorporate these subtly.` : "";
+  const allowedGenericMotifs = safeArrayOfStrings(params.bibleCreativeBrief?.allowedGenericMotifs, []);
+  const allowedGenericForDirection = [...new Set([...allowedGenericMotifs, ...motifFocus])];
+  const allowedGenericLine =
+    allowedGenericForDirection.length > 0
+      ? `Allowed generic motifs for this direction (if context truly demands): ${allowedGenericForDirection.join(", ")}.`
+      : "Allowed generic motifs for this direction: none.";
+  const genericMotifBanLine = `Do NOT use generic Christian icons (${GENERIC_CHRISTIAN_MOTIFS.join(
+    ", "
+  )}) unless explicitly listed in allowedGenericMotifs or motifFocus.`;
+  const bibleDoNotUseLine =
+    params.bibleCreativeBrief && params.bibleCreativeBrief.doNotUse.length > 0
+      ? `Do not use: ${params.bibleCreativeBrief.doNotUse.join("; ")}.`
+      : "";
+  const titleStageInstructions =
+    params.directionSpec?.wantsTitleStage === true
+      ? buildTitleStageInstructions({
+          format: params.shape,
+          placementHint: resolveSafeAreaAnchor(params.directionSpec),
+          mode: params.brandMode || "fresh"
+        })
+      : "";
 
   return [
-    "Create an ORIGINAL premium sermon-series BACKGROUND only.",
-    "Background only. no text, no letters, no words, no typography, no signage, no watermarks.",
-    "No logos and no symbols that resemble letters.",
-    "Do not include any readable characters in any language.",
-    "Create an ORIGINAL design; do not copy reference images; use them only for inspiration.",
-    "Use strong hierarchy principles: disciplined grid, intentional negative space, restrained accents.",
-    photoRequested
-      ? "Photo scene was requested by user context, but keep imagery restrained and topic-relevant with clean negative space."
-      : "Default to abstract textures, subtle paper grain, geometric motifs, and minimal illustration accents. Avoid literal scene photography unless explicitly requested.",
-    topicMotifHint,
-    !photoRequested ? `Negative scene list: ${minimalNegativeList}.` : "",
-    "Leave intentional negative space for a text overlay in the upper-left area.",
+    buildBackgroundPrompt(params.brief, params.styleFamily),
+    directionHint,
+    bibleSummaryLine,
+    bibleThemeLine,
+    bibleMotifLine,
+    motifFocusLine,
+    allowedGenericLine,
+    genericMotifBanLine,
+    params.seriesPreferenceGuidance || "",
     shapeCompositionHint(params.shape),
-    laneBriefHint(params.optionIndex),
-    `Creative brief: ${params.creativeBrief}`,
-    `Layout brief: ${params.styleBrief.layout}`,
-    `Typography intent for later overlay: title=${params.styleBrief.typography.title} | subtitle=${params.styleBrief.typography.subtitle} | passage=${params.styleBrief.typography.passage}.`,
-    params.styleBrief.motifs.length > 0 ? `Motifs: ${params.styleBrief.motifs.join(", ")}.` : "",
-    `Spacing: ${params.styleBrief.spacing}`,
-    `Color direction: ${params.styleBrief.colorDirection}`,
-    params.styleBrief.avoid.length > 0 ? `Avoid: ${params.styleBrief.avoid.join(", ")}.` : "",
-    avoidWordList ? `Avoid words (never render these as text): ${avoidWordList}.` : "",
-    description ? `Series description mood context (prompt-only, never render): ${description}.` : "",
-    paletteHint,
-    params.feedbackRequest ? `Refinement cues: ${params.feedbackRequest}.` : "",
+    "Incorporate 1-2 motifs subtly and symbolically; avoid literal portraits or face-centric depictions.",
+    buildLockupSafeAreaInstructions(params.directionSpec),
+    titleStageInstructions,
+    "Avoid busy details in the lockup safe area; keep that region low-detail and low-contrast.",
+    bibleDoNotUseLine,
+    "Keep hierarchy disciplined and leave the lockup lane clean.",
+    params.brandPaletteHardConstraint || "",
+    params.paletteComplianceBoost || "",
     params.noTextBoost || "",
     params.originalityBoost || "",
-    "Final text policy reminder: title/subtitle are overlay-only and must NOT appear in the background art.",
     `Variation seed: ${params.generationId}.`
   ]
     .filter(Boolean)
@@ -1228,34 +2378,37 @@ const NO_TEXT_RETRY_BOOSTS = [
 ] as const;
 
 async function generateValidatedBackgroundPng(params: {
-  project: GenerationProjectContext;
-  palette: string[];
+  brief: TemplateBrief;
+  styleFamily: StyleFamily;
   shape: PreviewShape;
   generationId: string;
-  optionIndex: number;
-  feedbackRequest: string;
-  styleBrief: StyleBrief;
-  creativeBrief: string;
-  avoidWords: string[];
+  directionSpec?: PlannedDirectionSpec | null;
+  brandMode?: ProjectBrandMode;
+  seriesPreferenceGuidance?: string;
+  bibleCreativeBrief?: BibleCreativeBrief | null;
   referenceDataUrls: string[];
+  focalPoint?: FocalPoint;
   originalityBoost?: string;
+  brandPaletteHardConstraint?: string;
+  paletteComplianceBoost?: string;
 }): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number }> {
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
 
   for (let attempt = 0; attempt <= 2; attempt += 1) {
     const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[attempt - 1];
-    const prompt = buildCleanMinimalBackgroundPrompt({
-      project: params.project,
-      palette: params.palette,
+    const prompt = buildTemplateBackgroundPrompt({
+      brief: params.brief,
+      styleFamily: params.styleFamily,
       shape: params.shape,
       generationId: params.generationId,
-      optionIndex: params.optionIndex,
-      feedbackRequest: params.feedbackRequest,
-      styleBrief: params.styleBrief,
-      creativeBrief: params.creativeBrief,
-      avoidWords: params.avoidWords,
+      directionSpec: params.directionSpec,
+      brandMode: params.brandMode,
+      seriesPreferenceGuidance: params.seriesPreferenceGuidance,
+      bibleCreativeBrief: params.bibleCreativeBrief,
       originalityBoost: params.originalityBoost,
+      brandPaletteHardConstraint: params.brandPaletteHardConstraint,
+      paletteComplianceBoost: params.paletteComplianceBoost,
       noTextBoost
     });
 
@@ -1264,7 +2417,7 @@ async function generateValidatedBackgroundPng(params: {
       shape: params.shape,
       referenceDataUrls: params.referenceDataUrls
     });
-    const backgroundPng = await normalizePngToShape(backgroundSource, params.shape);
+    const backgroundPng = await normalizePngToShape(backgroundSource, params.shape, params.focalPoint);
     const hasText = await imageHasReadableText(backgroundPng);
     if (!hasText) {
       return {
@@ -1312,31 +2465,89 @@ async function renderCompositedPreviewPng(designDoc: DesignDoc): Promise<Buffer>
     .toBuffer();
 }
 
+function toBackgroundOnlyDesignDoc(designDoc: DesignDoc): DesignDoc {
+  return {
+    ...designDoc,
+    layers: designDoc.layers.filter((layer) => layer.type !== "text")
+  };
+}
+
+async function renderBackgroundOnlyPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
+  const svg = await buildFinalSvg(toBackgroundOnlyDesignDoc(designDoc));
+  return sharp(Buffer.from(svg))
+    .resize({
+      width: designDoc.width,
+      height: designDoc.height,
+      fit: "fill",
+      position: "center"
+    })
+    .png()
+    .toBuffer();
+}
+
 async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
   output: GenerationOutputPayload;
 }): Promise<void> {
   const designDocByShape = params.output.designDocByShape;
-  const [squarePng, widePng, tallPng] = await Promise.all([
+  const [squarePng, widePng, tallPng, squareBackgroundPng, wideBackgroundPng, tallBackgroundPng, lockupResult] = await Promise.all([
     renderCompositedPreviewPng(designDocByShape.square),
     renderCompositedPreviewPng(designDocByShape.wide),
-    renderCompositedPreviewPng(designDocByShape.tall)
+    renderCompositedPreviewPng(designDocByShape.tall),
+    renderBackgroundOnlyPreviewPng(designDocByShape.square),
+    renderBackgroundOnlyPreviewPng(designDocByShape.wide),
+    renderBackgroundOnlyPreviewPng(designDocByShape.tall),
+    (async () =>
+      renderTrimmedLockupPngFromSvg(
+        await buildFinalSvg(designDocByShape.wide, {
+          includeBackground: false,
+          includeImages: false
+        })
+      ))()
   ]);
-  const [squarePath, widePath, tallPath] = await Promise.all([
-    writeGenerationPreviewFiles({
-      fileName: `${params.generationId}-square.png`,
-      png: squarePng
-    }),
-    writeGenerationPreviewFiles({
-      fileName: `${params.generationId}-wide.png`,
-      png: widePng
-    }),
-    writeGenerationPreviewFiles({
-      fileName: `${params.generationId}-tall.png`,
-      png: tallPng
-    })
-  ]);
+  const [squarePath, widePath, tallPath, squareBackgroundPath, wideBackgroundPath, tallBackgroundPath, lockupPath] =
+    await Promise.all([
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-square.png`,
+        png: squarePng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-wide.png`,
+        png: widePng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-tall.png`,
+        png: tallPng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-square-bg.png`,
+        png: squareBackgroundPng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-wide-bg.png`,
+        png: wideBackgroundPng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-tall-bg.png`,
+        png: tallBackgroundPng
+      }),
+      writeGenerationPreviewFiles({
+        fileName: `${params.generationId}-lockup.png`,
+        png: lockupResult.png
+      })
+    ]);
+  const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
+    projectId: params.projectId,
+    generationId: params.generationId,
+    kind: "BACKGROUND",
+    slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
+    file_path:
+      shape === "square" ? squareBackgroundPath : shape === "wide" ? wideBackgroundPath : tallBackgroundPath,
+    mime_type: "image/png",
+    width: PREVIEW_DIMENSIONS[shape].width,
+    height: PREVIEW_DIMENSIONS[shape].height
+  }));
   const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
     projectId: params.projectId,
     generationId: params.generationId,
@@ -1347,6 +2558,16 @@ async function completeGenerationWithFallbackOutput(params: {
     width: PREVIEW_DIMENSIONS[shape].width,
     height: PREVIEW_DIMENSIONS[shape].height
   }));
+  const lockupAssetRow: Prisma.AssetCreateManyInput = {
+    projectId: params.projectId,
+    generationId: params.generationId,
+    kind: "LOCKUP",
+    slot: LOCKUP_ASSET_SLOT,
+    file_path: lockupPath,
+    mime_type: "image/png",
+    width: lockupResult.width,
+    height: lockupResult.height
+  };
 
   const completedOutput: GenerationOutputPayload = {
     ...params.output,
@@ -1367,7 +2588,7 @@ async function completeGenerationWithFallbackOutput(params: {
       }
     }),
     prisma.asset.createMany({
-      data: finalAssetRows
+      data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
     }),
     prisma.generation.update({
       where: { id: params.generationId },
@@ -1382,9 +2603,45 @@ async function completeGenerationWithFallbackOutput(params: {
 async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   project: GenerationProjectContext & { id: string };
   plannedGenerations: PlannedGeneration[];
+  bibleCreativeBrief?: BibleCreativeBrief | null;
+  motifBankContext?: MotifBankContext;
 }): Promise<void> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
   const referenceIndex = await loadIndex();
+  const reusableAssetsByGenerationId = new Map<string, ReusableGenerationAssets | null>();
+  const initialGenerationInput = params.plannedGenerations[0]?.input;
+  const seriesPreferenceNotes = readSeriesPreferencesDesignNotesFromInput(initialGenerationInput);
+  const motifBankContext =
+    params.motifBankContext ||
+    getMotifBankContext({
+      title: params.project.series_title,
+      subtitle: params.project.series_subtitle,
+      scripturePassages: params.project.scripture_passages,
+      description: params.project.series_description,
+      designNotes: params.project.designNotes || seriesPreferenceNotes || null
+    });
+  const bibleCreativeBrief =
+    params.bibleCreativeBrief ||
+    (await extractBibleCreativeBrief({
+      title: params.project.series_title,
+      subtitle: params.project.series_subtitle,
+      scripturePassages: params.project.scripture_passages,
+      description: params.project.series_description,
+      designNotes: params.project.designNotes || seriesPreferenceNotes || null,
+      motifBankContext
+    }));
+  const orgAllowedBrandPalette =
+    params.project.brandMode === "brand" ? parseAllowedPaletteFromOrgBrandKit(params.project.brandKit) : [];
+  const brandPaletteHardConstraintPrompt =
+    params.project.brandMode === "brand" ? buildBrandPaletteHardConstraintPrompt(orgAllowedBrandPalette) : "";
+  const brandPaletteComplianceHexes =
+    params.project.brandMode === "brand" && orgAllowedBrandPalette.length > 0
+      ? [...new Set([...orgAllowedBrandPalette, ...BRAND_NEUTRAL_HEXES])]
+      : [];
+  const organizationTypographyDirection =
+    params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
+      ? params.project.brandKit.typographyDirection
+      : null;
 
   for (const plannedGeneration of params.plannedGenerations) {
     const fallbackOutput = plannedGeneration.fallbackOutput;
@@ -1400,11 +2657,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
     try {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
-      const feedbackRequest = readFeedbackRequest(plannedGeneration.input);
+      const feedbackControls = readFeedbackGenerationControls(plannedGeneration.input);
+      const seriesPreferenceGuidance = buildSeriesPreferenceGuidance(params.project);
       const designBrief = readDesignBriefFromInput(plannedGeneration.input);
       if (!designBrief) {
         throw new Error("Generation input is missing a valid designBrief payload.");
       }
+      const runSeed = readRunSeedFromInput(plannedGeneration.input) || plannedGeneration.id;
+      const directionSpec = readDirectionSpecFromInput(plannedGeneration.input, plannedGeneration.optionIndex);
       const displayContent = buildOverlayDisplayContent({
         title: designBrief.seriesTitle || params.project.series_title,
         subtitle: designBrief.seriesSubtitle || params.project.series_subtitle,
@@ -1414,7 +2674,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         title: displayContent.title,
         subtitle: displayContent.subtitle
       };
-      const lockupRecipe = designBrief.lockupRecipe;
+      const sourceLockupRecipe = designBrief.lockupRecipe;
+      const lockupPresetId = designBrief.lockupPresetId || directionSpec?.lockupPresetId;
+      const optionStyleFamily = ((directionSpec?.templateStyleFamily ||
+        designBrief.styleFamilies[plannedGeneration.optionIndex] ||
+        designBrief.styleFamilies[0]) as StyleFamily);
       const references =
         plannedGeneration.references.length > 0
           ? plannedGeneration.references.slice(0, 3)
@@ -1426,78 +2690,219 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 n: 3
               })
             : [];
-      const referenceDataUrls = await buildReferenceDataUrls(references);
-      const styleBrief = await createStyleBrief({
-        optionIndex: plannedGeneration.optionIndex,
-        project: params.project,
+      const lockupStyleMode = resolveLockupStyleMode({
+        directionSpec,
+        styleFamily: optionStyleFamily,
+        lockupPresetId,
         references,
-        feedbackRequest,
-        palette
+        brandMode: params.project.brandMode,
+        typographyDirection: organizationTypographyDirection
       });
-      const avoidWords = buildAvoidWords(params.project);
-      const creativeBrief = buildCreativeBrief({
-        project: params.project,
-        styleBrief,
-        avoidWords
+      const plannedLockupLayout = readLockupLayoutFromInput(plannedGeneration.input);
+      const lockupLayout = plannedLockupLayout || defaultLockupLayoutForStyleMode(lockupStyleMode);
+      const lockupPrompt = buildLockupGenerationPrompt({
+        title: content.title,
+        subtitle: content.subtitle,
+        styleMode: lockupStyleMode,
+        lockupLayout,
+        directionSpec,
+        references,
+        bibleCreativeBrief,
+        wantsSeriesMark: directionSpec?.wantsSeriesMark || false,
+        brandMode: params.project.brandMode,
+        typographyDirection: organizationTypographyDirection,
+        optionalMarkAccentHexes: palette
       });
+      const lockupIntegrationMode = chooseLockupIntegrationMode(lockupStyleMode);
+      const referenceDataUrls = await buildReferenceDataUrls(references);
+      const templateBrief: TemplateBrief = {
+        title: content.title,
+        subtitle: content.subtitle,
+        scripture: designBrief.passage || params.project.scripture_passages || "",
+        keywords: designBrief.keywords || [],
+        palette,
+        lockupRecipe: sourceLockupRecipe,
+        lockupPresetId
+      };
+      const fontSeedBase = [
+        runSeed,
+        String(plannedGeneration.optionIndex),
+        lockupPresetId || "auto-preset",
+        optionStyleFamily
+      ].join("|");
       const masterDimensions = PREVIEW_DIMENSIONS[OPTION_MASTER_BACKGROUND_SHAPE];
+      let reusableAssets: ReusableGenerationAssets | null = null;
+      if (
+        feedbackControls.chosenGenerationId &&
+        (feedbackControls.regenerateBackground === false || feedbackControls.regenerateLockup === false)
+      ) {
+        if (!reusableAssetsByGenerationId.has(feedbackControls.chosenGenerationId)) {
+          reusableAssetsByGenerationId.set(
+            feedbackControls.chosenGenerationId,
+            await loadReusableAssetsFromGeneration({
+              projectId: params.project.id,
+              generationId: feedbackControls.chosenGenerationId
+            })
+          );
+        }
+        reusableAssets = reusableAssetsByGenerationId.get(feedbackControls.chosenGenerationId) || null;
+      }
+      const shouldReuseBackground =
+        feedbackControls.regenerateBackground === false && Boolean(reusableAssets?.masterBackgroundPng);
+      const shouldReuseLockup = feedbackControls.regenerateLockup === false && Boolean(reusableAssets?.lockupPng);
+      const lockupRecipeForRender = shouldReuseLockup
+        ? sourceLockupRecipe
+        : applyLockupRecipeGuardrails({
+            lockupRecipe: sourceLockupRecipe,
+            styleMode: lockupStyleMode
+          });
+
       const renderMasterAttempt = async (originalityBoost?: string) => {
-        const validatedBackground = await generateValidatedBackgroundPng({
-          project: params.project,
-          palette,
+        if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
+          const backgroundPng = await normalizePngToShape(
+            reusableAssets.masterBackgroundPng,
+            OPTION_MASTER_BACKGROUND_SHAPE,
+            resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE)
+          );
+          const hash = await computeDHashFromBuffer(backgroundPng);
+          return {
+            prompt: `reused background from generation ${reusableAssets.sourceGenerationId}`,
+            textRetryCount: 0,
+            backgroundPng,
+            closestDistance: findClosestReferenceDistance(hash, references),
+            paletteRetryCount: 0,
+            paletteComplianceScore: null as PaletteComplianceScore | null
+          };
+        }
+
+        const initialBackground = await generateValidatedBackgroundPng({
+          brief: templateBrief,
+          styleFamily: optionStyleFamily,
           shape: OPTION_MASTER_BACKGROUND_SHAPE,
-          generationId: plannedGeneration.id,
-          optionIndex: plannedGeneration.optionIndex,
-          feedbackRequest,
-          styleBrief,
-          creativeBrief,
-          avoidWords,
+          generationId: `${runSeed}|${plannedGeneration.optionIndex}`,
+          directionSpec,
+          brandMode: params.project.brandMode,
+          seriesPreferenceGuidance,
+          bibleCreativeBrief,
           referenceDataUrls,
-          originalityBoost
+          focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
+          originalityBoost,
+          brandPaletteHardConstraint: brandPaletteHardConstraintPrompt
         });
+
+        let validatedBackground = initialBackground;
+        let paletteRetryCount = 0;
+        let paletteComplianceScore: PaletteComplianceScore | null = null;
+
+        if (brandPaletteComplianceHexes.length > 0) {
+          try {
+            paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
+            if (paletteComplianceScore && !paletteComplianceScore.isCompliant) {
+              console.warn(
+                `[brand-palette-retry] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} farRatio=${(
+                  paletteComplianceScore.farSampleRatio * 100
+                ).toFixed(1)}% farSamples=${paletteComplianceScore.farSampleCount}/${paletteComplianceScore.sampleCount} avgDistance=${paletteComplianceScore.averageNearestDistance.toFixed(
+                  1
+                )}`
+              );
+              paletteRetryCount = 1;
+              validatedBackground = await generateValidatedBackgroundPng({
+                brief: templateBrief,
+                styleFamily: optionStyleFamily,
+                shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                generationId: `${runSeed}|${plannedGeneration.optionIndex}|palette-retry`,
+                directionSpec,
+                brandMode: params.project.brandMode,
+                seriesPreferenceGuidance,
+                bibleCreativeBrief,
+                referenceDataUrls,
+                focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
+                originalityBoost,
+                brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
+                paletteComplianceBoost: BRAND_PALETTE_STRICT_RETRY_BOOST
+              });
+              paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown palette compliance scoring error";
+            console.warn(
+              `[brand-palette-compliance] scoring failed for generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex}: ${message}`
+            );
+          }
+        }
+
         const backgroundPng = validatedBackground.backgroundPng;
-        const layout = computeCleanMinimalLayout({
-          width: masterDimensions.width,
-          height: masterDimensions.height,
-          content,
-          lockupRecipe
-        });
-        const textPalette = await chooseTextPaletteForBackground({
-          backgroundPng,
-          sampleRegion: layout.textRegion,
-          width: masterDimensions.width,
-          height: masterDimensions.height
-        });
-        const overlaySvg = buildCleanMinimalOverlaySvg({
-          width: masterDimensions.width,
-          height: masterDimensions.height,
-          content,
-          palette: textPalette,
-          lockupRecipe
-        });
-        const finalPng = await sharp(backgroundPng)
-          .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
-          .png()
-          .toBuffer();
-        const hash = await computeDHashFromBuffer(finalPng);
+        const hash = await computeDHashFromBuffer(backgroundPng);
         const closestDistance = findClosestReferenceDistance(hash, references);
 
         return {
           prompt: validatedBackground.prompt,
           textRetryCount: validatedBackground.textRetryCount,
           backgroundPng,
-          closestDistance
+          closestDistance,
+          paletteRetryCount,
+          paletteComplianceScore
         };
       };
 
       let masterAttempt = await renderMasterAttempt();
       let originalityRetried = false;
-      if (Number.isFinite(masterAttempt.closestDistance) && masterAttempt.closestDistance < 6) {
+      if (!shouldReuseBackground && Number.isFinite(masterAttempt.closestDistance) && masterAttempt.closestDistance < 6) {
         originalityRetried = true;
         masterAttempt = await renderMasterAttempt(
           "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
         );
       }
+      const masterLayout = computeCleanMinimalLayout({
+        width: masterDimensions.width,
+        height: masterDimensions.height,
+        content,
+        lockupRecipe: lockupRecipeForRender,
+        lockupPresetId,
+        styleFamily: optionStyleFamily,
+        fontSeed: fontSeedBase
+      });
+      const resolvedLockupPalette =
+        designBrief.resolvedLockupPalette ||
+        (await resolveLockupPaletteForBackground({
+          backgroundPng: masterAttempt.backgroundPng,
+          sampleRegion: masterLayout.textRegion,
+          width: masterDimensions.width,
+          height: masterDimensions.height
+        }));
+      const lockupPaletteForMaster = await chooseTextPaletteForBackground({
+        backgroundPng: masterAttempt.backgroundPng,
+        sampleRegion: masterLayout.textRegion,
+        width: masterDimensions.width,
+        height: masterDimensions.height,
+        resolvedPalette: resolvedLockupPalette
+      });
+      const lockupPaletteForRender = {
+        ...lockupPaletteForMaster,
+        autoScrim: false
+      };
+      const lockupRenderResult = shouldReuseLockup && reusableAssets?.lockupPng
+        ? {
+            png: reusableAssets.lockupPng,
+            width: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).width || 1)),
+            height: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).height || 1))
+          }
+        : await renderTrimmedLockupPngFromSvg(
+            buildCleanMinimalOverlaySvg({
+              width: masterDimensions.width,
+              height: masterDimensions.height,
+              content,
+              palette: lockupPaletteForRender,
+              lockupRecipe: lockupRecipeForRender,
+              lockupPresetId,
+              styleFamily: optionStyleFamily,
+              fontSeed: fontSeedBase
+            })
+          );
+      const lockupPath = await writeGenerationPreviewFiles({
+        fileName: `${plannedGeneration.id}-lockup.png`,
+        png: lockupRenderResult.png
+      });
 
       const shapeResults = await Promise.all(
         PREVIEW_SHAPES.map(async (shape) => {
@@ -1505,30 +2910,37 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const backgroundPng =
             shape === OPTION_MASTER_BACKGROUND_SHAPE
               ? masterAttempt.backgroundPng
-              : await normalizePngToShape(masterAttempt.backgroundPng, shape);
+              : await normalizePngToShape(
+                  masterAttempt.backgroundPng,
+                  shape,
+                  resolveRecipeFocalPoint(lockupRecipeForRender, shape)
+                );
           const layout = computeCleanMinimalLayout({
             width: dimensions.width,
             height: dimensions.height,
             content,
-            lockupRecipe
+            lockupRecipe: lockupRecipeForRender,
+            lockupPresetId,
+            styleFamily: optionStyleFamily,
+            fontSeed: fontSeedBase
           });
           const textPalette = await chooseTextPaletteForBackground({
             backgroundPng,
             sampleRegion: layout.textRegion,
             width: dimensions.width,
-            height: dimensions.height
+            height: dimensions.height,
+            resolvedPalette: resolvedLockupPalette
           });
-          const overlaySvg = buildCleanMinimalOverlaySvg({
+          const titleBlock = layout.blocks.find((block) => block.key === "title");
+          const finalPng = await composeLockupOnBackground({
+            backgroundPng,
+            lockupPng: lockupRenderResult.png,
+            shape,
             width: dimensions.width,
             height: dimensions.height,
-            content,
-            palette: textPalette,
-            lockupRecipe
+            align: titleBlock?.align || "left",
+            integrationMode: lockupIntegrationMode
           });
-          const finalPng = await sharp(backgroundPng)
-            .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
-            .png()
-            .toBuffer();
           const backgroundPath = await writeGenerationPreviewFiles({
             fileName: `${plannedGeneration.id}-${shape}-bg.png`,
             png: backgroundPng
@@ -1542,13 +2954,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             shape,
             backgroundPath,
             finalPath,
-            designDoc: buildCleanMinimalDesignDoc({
-              width: dimensions.width,
-              height: dimensions.height,
-              content,
-              palette: textPalette,
+            designDoc: renderTemplate(optionStyleFamily, templateBrief, plannedGeneration.optionIndex, shape, {
               backgroundImagePath: backgroundPath,
-              lockupRecipe
+              textPalette
             })
           };
         })
@@ -1556,9 +2964,24 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
       const promptUsed = [
         `master(${OPTION_MASTER_BACKGROUND_SHAPE}): ${masterAttempt.prompt}`,
+        directionSpec
+          ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily} / ${directionSpec.compositionType}]`
+          : "",
+        shouldReuseBackground && reusableAssets ? `[reuse: background from ${reusableAssets.sourceGenerationId}]` : "",
+        shouldReuseLockup && reusableAssets ? `[reuse: lockup from ${reusableAssets.sourceGenerationId}]` : "",
+        `[lockup-style-mode: ${lockupStyleMode}]`,
+        `[lockup-layout: ${lockupLayout}]`,
+        `[lockup-integration: ${lockupIntegrationMode}]`,
+        directionSpec?.wantsSeriesMark ? "[series-mark: requested]" : "[series-mark: not-requested]",
+        directionSpec?.wantsTitleStage ? "[title-stage: requested]" : "[title-stage: not-requested]",
+        directionSpec?.motifFocus && directionSpec.motifFocus.length > 0
+          ? `[motif-focus: ${directionSpec.motifFocus.join(" + ")}]`
+          : "",
+        `[lockup-prompt: ${lockupPrompt}]`,
         originalityRetried ? "[retry: originality-guard]" : "",
         masterAttempt.textRetryCount > 0 ? `[retry: no-text x${masterAttempt.textRetryCount}]` : "",
-        "derived variants: square/wide/tall reframed from one master background."
+        masterAttempt.paletteRetryCount > 0 ? `[retry: brand-palette x${masterAttempt.paletteRetryCount}]` : "",
+        "derived variants: square/wide/tall from one shared background + one shared lockup."
       ]
         .filter(Boolean)
         .join(" ");
@@ -1575,13 +2998,23 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
         projectId: params.project.id,
         generationId: plannedGeneration.id,
-        kind: "IMAGE",
+        kind: "BACKGROUND",
         slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
         file_path: byShape[shape].backgroundPath,
         mime_type: "image/png",
         width: PREVIEW_DIMENSIONS[shape].width,
         height: PREVIEW_DIMENSIONS[shape].height
       }));
+      const lockupAssetRow: Prisma.AssetCreateManyInput = {
+        projectId: params.project.id,
+        generationId: plannedGeneration.id,
+        kind: "LOCKUP",
+        slot: LOCKUP_ASSET_SLOT,
+        file_path: lockupPath,
+        mime_type: "image/png",
+        width: lockupRenderResult.width,
+        height: lockupRenderResult.height
+      };
       const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
         projectId: params.project.id,
         generationId: plannedGeneration.id,
@@ -1597,20 +3030,39 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         ...fallbackOutput,
         designDoc: designDocByShape.square,
         designDocByShape,
-        notes: "ai+clean-min-overlay",
+        notes: "ai+split-background-lockup",
         promptUsed,
         meta: {
           styleRefCount: references.length,
           usedStylePaths: references.map((reference) => reference.path || reference.thumbPath),
           designSpec: {
-            seed: plannedGeneration.id,
+            seed: `${runSeed}|${plannedGeneration.optionIndex}`,
+            runSeed,
             optionLane: optionLane(plannedGeneration.optionIndex),
             masterBackgroundShape: OPTION_MASTER_BACKGROUND_SHAPE,
             palette,
-            motifs: styleBrief.motifs,
-            layout: styleBrief.layout,
+            directionSpec,
+            templateStyleFamily: optionStyleFamily,
             styleFamilies: designBrief.styleFamilies,
-            lockupRecipe: designBrief.lockupRecipe
+            lockupPresetId,
+            lockupLayout,
+            wantsTitleStage: directionSpec?.wantsTitleStage === true,
+            wantsSeriesMark: directionSpec?.wantsSeriesMark === true,
+            motifFocus: directionSpec?.motifFocus || [],
+            bookKeys: motifBankContext.bookKeys,
+            bookNames: motifBankContext.bookNames,
+            topicKeys: motifBankContext.topicKeys,
+            topicNames: motifBankContext.topicNames,
+            lockupRecipe: lockupRecipeForRender,
+            lockupStyleMode,
+            lockupIntegrationMode,
+            lockupPrompt,
+            resolvedLockupPalette,
+            lockupAssetPath: lockupPath,
+            paletteComplianceScore: masterAttempt.paletteComplianceScore,
+            reusedBackgroundFromGenerationId:
+              shouldReuseBackground && reusableAssets ? reusableAssets.sourceGenerationId : null,
+            reusedLockupFromGenerationId: shouldReuseLockup && reusableAssets ? reusableAssets.sourceGenerationId : null
           }
         },
         preview: {
@@ -1630,7 +3082,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         }),
         prisma.asset.createMany({
-          data: [...backgroundAssetRows, ...finalAssetRows]
+          data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
         }),
         prisma.generation.update({
           where: {
@@ -1638,7 +3090,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           },
           data: {
             status: "COMPLETED",
-            output: completedOutput as Prisma.InputJsonValue
+            output: completedOutput as Prisma.InputJsonValue,
+            input: withResolvedLockupPaletteInput(
+              plannedGeneration.input,
+              {
+                ...designBrief,
+                lockupRecipe: lockupRecipeForRender
+              },
+              resolvedLockupPalette
+            )
           }
         })
       ]);
@@ -1667,7 +3127,11 @@ export async function createProjectAction(
     series_title: formData.get("series_title"),
     series_subtitle: formData.get("series_subtitle") || undefined,
     scripture_passages: formData.get("scripture_passages") || undefined,
-    series_description: formData.get("series_description") || undefined
+    series_description: formData.get("series_description") || undefined,
+    brandMode: formData.get("brandMode") || undefined,
+    preferredAccentColors: formData.get("preferredAccentColors") || undefined,
+    avoidColors: formData.get("avoidColors") || undefined,
+    designNotes: formData.get("designNotes") || undefined
   });
 
   if (!parsed.success) {
@@ -1681,11 +3145,15 @@ export async function createProjectAction(
       series_title: parsed.data.series_title,
       series_subtitle: parsed.data.series_subtitle || null,
       scripture_passages: parsed.data.scripture_passages || null,
-      series_description: parsed.data.series_description || null
+      series_description: parsed.data.series_description || null,
+      brandMode: parsed.data.brandMode,
+      preferredAccentColors: parsed.data.preferredAccentColors || null,
+      avoidColors: parsed.data.avoidColors || null,
+      designNotes: parsed.data.designNotes || null
     }
   });
 
-  redirect(`/app/projects/${project.id}/brand`);
+  redirect(`/app/projects/${project.id}`);
 }
 
 export async function deleteProjectAction(projectId: string): Promise<void> {
@@ -1829,34 +3297,83 @@ export async function generateRoundOneAction(
     return { error: "Project not found." };
   }
 
-  if (!project.brandKit) {
-    return { error: "Set up the brand kit before generating directions." };
-  }
+  const brandKit = project.brandKit;
 
   const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
-  const enabledPresetKeySet = new Set(enabledPresets.map((preset) => preset.key));
   const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
-  const selectedPresetKeys = ensureThree(
-    filterToEnabledPresets(pickInitialPresetKeys(), enabledPresetKeySet),
-    enabledPresetKeySet,
-    [...enabledPresets.map((preset) => preset.key), ...pickInitialPresetKeys()]
-  );
-  if (selectedPresetKeys.length < ROUND_OPTION_COUNT) {
+  const runSeed = randomUUID();
+  const seriesMarkRequested = shouldRequestSeriesMarkFromNotes([project.designNotes]);
+  const motifBankContext = getMotifBankContext({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes
+  });
+  const recentMotifs = await loadRecentProjectMotifs(project.id);
+  const bibleCreativeBrief = await extractBibleCreativeBrief({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes,
+    motifBankContext
+  });
+  const directionPlan = planDirectionSet({
+    runSeed,
+    enabledPresetKeys: enabledPresets.map((preset) => preset.key),
+    optionCount: ROUND_OPTION_COUNT,
+    seriesMarkRequested,
+    motifs: bibleCreativeBrief.motifs,
+    allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
+    markIdeas: bibleCreativeBrief.markIdeas,
+    recentMotifs
+  });
+  const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
+  const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
+  const plannedStyleFamilies = directionPlan.map((spec) => spec.templateStyleFamily) as [StyleFamily, StyleFamily, StyleFamily];
+
+  if (selectedPresetKeys.length < ROUND_OPTION_COUNT || lockupPresetIds.length < ROUND_OPTION_COUNT) {
     return { error: "At least three presets are required to generate options." };
   }
 
   const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT);
-  const input = buildGenerationInput(project, project.brandKit, selectedPresetKeys);
-  const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
-  if (!validatedDesignBrief.ok) {
-    return {
-      error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
-    };
+  const lockupLayoutsForOptions = resolvePlannedLockupLayouts({
+    seed: `${runSeed}:round-1`,
+    directionPlan,
+    styleFamilies: plannedStyleFamilies,
+    lockupPresetIds,
+    referencesByOption: refsForOptions,
+    brandMode: project.brandMode,
+    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
+  });
+  const inputsByOption = selectedPresetKeys.map((_, index) =>
+    buildGenerationInput(
+      project,
+      brandKit,
+      selectedPresetKeys,
+      undefined,
+      lockupPresetIds[index],
+      runSeed,
+      plannedStyleFamilies,
+      runSeed,
+      directionPlan,
+      lockupLayoutsForOptions[index]
+    )
+  );
+  for (const input of inputsByOption) {
+    const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
+    if (!validatedDesignBrief.ok) {
+      return {
+        error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
+      };
+    }
   }
 
   const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
     const generationId = randomUUID();
     const references = refsForOptions[index] || [];
+    const input = inputsByOption[index];
 
     return {
       id: generationId,
@@ -1873,7 +3390,8 @@ export async function generateRoundOneAction(
         input,
         round: 1,
         optionIndex: index,
-        referenceItems: references
+        referenceItems: references,
+        motifBankContext
       })
     };
   });
@@ -1895,7 +3413,9 @@ export async function generateRoundOneAction(
 
   await createOpenAiPreviewAssetsForPlannedGenerations({
     project,
-    plannedGenerations
+    plannedGenerations,
+    bibleCreativeBrief,
+    motifBankContext
   });
 
   redirect(`/app/projects/${projectId}/generations`);
@@ -1913,9 +3433,7 @@ export async function generateRoundTwoAction(
     return { error: "Project not found." };
   }
 
-  if (!project.brandKit) {
-    return { error: "Set up the brand kit before generating directions." };
-  }
+  const brandKit = project.brandKit;
 
   const parsed = generateRoundTwoSchema.safeParse({
     currentRound: formData.get("currentRound"),
@@ -1924,6 +3442,9 @@ export async function generateRoundTwoAction(
     emphasis: formData.get("emphasis"),
     expressiveness: formData.get("expressiveness"),
     temperature: formData.get("temperature"),
+    regenerateLockup: parseOptionalBooleanFormValue(formData.get("regenerateLockup")),
+    explicitNewTitleStyle: parseOptionalBooleanFormValue(formData.get("explicitNewTitleStyle")),
+    regenerateBackground: parseOptionalBooleanFormValue(formData.get("regenerateBackground")),
     styleDirection: formData.get("styleDirection")
   });
 
@@ -1952,23 +3473,74 @@ export async function generateRoundTwoAction(
 
   const styleDirection = normalizeStyleDirection(parsed.data.styleDirection);
   const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
-  const enabledPresetKeySet = new Set(enabledPresets.map((preset) => preset.key));
   const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
-  const selectedPresetKeys = ensureThree(
-    filterToEnabledPresets(pickPresetKeysForStyle(styleDirection), enabledPresetKeySet),
-    enabledPresetKeySet,
-    [...enabledPresets.map((preset) => preset.key), ...pickPresetKeysForStyle(styleDirection), ...pickInitialPresetKeys()]
-  );
-  if (selectedPresetKeys.length < ROUND_OPTION_COUNT) {
+  const round = parsed.data.currentRound + 1;
+  const runSeed = randomUUID();
+  const chosenInputSeriesNotes = chosenGeneration ? readSeriesPreferencesDesignNotesFromInput(chosenGeneration.input) : null;
+  const seriesMarkRequested = shouldRequestSeriesMarkFromNotes([project.designNotes, chosenInputSeriesNotes]);
+  const motifBankContext = getMotifBankContext({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes || chosenInputSeriesNotes || null
+  });
+  const recentMotifs = await loadRecentProjectMotifs(project.id);
+  const bibleCreativeBrief = await extractBibleCreativeBrief({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes || chosenInputSeriesNotes || null,
+    motifBankContext
+  });
+  const directionPlan = planDirectionSet({
+    runSeed,
+    enabledPresetKeys: enabledPresets.map((preset) => preset.key),
+    optionCount: ROUND_OPTION_COUNT,
+    preferredFamilies: preferredDirectionFamiliesForStyleDirection(styleDirection),
+    seriesMarkRequested,
+    motifs: bibleCreativeBrief.motifs,
+    allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
+    markIdeas: bibleCreativeBrief.markIdeas,
+    recentMotifs
+  });
+  const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
+  const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
+  const plannedStyleFamilies = directionPlan.map((spec) => spec.templateStyleFamily) as [StyleFamily, StyleFamily, StyleFamily];
+
+  if (selectedPresetKeys.length < ROUND_OPTION_COUNT || lockupPresetIds.length < ROUND_OPTION_COUNT) {
     return { error: "At least three presets are required to generate options." };
   }
 
-  const input = {
+  const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT);
+  const chosenLockupLayout = chosenGeneration ? readLockupLayoutFromGenerationPayload(chosenGeneration.input, chosenGeneration.output) : null;
+  const shouldRequestNewLockupLayout =
+    parsed.data.regenerateLockup === true && parsed.data.explicitNewTitleStyle === true;
+  const lockupLayoutsForOptions = resolvePlannedLockupLayouts({
+    seed: `${runSeed}:round-${round}`,
+    directionPlan,
+    styleFamilies: plannedStyleFamilies,
+    lockupPresetIds,
+    referencesByOption: refsForOptions,
+    keepLayout: chosenLockupLayout,
+    forceNewLayout: shouldRequestNewLockupLayout,
+    brandMode: project.brandMode,
+    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
+  });
+
+  const inputsByOption = selectedPresetKeys.map((_, index) => ({
     ...buildGenerationInput(
       project,
-      project.brandKit,
+      brandKit,
       selectedPresetKeys,
-      chosenGeneration ? readLockupRecipeFromInput(chosenGeneration.input) : undefined
+      undefined,
+      lockupPresetIds[index],
+      runSeed,
+      plannedStyleFamilies,
+      runSeed,
+      directionPlan,
+      lockupLayoutsForOptions[index]
     ),
     feedback: {
       sourceRound: parsed.data.currentRound,
@@ -1977,22 +3549,25 @@ export async function generateRoundTwoAction(
       emphasis: parsed.data.emphasis,
       expressiveness: parsed.data.expressiveness,
       temperature: parsed.data.temperature,
+      regenerateLockup: parsed.data.regenerateLockup,
+      explicitNewTitleStyle: parsed.data.explicitNewTitleStyle,
+      regenerateBackground: parsed.data.regenerateBackground,
       styleDirection
     }
-  };
-  const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
-  if (!validatedDesignBrief.ok) {
-    return {
-      error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
-    };
+  }));
+  for (const input of inputsByOption) {
+    const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
+    if (!validatedDesignBrief.ok) {
+      return {
+        error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
+      };
+    }
   }
-
-  const round = parsed.data.currentRound + 1;
-  const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT);
 
   const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
     const generationId = randomUUID();
     const references = refsForOptions[index] || [];
+    const input = inputsByOption[index];
 
     return {
       id: generationId,
@@ -2009,7 +3584,8 @@ export async function generateRoundTwoAction(
         input,
         round,
         optionIndex: index,
-        referenceItems: references
+        referenceItems: references,
+        motifBankContext
       })
     };
   });
@@ -2031,7 +3607,9 @@ export async function generateRoundTwoAction(
 
   await createOpenAiPreviewAssetsForPlannedGenerations({
     project,
-    plannedGenerations
+    plannedGenerations,
+    bibleCreativeBrief,
+    motifBankContext
   });
 
   redirect(`/app/projects/${projectId}/generations`);
@@ -2058,6 +3636,8 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
       series_description: true,
       brandKit: {
         select: {
+          websiteUrl: true,
+          typographyDirection: true,
           logoPath: true,
           paletteJson: true
         }
@@ -2068,6 +3648,12 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
   if (!project) {
     return;
   }
+
+  const effectiveBrandKit = await resolveEffectiveBrandKit({
+    organizationId: session.organizationId,
+    projectId: project.id,
+    projectBrandKit: project.brandKit
+  });
 
   const generation = await prisma.generation.findFirst({
     where: {
@@ -2087,7 +3673,7 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
   }
 
   const optionIndex = Math.max(0, normalizedOptionKey.charCodeAt(0) - 65);
-  const palette = project.brandKit ? parsePaletteJson(project.brandKit.paletteJson) : [];
+  const palette = effectiveBrandKit ? parsePaletteJson(effectiveBrandKit.paletteJson) : [];
   const designDoc = buildFinalDesignDoc({
     output: generation.output,
     input: generation.input,
@@ -2098,7 +3684,7 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
       seriesSubtitle: project.series_subtitle,
       scripturePassages: project.scripture_passages,
       seriesDescription: project.series_description,
-      logoPath: project.brandKit?.logoPath || null,
+      logoPath: effectiveBrandKit?.logoPath || null,
       palette
     }
   });
