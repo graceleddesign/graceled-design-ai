@@ -107,7 +107,7 @@ export const generateTypeSwissGridV1: PresetGenerator = (context) => {
       y: margins.top + rowHeight * 8,
       w: titleW,
       h: rowHeight * 2.8,
-      text: `${context.subtitle}\n${context.scripture || context.optionLabel}`,
+      text: `${context.subtitle}${context.scripture ? `\n${context.scripture}` : ""}`,
       color: mixHex(ink, accent, 0.32),
       fontFamily: "Arial",
       fontWeight: 600,

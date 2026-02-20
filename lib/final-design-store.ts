@@ -11,6 +11,7 @@ export async function findFinalDesignForOrganization(projectId: string, organiza
     },
     select: {
       id: true,
+      generationId: true,
       optionLabel: true,
       designJson: true
     }
@@ -38,7 +39,7 @@ export function readStoredDesignDoc(input: unknown, optionLabel: string): Design
         h: 200,
         text: optionLabel,
         fontSize: 88,
-        fontFamily: "Arial",
+        fontFamily: "Inter",
         fontWeight: 700,
         color: "#0F172A",
         align: "left"
@@ -51,7 +52,7 @@ export function readStoredDesignDoc(input: unknown, optionLabel: string): Design
         h: 220,
         text: "Stored design data could not be parsed. Re-approve a final option to regenerate exports.",
         fontSize: 36,
-        fontFamily: "Arial",
+        fontFamily: "Inter",
         fontWeight: 400,
         color: "#334155",
         align: "left"

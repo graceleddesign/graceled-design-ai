@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
-import { getFontAssetsByFamily, toPublicFontPath, type FontAsset } from "@/src/design/fonts/font-assets";
+import { execFileSync } from "child_process";
+import { getFontAssetSource, getFontAssetsByFamily, toPublicFontPath, type FontAsset } from "@/src/design/fonts/font-assets";
 
 export const CURATED_FONT_FAMILIES = [
   "Abril Fatface",
@@ -188,6 +189,7 @@ const ALIAS_TO_FAMILY = new Map<string, CuratedFontFamily>(
 const fontFileIndexCache = new Map<CuratedFontFamily, FontFileIndex>();
 const localFileIndexCache = new Map<string, LocalFontFileIndex>();
 const dataUriCache = new Map<string, string>();
+const warnedMissingGoogleFamilies = new Set<string>();
 
 function escapeCssString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -275,6 +277,63 @@ function getPublicFilePathFromUrl(urlPath: string): string | null {
     return null;
   }
   return absolutePath;
+}
+
+function shouldAutoFetchGoogleFonts(): boolean {
+  return process.env.GOOGLE_FONTS_AUTO_FETCH === "1";
+}
+
+function warnMissingGoogleFamily(family: string): void {
+  const key = family.trim().toLowerCase();
+  if (!key || warnedMissingGoogleFamilies.has(key)) {
+    return;
+  }
+  warnedMissingGoogleFamilies.add(key);
+  console.warn(
+    `[font-registry] Missing local Google font files for "${family}". Falling back to embedded curated fonts. Run "npm run fonts:sync" or set GOOGLE_FONTS_AUTO_FETCH=1.`
+  );
+}
+
+function isGoogleFamilyConfigured(family: string): boolean {
+  return getFontAssetsByFamily(family).some((asset) => getFontAssetSource(asset) === "google");
+}
+
+function autoFetchGoogleFamily(request: { family: string; weights: number[]; ital: boolean }): boolean {
+  if (!shouldAutoFetchGoogleFonts()) {
+    return false;
+  }
+
+  const scriptPath = path.join(process.cwd(), "scripts", "fetch-fonts-google.ts");
+  if (!fs.existsSync(scriptPath)) {
+    console.warn(`[font-registry] GOOGLE_FONTS_AUTO_FETCH=1 but ${scriptPath} was not found.`);
+    return false;
+  }
+
+  const weights = [...new Set(request.weights)]
+    .filter((weight) => Number.isFinite(weight))
+    .sort((left, right) => left - right);
+
+  if (weights.length === 0) {
+    return false;
+  }
+
+  const args = ["--import", "tsx", scriptPath, "add", "--family", request.family, "--weights", weights.join(",")];
+  if (request.ital) {
+    args.push("--ital");
+  }
+
+  try {
+    execFileSync(process.execPath, args, {
+      cwd: process.cwd(),
+      stdio: "pipe",
+      timeout: 20_000
+    });
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[font-registry] Failed to auto-fetch Google font "${request.family}": ${message}`);
+    return false;
+  }
 }
 
 function listLocalFontFiles(family: string): LocalFontFileIndex {
@@ -374,7 +433,8 @@ function addRequestedWeight(
 }
 
 function buildLocalAssetFontFaceCss(
-  requestsByFamily: Map<string, Map<"normal" | "italic", Set<number>>>
+  requestsByFamily: Map<string, Map<"normal" | "italic", Set<number>>>,
+  allowAutoFetch = true
 ): { css: string; unresolvedRequests: RequestedFontFace[] } {
   const rules = new Set<string>();
   const unresolvedRequests: RequestedFontFace[] = [];
@@ -439,6 +499,50 @@ function buildLocalAssetFontFaceCss(
         rules.add(
           `@font-face{font-family:${fontFamilyCssValue(asset.family)};font-style:${style};font-weight:${asset.weight};font-display:block;src:url(${dataUri}) format('woff2');}`
         );
+      }
+    }
+  }
+
+  if (allowAutoFetch && unresolvedRequests.length > 0) {
+    const pendingGoogleRequests = new Map<string, { family: string; weights: Set<number>; ital: boolean }>();
+    for (const unresolved of unresolvedRequests) {
+      if (!isGoogleFamilyConfigured(unresolved.family)) {
+        continue;
+      }
+      const key = unresolved.family.trim().toLowerCase();
+      const existing = pendingGoogleRequests.get(key) || {
+        family: unresolved.family,
+        weights: new Set<number>(),
+        ital: false
+      };
+      existing.weights.add(normalizeWeight(unresolved.weight));
+      if (unresolved.style === "italic") {
+        existing.ital = true;
+      }
+      pendingGoogleRequests.set(key, existing);
+    }
+
+    if (pendingGoogleRequests.size > 0) {
+      if (shouldAutoFetchGoogleFonts()) {
+        let fetchedAny = false;
+        for (const request of pendingGoogleRequests.values()) {
+          const didFetch = autoFetchGoogleFamily({
+            family: request.family,
+            weights: [...request.weights],
+            ital: request.ital
+          });
+          fetchedAny = fetchedAny || didFetch;
+        }
+
+        if (fetchedAny) {
+          localFileIndexCache.clear();
+          dataUriCache.clear();
+          return buildLocalAssetFontFaceCss(requestsByFamily, false);
+        }
+      } else {
+        for (const request of pendingGoogleRequests.values()) {
+          warnMissingGoogleFamily(request.family);
+        }
       }
     }
   }

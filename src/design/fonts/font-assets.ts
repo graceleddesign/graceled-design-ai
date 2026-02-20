@@ -1,3 +1,7 @@
+import googleFontAssetsManifest from "./font-assets.google.json";
+
+export type FontAssetSource = "local" | "google";
+
 export type FontAsset = {
   id: string;
   family: string;
@@ -6,9 +10,30 @@ export type FontAsset = {
   file: string;
   displayName: string;
   tags: string[];
+  source?: FontAssetSource;
 };
 
-export const FONT_ASSETS = [
+export type UpsertFontAssetVariant = {
+  weight: number;
+  style: "normal" | "italic";
+  file: string;
+  id?: string;
+  displayName?: string;
+  tags?: string[];
+};
+
+export type UpsertFontFamilyVariantsParams = {
+  existingAssets: readonly FontAsset[];
+  idSourceAssets?: readonly FontAsset[];
+  family: string;
+  source?: FontAssetSource;
+  familyTags?: string[];
+  variants: readonly UpsertFontAssetVariant[];
+};
+
+export const GOOGLE_FONT_ASSET_MANIFEST_RELATIVE_PATH = "src/design/fonts/font-assets.google.json";
+
+export const LOCAL_FONT_ASSETS = [
   {
     id: "PlayfairDisplay-Regular",
     family: "Playfair Display",
@@ -236,6 +261,175 @@ export const FONT_ASSETS = [
   }
 ] satisfies FontAsset[];
 
+function toVariantKey(family: string, weight: number, style: "normal" | "italic"): string {
+  return `${family.trim().toLowerCase()}::${Math.round(weight)}::${style}`;
+}
+
+function normalizeTags(tags: readonly string[]): string[] {
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const tag of tags) {
+    const clean = tag.trim();
+    const key = clean.toLowerCase();
+    if (!clean || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(clean);
+  }
+  return unique;
+}
+
+function toSafeWeight(weight: number): number {
+  if (!Number.isFinite(weight)) {
+    return 400;
+  }
+  return Math.max(100, Math.min(900, Math.round(weight / 100) * 100));
+}
+
+function sanitizeStyle(style: string): "normal" | "italic" {
+  return style === "italic" ? "italic" : "normal";
+}
+
+export function slugifyFontFamily(family: string): string {
+  return family
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "font";
+}
+
+function idStemFromFamily(family: string): string {
+  return family
+    .trim()
+    .replace(/[^a-z0-9]+/gi, " ")
+    .trim()
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join("") || "Font";
+}
+
+export function buildGoogleFontAssetId(family: string, weight: number, style: "normal" | "italic"): string {
+  return `${idStemFromFamily(family)}-w${toSafeWeight(weight)}-${style}`;
+}
+
+export function buildGoogleFontDisplayName(family: string, weight: number, style: "normal" | "italic"): string {
+  const safeWeight = toSafeWeight(weight);
+  if (style === "italic") {
+    return `${family} ${safeWeight} Italic`;
+  }
+  if (safeWeight === 400) {
+    return `${family} Regular`;
+  }
+  return `${family} ${safeWeight}`;
+}
+
+export function inferFontTagsFromFamilyName(family: string): string[] {
+  const normalized = family.trim().toLowerCase();
+  const sansHints = [
+    "sans",
+    "grotesk",
+    "inter",
+    "manrope",
+    "sora",
+    "oswald",
+    "archivo",
+    "plex",
+    "assistant",
+    "public",
+    "noto",
+    "work",
+    "bebas",
+    "space"
+  ];
+  const slabHints = ["slab", "arvo"];
+
+  if (sansHints.some((hint) => normalized.includes(hint))) {
+    return ["google", "sans", "text"];
+  }
+  if (slabHints.some((hint) => normalized.includes(hint))) {
+    return ["google", "slab", "serif"];
+  }
+  return ["google", "serif", "display"];
+}
+
+export function getFontAssetSource(asset: FontAsset): FontAssetSource {
+  return asset.source === "google" ? "google" : "local";
+}
+
+function sanitizeManifestAssets(raw: unknown): FontAsset[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const assets: FontAsset[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Partial<FontAsset>;
+    if (typeof record.id !== "string" || typeof record.family !== "string" || typeof record.file !== "string") {
+      continue;
+    }
+
+    assets.push({
+      id: record.id,
+      family: record.family,
+      style: sanitizeStyle(String(record.style || "normal")),
+      weight: toSafeWeight(Number(record.weight || 400)),
+      file: record.file,
+      displayName: typeof record.displayName === "string" && record.displayName.trim() ? record.displayName : record.id,
+      tags: normalizeTags(Array.isArray(record.tags) ? record.tags.filter((tag): tag is string => typeof tag === "string") : []),
+      source: record.source === "google" ? "google" : "local"
+    });
+  }
+  return assets;
+}
+
+export function mergeFontAssets(localAssets: readonly FontAsset[], googleAssets: readonly FontAsset[]): FontAsset[] {
+  const localByKey = new Map<string, FontAsset>();
+  const localKeys: string[] = [];
+
+  for (const asset of localAssets) {
+    const normalized: FontAsset = {
+      ...asset,
+      style: sanitizeStyle(asset.style),
+      weight: toSafeWeight(asset.weight),
+      tags: normalizeTags(asset.tags),
+      source: getFontAssetSource(asset)
+    };
+    const key = toVariantKey(normalized.family, normalized.weight, normalized.style);
+    localByKey.set(key, normalized);
+    localKeys.push(key);
+  }
+
+  for (const asset of googleAssets) {
+    const normalized: FontAsset = {
+      ...asset,
+      style: sanitizeStyle(asset.style),
+      weight: toSafeWeight(asset.weight),
+      tags: normalizeTags(asset.tags),
+      source: "google"
+    };
+    const key = toVariantKey(normalized.family, normalized.weight, normalized.style);
+    localByKey.set(key, normalized);
+    if (!localKeys.includes(key)) {
+      localKeys.push(key);
+    }
+  }
+
+  return localKeys
+    .map((key) => localByKey.get(key))
+    .filter((asset): asset is FontAsset => Boolean(asset));
+}
+
+export const GOOGLE_FONT_ASSETS = sanitizeManifestAssets(googleFontAssetsManifest).map((asset) => ({
+  ...asset,
+  source: "google" as const
+}));
+
+export const FONT_ASSETS = mergeFontAssets(LOCAL_FONT_ASSETS, GOOGLE_FONT_ASSETS);
+
 export type FontAssetId = (typeof FONT_ASSETS)[number]["id"];
 
 const FONT_ASSET_BY_ID = new Map<string, FontAsset>(FONT_ASSETS.map((asset) => [asset.id, asset]));
@@ -282,6 +476,72 @@ export function hasFontAssetId(id: string): id is FontAssetId {
 
 export function getFontAssetsByFamily(family: string): readonly FontAsset[] {
   return FONT_ASSETS_BY_FAMILY.get(family.trim().toLowerCase()) || [];
+}
+
+export function upsertFontFamilyVariants(params: UpsertFontFamilyVariantsParams): FontAsset[] {
+  const family = params.family.trim();
+  if (!family) {
+    return [...params.existingAssets];
+  }
+
+  const source = params.source || "google";
+  const output = [...params.existingAssets];
+  const byKey = new Map<string, number>();
+  const existingByKey = new Map<string, FontAsset>();
+
+  for (const asset of params.idSourceAssets || []) {
+    existingByKey.set(toVariantKey(asset.family, asset.weight, sanitizeStyle(asset.style)), asset);
+  }
+  for (const [index, asset] of output.entries()) {
+    const key = toVariantKey(asset.family, asset.weight, sanitizeStyle(asset.style));
+    byKey.set(key, index);
+    if (!existingByKey.has(key)) {
+      existingByKey.set(key, asset);
+    }
+  }
+
+  for (const variant of params.variants) {
+    const weight = toSafeWeight(variant.weight);
+    const style = sanitizeStyle(variant.style);
+    const key = toVariantKey(family, weight, style);
+    const matched = existingByKey.get(key);
+    const tags = normalizeTags(
+      variant.tags || matched?.tags || params.familyTags || inferFontTagsFromFamilyName(family)
+    );
+
+    const next: FontAsset = {
+      id: variant.id || matched?.id || buildGoogleFontAssetId(family, weight, style),
+      family,
+      style,
+      weight,
+      file: variant.file,
+      displayName: variant.displayName || matched?.displayName || buildGoogleFontDisplayName(family, weight, style),
+      tags,
+      source
+    };
+
+    const existingIndex = byKey.get(key);
+    if (typeof existingIndex === "number") {
+      output[existingIndex] = next;
+    } else {
+      output.push(next);
+      byKey.set(key, output.length - 1);
+    }
+  }
+
+  return [...output].sort((left, right) => {
+    const familyCompare = left.family.localeCompare(right.family);
+    if (familyCompare !== 0) {
+      return familyCompare;
+    }
+    if (left.weight !== right.weight) {
+      return left.weight - right.weight;
+    }
+    if (left.style !== right.style) {
+      return left.style === "normal" ? -1 : 1;
+    }
+    return left.id.localeCompare(right.id);
+  });
 }
 
 export function getFontFaceCSS(assets: readonly FontAsset[] = FONT_ASSETS): string {

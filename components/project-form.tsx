@@ -10,9 +10,9 @@ export function ProjectForm() {
 
   return (
     <form action={action} className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Step 1 of 2</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Project setup</p>
       <h1 className="text-xl font-semibold">New Project</h1>
-      <p className="text-sm text-slate-600">Start with your core series information, then continue to your brand kit.</p>
+      <p className="text-sm text-slate-600">Add your series details and pick your design approach.</p>
 
       <div className="space-y-2">
         <label htmlFor="series_title" className="text-sm font-medium text-slate-700">
@@ -64,6 +64,61 @@ export function ProjectForm() {
         />
       </div>
 
+      <div className="space-y-2">
+        <label htmlFor="brandMode" className="text-sm font-medium text-slate-700">
+          Design approach
+        </label>
+        <select id="brandMode" name="brandMode" defaultValue="fresh" className="w-full rounded-md border border-slate-300 px-3 py-2">
+          <option value="fresh">Fresh series look (recommended)</option>
+          <option value="brand">Brand-aligned (use Church Brand Kit)</option>
+        </select>
+        <p className="text-xs text-slate-500">You can create series that match your church brand—or explore a fresh look.</p>
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4">
+        <h2 className="text-sm font-semibold text-slate-700">Series Preferences (optional)</h2>
+
+        <div className="space-y-2">
+          <label htmlFor="preferredAccentColors" className="text-sm font-medium text-slate-700">
+            Preferred Accent Colors
+          </label>
+          <input
+            id="preferredAccentColors"
+            name="preferredAccentColors"
+            className="w-full rounded-md border border-slate-300 px-3 py-2"
+            placeholder="#14532D, #C2410C, navy"
+          />
+          <p className="text-xs text-slate-500">Hex codes and/or names, comma-separated.</p>
+        </div>
+
+        <div className="space-y-2">
+          <label htmlFor="avoidColors" className="text-sm font-medium text-slate-700">
+            Avoid Colors
+          </label>
+          <input
+            id="avoidColors"
+            name="avoidColors"
+            className="w-full rounded-md border border-slate-300 px-3 py-2"
+            placeholder="neon green, hot pink"
+          />
+          <p className="text-xs text-slate-500">Comma-separated.</p>
+        </div>
+
+        <div className="space-y-2">
+          <label htmlFor="designNotes" className="text-sm font-medium text-slate-700">
+            Design Notes
+          </label>
+          <textarea
+            id="designNotes"
+            name="designNotes"
+            rows={2}
+            className="w-full rounded-md border border-slate-300 px-3 py-2"
+            placeholder="Keep the tone warm and hopeful. Avoid harsh contrast."
+          />
+          <p className="text-xs text-slate-500">1-2 sentences.</p>
+        </div>
+      </div>
+
       {state.error ? <p className="text-sm text-red-700">{state.error}</p> : null}
 
       <button
@@ -71,7 +126,7 @@ export function ProjectForm() {
         disabled={pending}
         className="rounded-md bg-pine px-4 py-2 font-medium text-white disabled:opacity-60"
       >
-        {pending ? "Creating project..." : "Continue to Brand Kit"}
+        {pending ? "Creating project..." : "Create Project"}
       </button>
     </form>
   );

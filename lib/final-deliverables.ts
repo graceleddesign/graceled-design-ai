@@ -4,6 +4,7 @@ import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
 import sharp from "sharp";
 import type { DesignDoc } from "@/lib/design-doc";
+import { buildEmbeddedFontFaceCss } from "@/lib/lockups/font-registry";
 
 const PX_PER_INCH = 96;
 
@@ -56,6 +57,10 @@ function escapeXml(input: string): string {
     .replace(/>/g, "&gt;")
     .replace(/\"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+function escapeXmlText(input: string): string {
+  return input.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function layerRotationTransform(layer: { x: number; y: number; w: number; h: number; rotation?: number }): string {
@@ -339,13 +344,28 @@ export async function buildFinalSvg(designDoc: DesignDoc, options: BuildFinalSvg
       layer.type === "shape" &&
       (usesPaintReference(layer.fill, "scrimTall") || usesPaintReference(layer.stroke, "scrimTall"))
   );
+  const fontFaceCss = buildEmbeddedFontFaceCss(
+    designDoc.layers.flatMap((layer) =>
+      !isGuideLayer(layer) && layer.type === "text"
+        ? [
+            {
+              family: layer.fontFamily,
+              weight: layer.fontWeight
+            }
+          ]
+        : []
+    )
+  );
 
   svgParts.push('<?xml version="1.0" encoding="UTF-8"?>');
   svgParts.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${designDoc.width}" height="${designDoc.height}" viewBox="0 0 ${designDoc.width} ${designDoc.height}">`
   );
-  if (hasScrim || hasScrimTall) {
+  if (hasScrim || hasScrimTall || fontFaceCss) {
     svgParts.push("<defs>");
+    if (fontFaceCss) {
+      svgParts.push(`<style type="text/css">${escapeXmlText(fontFaceCss)}</style>`);
+    }
     if (hasScrim) {
       svgParts.push('<linearGradient id="scrim" x1="0" y1="0" x2="1" y2="0">');
       svgParts.push('<stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.18" />');
@@ -413,9 +433,13 @@ export async function buildFinalSvg(designDoc: DesignDoc, options: BuildFinalSvg
       typeof layer.letterSpacing === "number" && Number.isFinite(layer.letterSpacing)
         ? ` letter-spacing="${layer.letterSpacing}"`
         : "";
+    const fillOpacity =
+      typeof layer.opacity === "number" && Number.isFinite(layer.opacity) && layer.opacity >= 0 && layer.opacity <= 1
+        ? ` fill-opacity="${layer.opacity.toFixed(3)}"`
+        : "";
 
     svgParts.push(
-      `<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Arial")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}"${letterSpacing}${layerRotationTransform(layer)}>`
+      `<text x="${x}" y="${firstBaseline}" fill="${escapeXml(layer.color)}" font-family="${escapeXml(layer.fontFamily || "Inter")}" font-size="${layer.fontSize}" font-weight="${layer.fontWeight}" text-anchor="${anchor}"${letterSpacing}${fillOpacity}${layerRotationTransform(layer)}>`
     );
 
     for (const [lineIndex, line] of lines.entries()) {

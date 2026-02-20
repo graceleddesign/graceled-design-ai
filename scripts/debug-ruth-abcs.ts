@@ -1,12 +1,15 @@
-import { mkdir, writeFile } from "fs/promises";
+import { randomUUID } from "crypto";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import OpenAI from "openai";
 import sharp from "sharp";
+import { getDirectionTemplateCatalog, planDirectionSet, type PlannedDirectionSpec } from "../lib/direction-planner";
 import { buildOverlayDisplayContent } from "../lib/overlay-lines";
 import {
   buildCleanMinimalOverlaySvg,
   chooseTextPaletteForBackground,
-  computeCleanMinimalLayout
+  computeCleanMinimalLayout,
+  resolveLockupPaletteForBackground
 } from "../lib/templates/type-clean-min";
 
 type PreviewShape = "square" | "wide" | "tall";
@@ -171,16 +174,6 @@ async function hasReadableText(client: OpenAI, image: Buffer): Promise<boolean> 
   }
 }
 
-function lanePrompt(optionIndex: number): string {
-  if (optionIndex === 0) {
-    return "Minimal/clean lane with Swiss-grid restraint and gentle texture.";
-  }
-  if (optionIndex === 1) {
-    return "Illustrative/line-art lane with subtle engraved motifs and generous negative space.";
-  }
-  return "Photo-based lane with cinematic atmosphere and soft tactile depth.";
-}
-
 function shapePrompt(shape: PreviewShape): string {
   if (shape === "wide") {
     return "Keep the upper-left and left-center zones clear for text overlay.";
@@ -191,21 +184,38 @@ function shapePrompt(shape: PreviewShape): string {
   return "Keep left-center area clear for text overlay.";
 }
 
-function buildBackgroundPrompt(shape: PreviewShape, optionIndex: number, seed: string, noTextBoost = ""): string {
+function buildBackgroundPrompt(params: {
+  shape: PreviewShape;
+  direction: PlannedDirectionSpec;
+  title: string;
+  subtitle: string;
+  seed: string;
+  noTextBoost?: string;
+}): string {
+  const avoidWords = [params.title, params.subtitle]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join(", ");
+
   return [
     "Create an ORIGINAL premium sermon-series BACKGROUND only.",
     "No text, no letters, no words, no typography, no signage, no logos, no watermarks, no symbols resembling letters.",
     "Do not include readable characters in any language.",
-    "Default to abstract textures, subtle paper grain, geometric motifs, and minimal illustration accents.",
-    "Avoid literal scene photos unless explicitly requested.",
+    `Direction family: ${params.direction.styleFamily}.`,
+    `Composition target: ${params.direction.compositionType}.`,
+    `Background mode: ${params.direction.backgroundMode}.`,
+    `Type profile intent: ${params.direction.typeProfile}.`,
+    `Ornament profile intent: ${params.direction.ornamentProfile}.`,
+    params.direction.lanePrompt,
+    "Default to abstract textures, subtle paper grain, geometric motifs, and restrained premium compositions.",
+    "Use a church-safe visual language and avoid novelty gimmicks.",
     "Negative scene list: highway, road, cars, city, skyscraper, traffic, street signs, billboards.",
-    "Theme brief: providence, redemption, loyalty, harvest, wheat, Bethlehem, mercy, trust.",
-    "Avoid words (never render as text): Ruth, God Lovingly Provides.",
-    lanePrompt(optionIndex),
-    shapePrompt(shape),
+    "Theme brief: providence, redemption, mercy, trust, restoration, worship, biblical narrative.",
+    avoidWords ? `Avoid words (never render as text): ${avoidWords}.` : "",
+    shapePrompt(params.shape),
     "Create an original design; do not copy layout or specific elements from reference images.",
-    noTextBoost,
-    `Variation seed: ${seed}.`
+    params.noTextBoost || "",
+    `Variation seed: ${params.seed}.`
   ]
     .filter(Boolean)
     .join(" ");
@@ -226,7 +236,9 @@ async function normalizeShape(png: Buffer, shape: PreviewShape): Promise<Buffer>
 
 async function generateBackgroundWithRetries(params: {
   client: OpenAI;
-  optionIndex: number;
+  direction: PlannedDirectionSpec;
+  title: string;
+  subtitle: string;
   references: string[];
   seed: string;
 }): Promise<{ png: Buffer; retries: number; prompt: string }> {
@@ -239,7 +251,14 @@ async function generateBackgroundWithRetries(params: {
   let lastPng: Buffer | null = null;
   let lastPrompt = "";
   for (let attempt = 0; attempt < retryBoosts.length; attempt += 1) {
-    const prompt = buildBackgroundPrompt(OPTION_MASTER_BACKGROUND_SHAPE, params.optionIndex, params.seed, retryBoosts[attempt]);
+    const prompt = buildBackgroundPrompt({
+      shape: OPTION_MASTER_BACKGROUND_SHAPE,
+      direction: params.direction,
+      title: params.title,
+      subtitle: params.subtitle,
+      seed: `${params.seed}|${attempt}`,
+      noTextBoost: retryBoosts[attempt]
+    });
     const source = await generatePngFromPromptLocal({
       client: params.client,
       prompt,
@@ -260,33 +279,79 @@ async function generateBackgroundWithRetries(params: {
 
 async function main() {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is required for debug generation.");
-  }
-
-  const client = new OpenAI({ apiKey });
+  const client = apiKey ? new OpenAI({ apiKey }) : null;
   await mkdir(OUTPUT_DIR, { recursive: true });
 
+  const runSeed = process.env.DEBUG_RUN_SEED?.trim() || randomUUID();
+  const inputTitle = process.env.DEBUG_TITLE?.trim() || "Ruth";
+  const inputSubtitle = process.env.DEBUG_SUBTITLE?.trim() || "God Lovingly Provides";
+  const inputPassage = process.env.DEBUG_PASSAGE?.trim() || "Ruth 1:1-22";
   const displayContent = buildOverlayDisplayContent({
-    title: "Ruth",
-    subtitle: "God Lovingly Provides",
-    scripturePassages: "Ruth 1:1-22"
+    title: inputTitle,
+    subtitle: inputSubtitle,
+    scripturePassages: inputPassage
   });
   const content = {
     title: displayContent.title,
     subtitle: displayContent.subtitle
   };
+  const enabledPresetKeys = [...new Set(getDirectionTemplateCatalog().map((template) => template.presetKey))];
+  const directionPlan = planDirectionSet({
+    runSeed,
+    enabledPresetKeys,
+    optionCount: 3
+  });
+  const debugMetadata: Array<{
+    option: string;
+    styleFamily: string;
+    compositionType: string;
+    backgroundMode: string;
+    typeProfile: string;
+    ornamentProfile: string;
+    presetKey: string;
+    lockupPresetId: string;
+    templateStyleFamily: string;
+    prompt: string;
+  }> = [];
 
   for (let optionIndex = 0; optionIndex < 3; optionIndex += 1) {
-    const optionLabel = String.fromCharCode(65 + optionIndex);
+    const direction = directionPlan[optionIndex];
+    if (!direction) {
+      throw new Error(`Missing planned direction for option index ${optionIndex}`);
+    }
+    const optionLabel = direction.optionLabel;
     const referenceDataUrls: string[] = [];
+    const lockupPresetId = direction.lockupPresetId;
+    const fontSeed = `${runSeed}|${optionIndex}|${lockupPresetId}`;
 
-    const seed = `${SAMPLE_PROJECT_ID}-${optionLabel}-master`;
-    const masterBackground = await generateBackgroundWithRetries({
-      client,
-      optionIndex,
-      references: referenceDataUrls,
-      seed
+    const masterBackground = client
+      ? await generateBackgroundWithRetries({
+          client,
+          direction,
+          title: content.title,
+          subtitle: content.subtitle,
+          references: referenceDataUrls,
+          seed: `${runSeed}|${optionLabel}|master`
+        })
+      : {
+          png: await normalizeShape(await readFile(path.join(OUTPUT_DIR, `${optionLabel}-wide-bg.png`)), OPTION_MASTER_BACKGROUND_SHAPE),
+          retries: 0,
+          prompt: "offline-existing-background"
+        };
+    const masterDimensions = DIMENSIONS[OPTION_MASTER_BACKGROUND_SHAPE];
+    const masterLayout = computeCleanMinimalLayout({
+      width: masterDimensions.width,
+      height: masterDimensions.height,
+      content,
+      lockupPresetId,
+      styleFamily: direction.templateStyleFamily,
+      fontSeed
+    });
+    const resolvedLockupPalette = await resolveLockupPaletteForBackground({
+      backgroundPng: masterBackground.png,
+      sampleRegion: masterLayout.textRegion,
+      width: masterDimensions.width,
+      height: masterDimensions.height
     });
 
     for (const shape of PREVIEW_SHAPES) {
@@ -299,19 +364,26 @@ async function main() {
       const layout = computeCleanMinimalLayout({
         width: dimensions.width,
         height: dimensions.height,
-        content
+        content,
+        lockupPresetId,
+        styleFamily: direction.templateStyleFamily,
+        fontSeed
       });
       const textPalette = await chooseTextPaletteForBackground({
         backgroundPng,
         sampleRegion: layout.textRegion,
         width: dimensions.width,
-        height: dimensions.height
+        height: dimensions.height,
+        resolvedPalette: resolvedLockupPalette
       });
       const overlaySvg = buildCleanMinimalOverlaySvg({
         width: dimensions.width,
         height: dimensions.height,
         content,
-        palette: textPalette
+        palette: textPalette,
+        lockupPresetId,
+        styleFamily: direction.templateStyleFamily,
+        fontSeed
       });
       const finalPng = await sharp(backgroundPng)
         .composite([{ input: Buffer.from(overlaySvg), top: 0, left: 0 }])
@@ -326,9 +398,37 @@ async function main() {
         `Saved ${backgroundName} and ${finalName} (master=${OPTION_MASTER_BACKGROUND_SHAPE}, text retries: ${masterBackground.retries})`
       );
     }
-    console.log(`Option ${optionLabel} master prompt: ${masterBackground.prompt}`);
+    debugMetadata.push({
+      option: optionLabel,
+      styleFamily: direction.styleFamily,
+      compositionType: direction.compositionType,
+      backgroundMode: direction.backgroundMode,
+      typeProfile: direction.typeProfile,
+      ornamentProfile: direction.ornamentProfile,
+      presetKey: direction.presetKey,
+      lockupPresetId,
+      templateStyleFamily: direction.templateStyleFamily,
+      prompt: masterBackground.prompt
+    });
+    console.log(
+      `Option ${optionLabel}: ${direction.styleFamily} / ${direction.compositionType} | preset=${direction.presetKey} lockup=${lockupPresetId}`
+    );
   }
 
+  await writeFile(
+    path.join(OUTPUT_DIR, "metadata.json"),
+    `${JSON.stringify(
+      {
+        runSeed,
+        title: content.title,
+        subtitle: content.subtitle,
+        sampleProjectId: SAMPLE_PROJECT_ID,
+        directions: debugMetadata
+      },
+      null,
+      2
+    )}\n`
+  );
   console.log(`Done. Outputs written to ${OUTPUT_DIR}`);
 }
 

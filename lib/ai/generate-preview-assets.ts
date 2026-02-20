@@ -3,7 +3,7 @@ import "server-only";
 import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
-import sharp from "sharp";
+import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
 import { openai } from "@/lib/openai";
 
 type ImageQuality = "low" | "medium" | "high" | "auto";
@@ -183,15 +183,11 @@ async function writeResizedPng(params: {
   const filename = `${params.generationId}-${params.slot}-${Date.now()}-${randomUUID().slice(0, 8)}.png`;
   const outputPath = path.join(uploadDir, filename);
 
-  const resized = await sharp(params.sourcePng)
-    .resize({
-      width: params.width,
-      height: params.height,
-      fit: "cover",
-      position: "center"
-    })
-    .png()
-    .toBuffer();
+  const resized = await resizeCoverWithFocalPoint({
+    input: params.sourcePng,
+    width: params.width,
+    height: params.height
+  });
 
   await writeFile(outputPath, resized);
   return `/uploads/${filename}`;

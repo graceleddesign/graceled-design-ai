@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Settings } from "lucide-react";
 import { requireSession } from "@/lib/auth";
 import { logoutAction } from "@/app/app/actions";
 
@@ -16,6 +17,14 @@ export default async function AuthenticatedLayout({ children }: { children: Reac
 
           <nav className="flex items-center gap-4 text-sm">
             <Link href="/app/projects">Projects</Link>
+            <Link
+              href="/app/settings"
+              aria-label="Settings"
+              className="inline-flex items-center gap-1 rounded-md px-1 py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-2"
+            >
+              <Settings aria-hidden="true" className="h-4 w-4" />
+              <span className="hidden md:inline">Settings</span>
+            </Link>
             <form action={logoutAction}>
               <button type="submit" className="rounded-md border border-slate-300 px-3 py-1.5 text-slate-700">
                 Log out

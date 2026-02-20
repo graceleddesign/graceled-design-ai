@@ -49,15 +49,27 @@ export default async function GenerationFeedbackPage({
         },
         select: {
           id: true,
-          preset: {
-            select: {
-              name: true,
-              subtitle: true
-            }
-          }
+          round: true
         }
       })
     : null;
+  const roundGenerations =
+    chosenGeneration && chosenGeneration.round > 0
+      ? await prisma.generation.findMany({
+          where: {
+            projectId: project.id,
+            round: chosenGeneration.round
+          },
+          orderBy: {
+            createdAt: "asc"
+          },
+          select: {
+            id: true
+          }
+        })
+      : [];
+  const chosenOptionIndex = chosenGeneration ? roundGenerations.findIndex((item) => item.id === chosenGeneration.id) : -1;
+  const chosenOptionKey = chosenOptionIndex >= 0 && chosenOptionIndex < 3 ? (String.fromCharCode(65 + chosenOptionIndex) as "A" | "B" | "C") : undefined;
 
   return (
     <section className="mx-auto max-w-3xl space-y-4">
@@ -69,9 +81,7 @@ export default async function GenerationFeedbackPage({
         projectId={project.id}
         currentRound={round}
         chosenGenerationId={chosenGeneration?.id}
-        chosenDirectionLabel={
-          chosenGeneration ? `${chosenGeneration.preset?.name || "Direction"}${chosenGeneration.preset?.subtitle ? ` - ${chosenGeneration.preset.subtitle}` : ""}` : undefined
-        }
+        chosenDirectionLabel={chosenOptionKey || (chosenGeneration ? "Selected direction" : undefined)}
       />
     </section>
   );

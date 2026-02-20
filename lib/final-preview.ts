@@ -1,6 +1,7 @@
 import sharp from "sharp";
 import type { DesignDoc } from "@/lib/design-doc";
 import { buildFinalSvg } from "@/lib/final-deliverables";
+import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
 
 function normalizeDimension(value: number): number {
   if (!Number.isFinite(value) || Number.isNaN(value)) {
@@ -19,15 +20,11 @@ export async function renderPreviewPng(params: {
   const width = normalizeDimension(params.outputWidth);
   const height = normalizeDimension(params.outputHeight);
 
-  const resizedBackground = await sharp(params.backgroundPngBuffer)
-    .resize({
-      width,
-      height,
-      fit: "cover",
-      position: "center"
-    })
-    .png()
-    .toBuffer();
+  const resizedBackground = await resizeCoverWithFocalPoint({
+    input: params.backgroundPngBuffer,
+    width,
+    height
+  });
 
   const overlaySvg = await buildFinalSvg(params.designDoc, {
     includeBackground: false,
