@@ -194,6 +194,174 @@ const LOCKUP_LAYOUT_ARCHETYPES = [
 ] as const;
 type LockupLayoutArchetype = (typeof LOCKUP_LAYOUT_ARCHETYPES)[number];
 const LOCKUP_LAYOUT_ARCHETYPE_SET = new Set<string>(LOCKUP_LAYOUT_ARCHETYPES);
+type LockupTypographicRecipe = {
+  id: string;
+  label: string;
+  titleCase: LockupRecipe["hierarchy"]["case"];
+  subtitleCase: LockupRecipe["hierarchy"]["case"];
+  maxTitleLines: 1 | 2 | 3 | 4;
+  forcedLineBreakRule: string;
+  titleTrackingRange: {
+    min: number;
+    max: number;
+  };
+  subtitleTrackingRange: {
+    min: number;
+    max: number;
+  };
+  opticalAlignment: {
+    alignment: LockupRecipe["alignment"];
+    safeMarginPct: number;
+    maxTitleWidthPct: number;
+  };
+  subtitleWidthRatio: number;
+  dividerRule: "none" | "optional" | "required";
+  titleTreatment: LockupRecipe["titleTreatment"];
+};
+const LOCKUP_TEXT_OVERRIDE_PROMPT =
+  "LOCKUP TEXT OVERRIDE: Use EXACT text only. Do not add any other words, letters, or decorative type.";
+const LOCKUP_TYPOGRAPHIC_RECIPE_BY_LAYOUT: Record<LockupLayoutArchetype, LockupTypographicRecipe> = {
+  editorial_stack: {
+    id: "classic_stack",
+    label: "Classic Stack",
+    titleCase: "title_case",
+    subtitleCase: "upper",
+    maxTitleLines: 3,
+    forcedLineBreakRule: "Break title into 2-3 balanced word groups; avoid orphan prepositions.",
+    titleTrackingRange: { min: 0.01, max: 0.05 },
+    subtitleTrackingRange: { min: 0.03, max: 0.08 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.076, maxTitleWidthPct: 0.56 },
+    subtitleWidthRatio: 0.62,
+    dividerRule: "optional",
+    titleTreatment: "stacked"
+  },
+  banner_strip: {
+    id: "banner_strip",
+    label: "Banner Strip",
+    titleCase: "upper",
+    subtitleCase: "upper",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Split long titles into two compact bands by major phrase groups.",
+    titleTrackingRange: { min: -0.02, max: 0.03 },
+    subtitleTrackingRange: { min: 0.03, max: 0.08 },
+    opticalAlignment: { alignment: "center", safeMarginPct: 0.06, maxTitleWidthPct: 0.7 },
+    subtitleWidthRatio: 0.58,
+    dividerRule: "required",
+    titleTreatment: "split"
+  },
+  centered_classic: {
+    id: "centered_classic",
+    label: "Centered Classic",
+    titleCase: "title_case",
+    subtitleCase: "upper",
+    maxTitleLines: 3,
+    forcedLineBreakRule: "Center title on 2-3 optical lines with near-even line lengths.",
+    titleTrackingRange: { min: 0.01, max: 0.05 },
+    subtitleTrackingRange: { min: 0.04, max: 0.09 },
+    opticalAlignment: { alignment: "center", safeMarginPct: 0.072, maxTitleWidthPct: 0.6 },
+    subtitleWidthRatio: 0.55,
+    dividerRule: "optional",
+    titleTreatment: "stacked"
+  },
+  vertical_spine: {
+    id: "vertical_spine",
+    label: "Vertical Spine",
+    titleCase: "upper",
+    subtitleCase: "upper",
+    maxTitleLines: 4,
+    forcedLineBreakRule: "Use short stacked word groups that read cleanly along a vertical rail.",
+    titleTrackingRange: { min: 0.02, max: 0.08 },
+    subtitleTrackingRange: { min: 0.05, max: 0.1 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.084, maxTitleWidthPct: 0.46 },
+    subtitleWidthRatio: 0.52,
+    dividerRule: "required",
+    titleTreatment: "stacked"
+  },
+  split_title: {
+    id: "split_title",
+    label: "Split Title",
+    titleCase: "title_case",
+    subtitleCase: "upper",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Force one intentional break at the strongest semantic pivot in the title.",
+    titleTrackingRange: { min: -0.01, max: 0.03 },
+    subtitleTrackingRange: { min: 0.03, max: 0.08 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.07, maxTitleWidthPct: 0.62 },
+    subtitleWidthRatio: 0.6,
+    dividerRule: "none",
+    titleTreatment: "split"
+  },
+  framed_type: {
+    id: "framed_type",
+    label: "Framed Type",
+    titleCase: "upper",
+    subtitleCase: "upper",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Keep title to one strong line or two tightly grouped lines.",
+    titleTrackingRange: { min: 0.02, max: 0.08 },
+    subtitleTrackingRange: { min: 0.05, max: 0.11 },
+    opticalAlignment: { alignment: "center", safeMarginPct: 0.064, maxTitleWidthPct: 0.66 },
+    subtitleWidthRatio: 0.57,
+    dividerRule: "required",
+    titleTreatment: "boxed"
+  },
+  monogram_mark: {
+    id: "monogram_mark",
+    label: "Monogram + Wordmark",
+    titleCase: "upper",
+    subtitleCase: "upper",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Keep title compact beside mark; if wrapped, split into two equal word groups.",
+    titleTrackingRange: { min: 0.01, max: 0.06 },
+    subtitleTrackingRange: { min: 0.04, max: 0.09 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.072, maxTitleWidthPct: 0.58 },
+    subtitleWidthRatio: 0.56,
+    dividerRule: "optional",
+    titleTreatment: "stacked"
+  },
+  seal_arc: {
+    id: "seal_arc",
+    label: "Seal Arc",
+    titleCase: "upper",
+    subtitleCase: "upper",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Use one arc title line; reserve subtitle for a straight secondary line.",
+    titleTrackingRange: { min: 0.03, max: 0.1 },
+    subtitleTrackingRange: { min: 0.05, max: 0.11 },
+    opticalAlignment: { alignment: "center", safeMarginPct: 0.068, maxTitleWidthPct: 0.64 },
+    subtitleWidthRatio: 0.55,
+    dividerRule: "required",
+    titleTreatment: "badge"
+  },
+  stepped_baseline: {
+    id: "stepped_baseline",
+    label: "Stepped Baseline",
+    titleCase: "title_case",
+    subtitleCase: "upper",
+    maxTitleLines: 3,
+    forcedLineBreakRule: "Break into 2-3 descending phrase groups with deliberate baseline offsets.",
+    titleTrackingRange: { min: 0, max: 0.04 },
+    subtitleTrackingRange: { min: 0.03, max: 0.08 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.078, maxTitleWidthPct: 0.59 },
+    subtitleWidthRatio: 0.61,
+    dividerRule: "optional",
+    titleTreatment: "stacked"
+  },
+  offset_kicker: {
+    id: "offset_kicker",
+    label: "Offset Kicker",
+    titleCase: "upper",
+    subtitleCase: "title_case",
+    maxTitleLines: 2,
+    forcedLineBreakRule: "Keep title dominant; place subtitle as one short offset kicker line.",
+    titleTrackingRange: { min: -0.02, max: 0.03 },
+    subtitleTrackingRange: { min: 0.01, max: 0.05 },
+    opticalAlignment: { alignment: "left", safeMarginPct: 0.07, maxTitleWidthPct: 0.63 },
+    subtitleWidthRatio: 0.64,
+    dividerRule: "none",
+    titleTreatment: "singleline"
+  }
+};
 const DIRECTION_LANE_FAMILIES = ["premium_modern", "editorial", "minimal", "photo_centric", "retro"] as const;
 const DIRECTION_LANE_FAMILY_SET = new Set<string>(DIRECTION_LANE_FAMILIES);
 const LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE: Record<LockupStyleMode, readonly LockupLayoutArchetype[]> = {
@@ -971,6 +1139,23 @@ function lockupLayoutInstructionForArchetype(archetype: LockupLayoutArchetype): 
   return "offset_kicker: primary title anchored with a smaller offset kicker/subtitle accent that sharpens hierarchy without decorative clutter.";
 }
 
+function lockupTypographicRecipeForArchetype(archetype: LockupLayoutArchetype): LockupTypographicRecipe {
+  return LOCKUP_TYPOGRAPHIC_RECIPE_BY_LAYOUT[archetype];
+}
+
+function lockupTypographicRecipeInstructionForArchetype(archetype: LockupLayoutArchetype): string {
+  const recipe = lockupTypographicRecipeForArchetype(archetype);
+  return `Typographic recipe (HARD) ${recipe.label}: casing title=${recipe.titleCase}, subtitle=${recipe.subtitleCase}; max title lines=${recipe.maxTitleLines}; forced line breaks=${recipe.forcedLineBreakRule}; tracking title=${recipe.titleTrackingRange.min.toFixed(
+    2
+  )}..${recipe.titleTrackingRange.max.toFixed(2)}em, subtitle=${recipe.subtitleTrackingRange.min.toFixed(2)}..${recipe.subtitleTrackingRange.max.toFixed(
+    2
+  )}em; optical alignment=${recipe.opticalAlignment.alignment} with safe margin ${recipe.opticalAlignment.safeMarginPct.toFixed(
+    3
+  )} and max title width ${recipe.opticalAlignment.maxTitleWidthPct.toFixed(3)}; subtitle width target=${recipe.subtitleWidthRatio.toFixed(
+    2
+  )}x title width; divider usage=${recipe.dividerRule}.`;
+}
+
 function chooseDistinctLockupLayouts(params: {
   seed: string;
   styleModes: LockupStyleMode[];
@@ -1010,6 +1195,7 @@ function resolvePlannedLockupLayouts(params: {
   referencesByOption: readonly ReferenceLibraryItem[][];
   keepLayout?: LockupLayoutArchetype | null;
   forceNewLayout?: boolean;
+  forceDistinctRecipes?: boolean;
   brandMode?: ProjectBrandMode;
   typographyDirection?: "match_site" | "graceled_defaults" | null;
 }): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
@@ -1028,8 +1214,23 @@ function resolvePlannedLockupLayouts(params: {
     })
   );
 
-  return chooseDistinctLockupLayouts({
+  const chosenLayouts = chooseDistinctLockupLayouts({
     seed: params.seed,
+    styleModes,
+    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined
+  });
+
+  if (!params.forceDistinctRecipes) {
+    return chosenLayouts;
+  }
+
+  const recipeIds = chosenLayouts.map((layout) => lockupTypographicRecipeForArchetype(layout).id);
+  if (new Set(recipeIds).size >= ROUND_OPTION_COUNT) {
+    return chosenLayouts;
+  }
+
+  return chooseDistinctLockupLayouts({
+    seed: `${params.seed}:distinct-recipes`,
     styleModes,
     exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined
   });
@@ -1148,6 +1349,7 @@ function buildLockupGenerationPrompt(params: {
         : "Modern style mode bias: favor editorial_stack or split_title pacing and avoid faux vintage cues when references do not demand them.";
   const archetypeLine = `Lockup layout archetype: ${params.lockupLayout}. Follow this layout strongly.`;
   const archetypeInstructionLine = lockupLayoutInstructionForArchetype(params.lockupLayout);
+  const typographicRecipeLine = lockupTypographicRecipeInstructionForArchetype(params.lockupLayout);
   // Bible brief motifs/markIdeas provide symbolic lockup accents without introducing extra copy.
   const motifsLine =
     params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
@@ -1204,6 +1406,7 @@ function buildLockupGenerationPrompt(params: {
     styleSpecificLine,
     archetypeLine,
     archetypeInstructionLine,
+    typographicRecipeLine,
     styleModeLayoutBiasLine,
     motifsLine,
     typographyMoodLine,
@@ -1227,21 +1430,36 @@ function buildLockupGenerationPrompt(params: {
 function applyLockupRecipeGuardrails(params: {
   lockupRecipe: LockupRecipe;
   styleMode: LockupStyleMode;
+  lockupLayout: LockupLayoutArchetype;
 }): LockupRecipe {
   const source = params.lockupRecipe;
   const modernMode = params.styleMode === "modern_editorial";
+  const typographicRecipe = lockupTypographicRecipeForArchetype(params.lockupLayout);
 
-  const titleTreatment =
-    source.titleTreatment === "boxed" || source.titleTreatment === "badge"
-      ? modernMode
-        ? source.layoutIntent === "bold_modern"
-          ? "overprint"
-          : "split"
-        : "stacked"
-      : source.titleTreatment;
+  const recipeTreatment =
+    typographicRecipe.maxTitleLines <= 1
+      ? "singleline"
+      : typographicRecipe.maxTitleLines === 2
+        ? typographicRecipe.titleTreatment === "singleline"
+          ? "split"
+          : typographicRecipe.titleTreatment
+        : typographicRecipe.titleTreatment === "singleline"
+          ? "stacked"
+          : typographicRecipe.titleTreatment;
+  const titleTreatment = recipeTreatment === "badge" && modernMode ? "split" : recipeTreatment;
 
   let ornament: NonNullable<LockupRecipe["ornament"]>;
-  if (modernMode) {
+  if (typographicRecipe.dividerRule === "none") {
+    ornament = {
+      kind: "none",
+      weight: source.ornament?.weight || "med"
+    };
+  } else if (typographicRecipe.dividerRule === "required") {
+    ornament = {
+      kind: "rule_dot",
+      weight: source.ornament?.weight || "thin"
+    };
+  } else if (modernMode) {
     ornament = {
       kind: "none",
       weight: source.ornament?.weight || "med"
@@ -1260,6 +1478,15 @@ function applyLockupRecipeGuardrails(params: {
     };
   }
 
+  const trackingMin = modernMode
+    ? clampNumber(Math.max(-0.05, typographicRecipe.titleTrackingRange.min), -0.05, 0.08)
+    : clampNumber(Math.max(0.01, typographicRecipe.titleTrackingRange.min), 0.01, 0.08);
+  const trackingMax = modernMode
+    ? clampNumber(Math.min(0.08, typographicRecipe.titleTrackingRange.max), trackingMin, 0.08)
+    : clampNumber(Math.min(0.08, typographicRecipe.titleTrackingRange.max), trackingMin, 0.08);
+  const recipeCase = modernMode && typographicRecipe.titleCase === "title_case" ? "upper" : typographicRecipe.titleCase;
+  const subtitleScaleTarget = clampNumber(typographicRecipe.subtitleWidthRatio * 0.9, 0.42, 0.62);
+
   return {
     ...source,
     layoutIntent: modernMode
@@ -1270,15 +1497,169 @@ function applyLockupRecipeGuardrails(params: {
         ? "classic_serif"
         : source.layoutIntent,
     titleTreatment,
+    alignment: typographicRecipe.opticalAlignment.alignment,
+    placement: {
+      ...source.placement,
+      safeMarginPct: clampNumber(typographicRecipe.opticalAlignment.safeMarginPct, 0.04, 0.12),
+      maxTitleWidthPct: clampNumber(typographicRecipe.opticalAlignment.maxTitleWidthPct, 0.35, 0.75)
+    },
     hierarchy: {
       ...source.hierarchy,
-      subtitleScale: clampNumber(source.hierarchy.subtitleScale, 0.42, 0.62),
-      tracking: modernMode
-        ? clampNumber(source.hierarchy.tracking, -0.05, 0.08)
-        : clampNumber(source.hierarchy.tracking, 0.01, 0.08),
-      case: modernMode && source.hierarchy.case === "title_case" ? "upper" : source.hierarchy.case
+      subtitleScale: clampNumber((source.hierarchy.subtitleScale + subtitleScaleTarget) / 2, 0.42, 0.62),
+      tracking: clampNumber(source.hierarchy.tracking, trackingMin, trackingMax),
+      case: recipeCase
     },
     ornament
+  };
+}
+
+type LockupSvgTextValidation = {
+  valid: boolean;
+  expected: string[];
+  extracted: string[];
+  unexpected: string[];
+  missing: string[];
+};
+
+function decodeXmlEntity(entity: string): string {
+  const normalized = entity.toLowerCase();
+  if (normalized === "&amp;") {
+    return "&";
+  }
+  if (normalized === "&lt;") {
+    return "<";
+  }
+  if (normalized === "&gt;") {
+    return ">";
+  }
+  if (normalized === "&quot;") {
+    return '"';
+  }
+  if (normalized === "&apos;") {
+    return "'";
+  }
+  const hexMatch = normalized.match(/^&#x([0-9a-f]+);$/);
+  if (hexMatch) {
+    const codepoint = Number.parseInt(hexMatch[1], 16);
+    return Number.isFinite(codepoint) ? String.fromCodePoint(codepoint) : "";
+  }
+  const decMatch = normalized.match(/^&#([0-9]+);$/);
+  if (decMatch) {
+    const codepoint = Number.parseInt(decMatch[1], 10);
+    return Number.isFinite(codepoint) ? String.fromCodePoint(codepoint) : "";
+  }
+  return entity;
+}
+
+function decodeXmlEntities(value: string): string {
+  return value.replace(/&(amp|lt|gt|quot|apos|#x[0-9a-fA-F]+|#[0-9]+);/g, (entity) => decodeXmlEntity(entity));
+}
+
+function extractSvgTextNodes(svg: string): string[] {
+  const textMatches = svg.match(/<text\b[\s\S]*?<\/text>/gi) || [];
+  const extracted = textMatches
+    .map((node) => node.replace(/<[^>]+>/g, " "))
+    .map((text) => decodeXmlEntities(text))
+    .map((text) => text.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return [...new Set(extracted)];
+}
+
+function validateLockupSvgTextIntegrity(params: {
+  svg: string;
+  seriesTitle: string;
+  subtitle?: string | null;
+}): LockupSvgTextValidation {
+  const expected = [params.seriesTitle, params.subtitle || ""].map((value) => normalizeLine(value)).filter(Boolean);
+  const expectedSet = new Set(expected);
+  const extracted = extractSvgTextNodes(params.svg).map((value) => normalizeLine(value)).filter(Boolean);
+  const unexpected = [...new Set(extracted.filter((value) => !expectedSet.has(value)))];
+  const missing = expected.filter((value) => !extracted.includes(value));
+
+  return {
+    valid: unexpected.length === 0 && missing.length === 0,
+    expected,
+    extracted: [...new Set(extracted)],
+    unexpected,
+    missing
+  };
+}
+
+async function renderValidatedLockupPng(params: {
+  width: number;
+  height: number;
+  content: {
+    title: string;
+    subtitle: string;
+  };
+  palette: Awaited<ReturnType<typeof chooseTextPaletteForBackground>>;
+  lockupRecipe: LockupRecipe;
+  lockupPresetId?: string | null;
+  styleFamily: StyleFamily;
+  fontSeed: string;
+  lockupPrompt: string;
+}): Promise<{
+  renderResult: { png: Buffer; width: number; height: number };
+  effectivePrompt: string;
+  textValidation: LockupSvgTextValidation;
+  textOverrideRetried: boolean;
+}> {
+  let effectivePrompt = params.lockupPrompt;
+  let textOverrideRetried = false;
+  let finalValidation: LockupSvgTextValidation | null = null;
+  let finalSvg = "";
+
+  for (let attempt = 0; attempt <= 1; attempt += 1) {
+    if (attempt === 1) {
+      textOverrideRetried = true;
+      effectivePrompt = `${params.lockupPrompt}\n${LOCKUP_TEXT_OVERRIDE_PROMPT}`;
+    }
+
+    const svg = buildCleanMinimalOverlaySvg({
+      width: params.width,
+      height: params.height,
+      content: {
+        title: params.content.title,
+        subtitle: params.content.subtitle
+      },
+      palette: params.palette,
+      lockupRecipe: params.lockupRecipe,
+      lockupPresetId: params.lockupPresetId,
+      styleFamily: params.styleFamily,
+      fontSeed: params.fontSeed
+    });
+    const validation = validateLockupSvgTextIntegrity({
+      svg,
+      seriesTitle: params.content.title,
+      subtitle: params.content.subtitle
+    });
+    finalValidation = validation;
+    finalSvg = svg;
+    if (validation.valid) {
+      break;
+    }
+  }
+
+  if (finalValidation && !finalValidation.valid) {
+    console.warn(
+      `[lockup-text-validation] failed after override retry unexpected=${finalValidation.unexpected.join(",") || "none"} missing=${
+        finalValidation.missing.join(",") || "none"
+      }`
+    );
+  }
+
+  const renderResult = await renderTrimmedLockupPngFromSvg(finalSvg);
+  return {
+    renderResult,
+    effectivePrompt,
+    textValidation: finalValidation || {
+      valid: true,
+      expected: [],
+      extracted: [],
+      unexpected: [],
+      missing: []
+    },
+    textOverrideRetried
   };
 }
 
@@ -3561,8 +3942,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         ? sourceLockupRecipe
         : applyLockupRecipeGuardrails({
             lockupRecipe: sourceLockupRecipe,
-            styleMode: lockupStyleMode
+            styleMode: lockupStyleMode,
+            lockupLayout
           });
+      const typographicRecipe = lockupTypographicRecipeForArchetype(lockupLayout);
 
       const renderMasterAttempt = async (originalityBoost?: string) => {
         if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
@@ -3848,24 +4231,32 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         ...lockupPaletteForMaster,
         autoScrim: false
       };
-      const lockupRenderResult = shouldReuseLockup && reusableAssets?.lockupPng
+      const lockupRenderComputation = shouldReuseLockup && reusableAssets?.lockupPng
         ? {
-            png: reusableAssets.lockupPng,
-            width: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).width || 1)),
-            height: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).height || 1))
+            renderResult: {
+              png: reusableAssets.lockupPng,
+              width: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).width || 1)),
+              height: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).height || 1))
+            },
+            effectivePrompt: lockupPrompt,
+            textValidation: null as LockupSvgTextValidation | null,
+            textOverrideRetried: false
           }
-        : await renderTrimmedLockupPngFromSvg(
-            buildCleanMinimalOverlaySvg({
-              width: masterDimensions.width,
-              height: masterDimensions.height,
-              content,
-              palette: lockupPaletteForRender,
-              lockupRecipe: lockupRecipeForRender,
-              lockupPresetId,
-              styleFamily: optionStyleFamily,
-              fontSeed: fontSeedBase
-            })
-          );
+        : await renderValidatedLockupPng({
+            width: masterDimensions.width,
+            height: masterDimensions.height,
+            content,
+            palette: lockupPaletteForRender,
+            lockupRecipe: lockupRecipeForRender,
+            lockupPresetId,
+            styleFamily: optionStyleFamily,
+            fontSeed: fontSeedBase,
+            lockupPrompt
+          });
+      const lockupRenderResult = lockupRenderComputation.renderResult;
+      const effectiveLockupPrompt = lockupRenderComputation.effectivePrompt;
+      const lockupTextValidation = lockupRenderComputation.textValidation;
+      const lockupTextOverrideRetried = lockupRenderComputation.textOverrideRetried;
       const lockupPath = await writeGenerationPreviewFiles({
         fileName: `${plannedGeneration.id}-lockup.png`,
         png: lockupRenderResult.png
@@ -3948,7 +4339,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         directionSpec?.motifFocus && directionSpec.motifFocus.length > 0
           ? `[motif-focus: ${directionSpec.motifFocus.join(" + ")}]`
           : "",
-        `[lockup-prompt: ${lockupPrompt}]`,
+        `[lockup-typography-recipe: ${typographicRecipe.id}]`,
+        `[lockup-prompt: ${effectiveLockupPrompt}]`,
+        lockupTextOverrideRetried ? "[retry: lockup-text-override x1]" : "",
+        lockupTextValidation && !lockupTextValidation.valid
+          ? `[lockup-text-validation: failed unexpected=${lockupTextValidation.unexpected.join(",") || "none"} missing=${lockupTextValidation.missing.join(",") || "none"}]`
+          : lockupTextValidation
+            ? "[lockup-text-validation: passed]"
+            : "",
         originalityRetried ? "[retry: originality-guard]" : "",
         masterAttempt.textRetryCount > 0 ? `[retry: no-text x${masterAttempt.textRetryCount}]` : "",
         masterAttempt.paletteRetryCount > 0 ? `[retry: brand-palette x${masterAttempt.paletteRetryCount}]` : "",
@@ -4050,9 +4448,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             topicKeys: motifBankContext.topicKeys,
             topicNames: motifBankContext.topicNames,
             lockupRecipe: lockupRecipeForRender,
+            lockupTypographicRecipe: typographicRecipe,
             lockupStyleMode,
             lockupIntegrationMode,
-            lockupPrompt,
+            lockupPrompt: effectiveLockupPrompt,
+            lockupTextValidation,
+            lockupTextOverrideRetried,
             resolvedLockupPalette,
             lockupAssetPath: lockupPath,
             paletteComplianceScore: masterAttempt.paletteComplianceScore,
@@ -4363,6 +4764,7 @@ export async function generateRoundOneAction(
     styleFamilies: plannedStyleFamilies,
     lockupPresetIds,
     referencesByOption: refsForOptions,
+    forceDistinctRecipes: explorationMode,
     brandMode: project.brandMode,
     typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
   });
