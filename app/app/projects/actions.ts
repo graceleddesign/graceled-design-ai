@@ -1160,23 +1160,48 @@ function chooseDistinctLockupLayouts(params: {
   seed: string;
   styleModes: LockupStyleMode[];
   exclude?: LockupLayoutArchetype[];
+  recentRecipeRanks?: Map<string, number>;
 }): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
   const excludeSet = new Set(params.exclude || []);
   const filteredPool = deterministicOrder(LOCKUP_LAYOUT_ARCHETYPES, `${params.seed}:pool`).filter((item) => !excludeSet.has(item));
   const basePool = filteredPool.length > 0 ? filteredPool : deterministicOrder(LOCKUP_LAYOUT_ARCHETYPES, `${params.seed}:fallback`);
   const used = new Set<LockupLayoutArchetype>();
+  const usedRecipeIds = new Set<string>();
+  const recentRecipeRanks = params.recentRecipeRanks || new Map<string, number>();
+
+  const recipeRecencyScore = (recipeId: string): number => {
+    const rank = recentRecipeRanks.get(recipeId);
+    if (rank === undefined) {
+      return 4;
+    }
+    return Math.min(0, -8 + rank);
+  };
+
   const picks = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
     const styleMode = params.styleModes[index] || "modern_editorial";
-    const preferredOrdered = deterministicOrder(
-      LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE[styleMode],
-      `${params.seed}:${styleMode}:${index}`
-    ).filter((item) => basePool.includes(item));
-    const orderedCandidates = [...preferredOrdered, ...basePool];
+    const preferredSet = new Set(LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE[styleMode]);
+    const rankedCandidates = basePool
+      .filter((item) => !used.has(item))
+      .map((layout) => {
+        const recipeId = lockupTypographicRecipeForArchetype(layout).id;
+        let score = 0;
+        score += preferredSet.has(layout) ? 9 : 2;
+        score += usedRecipeIds.has(recipeId) ? -24 : 5;
+        score += recipeRecencyScore(recipeId);
+        score += parseInt(hashForDeterministicOrdering(`${params.seed}:${styleMode}:${index}:layout-score`, layout).slice(0, 8), 16) / 0xffffffff;
+        return {
+          layout,
+          recipeId,
+          score
+        };
+      })
+      .sort((a, b) => b.score - a.score);
     const chosen =
-      orderedCandidates.find((item) => !used.has(item)) ||
+      rankedCandidates[0]?.layout ||
       basePool.find((item) => !used.has(item)) ||
       defaultLockupLayoutForStyleMode(styleMode);
     used.add(chosen);
+    usedRecipeIds.add(lockupTypographicRecipeForArchetype(chosen).id);
     return chosen;
   });
 
@@ -1196,6 +1221,7 @@ function resolvePlannedLockupLayouts(params: {
   keepLayout?: LockupLayoutArchetype | null;
   forceNewLayout?: boolean;
   forceDistinctRecipes?: boolean;
+  recentRecipeIds?: readonly string[];
   brandMode?: ProjectBrandMode;
   typographyDirection?: "match_site" | "graceled_defaults" | null;
 }): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
@@ -1214,10 +1240,18 @@ function resolvePlannedLockupLayouts(params: {
     })
   );
 
+  const recentRecipeRanks = new Map(
+    (params.recentRecipeIds || [])
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean)
+      .map((recipeId, index) => [recipeId, index] as const)
+  );
+
   const chosenLayouts = chooseDistinctLockupLayouts({
     seed: params.seed,
     styleModes,
-    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined
+    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined,
+    recentRecipeRanks
   });
 
   if (!params.forceDistinctRecipes) {
@@ -1232,7 +1266,8 @@ function resolvePlannedLockupLayouts(params: {
   return chooseDistinctLockupLayouts({
     seed: `${params.seed}:distinct-recipes`,
     styleModes,
-    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined
+    exclude: params.forceNewLayout && params.keepLayout ? [params.keepLayout] : undefined,
+    recentRecipeRanks
   });
 }
 
@@ -1938,7 +1973,15 @@ function optionLane(optionIndex: number): "A" | "B" | "C" {
   return "C";
 }
 
-function laneBriefHint(optionIndex: number): string {
+function laneBriefHint(optionIndex: number, directionSpec?: PlannedDirectionSpec | null): string {
+  if (directionSpec?.explorationLaneKey) {
+    const readableLane = directionSpec.explorationLaneKey
+      .toLowerCase()
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return `Exploration lane: ${readableLane}. Keep this direction clearly distinct from the other two options.`;
+  }
   const lane = optionLane(optionIndex);
   if (lane === "A") {
     return "Minimal / typography-led lane with Swiss-grid restraint and generous negative space.";
@@ -2109,6 +2152,59 @@ function readStyleMediumFromGenerationOutput(output: unknown): StyleMediumKey | 
   return styleFamily ? STYLE_FAMILY_BANK[styleFamily].medium : null;
 }
 
+function readLockupTypographicRecipeIdFromGenerationOutput(output: unknown): string | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+  const rawRecipe = (designSpec as { lockupTypographicRecipe?: unknown }).lockupTypographicRecipe;
+  if (rawRecipe && typeof rawRecipe === "object" && !Array.isArray(rawRecipe)) {
+    const id = (rawRecipe as { id?: unknown }).id;
+    if (typeof id === "string" && id.trim()) {
+      return id.trim();
+    }
+  }
+  const rawLayout = (designSpec as { lockupLayout?: unknown }).lockupLayout;
+  if (isLockupLayoutArchetype(rawLayout)) {
+    return lockupTypographicRecipeForArchetype(rawLayout).id;
+  }
+  return null;
+}
+
+function readExplorationSetKeyFromGenerationOutput(output: unknown): string | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+  const directSetKey = (designSpec as { explorationSetKey?: unknown }).explorationSetKey;
+  if (typeof directSetKey === "string" && directSetKey.trim()) {
+    return directSetKey.trim();
+  }
+  const directionSpec = (designSpec as { directionSpec?: unknown }).directionSpec;
+  if (!directionSpec || typeof directionSpec !== "object" || Array.isArray(directionSpec)) {
+    return null;
+  }
+  const nestedSetKey = (directionSpec as { explorationSetKey?: unknown }).explorationSetKey;
+  if (typeof nestedSetKey === "string" && nestedSetKey.trim()) {
+    return nestedSetKey.trim();
+  }
+  return null;
+}
+
 function deriveRecentStyleBuckets(recentStyleFamilies: readonly StyleFamilyKey[]): StyleBucketKey[] {
   const seen = new Set<StyleBucketKey>();
   const buckets: StyleBucketKey[] = [];
@@ -2210,6 +2306,89 @@ async function loadRecentStyleFamilies(params: {
     }
   }
 
+  return recent;
+}
+
+async function loadRecentLockupRecipeIds(params: {
+  organizationId: string;
+  projectId: string;
+  limit?: number;
+}): Promise<string[]> {
+  const target = Math.max(1, Math.min(params.limit || 18, 40));
+  const [projectGenerations, organizationGenerations] = await Promise.all([
+    prisma.generation.findMany({
+      where: {
+        projectId: params.projectId
+      },
+      orderBy: [{ round: "desc" }, { createdAt: "desc" }],
+      take: 24,
+      select: {
+        output: true
+      }
+    }),
+    prisma.generation.findMany({
+      where: {
+        project: {
+          organizationId: params.organizationId,
+          id: {
+            not: params.projectId
+          }
+        }
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: 60,
+      select: {
+        output: true
+      }
+    })
+  ]);
+
+  const ordered = [...projectGenerations, ...organizationGenerations];
+  const seen = new Set<string>();
+  const recent: string[] = [];
+  for (const generation of ordered) {
+    const recipeId = readLockupTypographicRecipeIdFromGenerationOutput(generation.output);
+    if (!recipeId || seen.has(recipeId)) {
+      continue;
+    }
+    seen.add(recipeId);
+    recent.push(recipeId);
+    if (recent.length >= target) {
+      break;
+    }
+  }
+  return recent;
+}
+
+async function loadRecentExplorationSetKeys(params: {
+  projectId: string;
+  limit?: number;
+}): Promise<string[]> {
+  const target = Math.max(1, Math.min(params.limit || 8, 20));
+  const recentGenerations = await prisma.generation.findMany({
+    where: {
+      projectId: params.projectId
+    },
+    orderBy: [{ round: "desc" }, { createdAt: "desc" }],
+    take: 24,
+    select: {
+      output: true
+    }
+  });
+
+  const seen = new Set<string>();
+  const recent: string[] = [];
+  for (const generation of recentGenerations) {
+    const setKey = readExplorationSetKeyFromGenerationOutput(generation.output);
+    if (!setKey || seen.has(setKey)) {
+      continue;
+    }
+    seen.add(setKey);
+    recent.push(setKey);
+    if (recent.length >= target) {
+      break;
+    }
+  }
   return recent;
 }
 
@@ -3329,7 +3508,7 @@ async function createStyleBrief(params: {
     "Generate one JSON object only. No markdown.",
     'Schema: {"layout":"...","typography":{"title":"...","subtitle":"...","passage":"..."},"motifs":["..."],"spacing":"...","colorDirection":"...","avoid":["..."]}',
     "Keep guidance concise and practical.",
-    `Lane target: ${laneBriefHint(params.optionIndex)}`,
+    `Lane target: ${laneBriefHint(params.optionIndex, params.directionSpec)}`,
     title ? `Series title: ${title}` : "",
     subtitle ? `Series subtitle: ${subtitle}` : "",
     scripture ? `Scripture passages: ${scripture}` : "",
@@ -4707,15 +4886,30 @@ export async function generateRoundOneAction(
     description: project.series_description,
     designNotes: project.designNotes
   });
-  const recentMotifs = await loadRecentProjectMotifs(project.id);
-  const recentStyleFamilies = await loadRecentStyleFamilies({
-    organizationId: session.organizationId,
-    projectId: project.id,
-    limit: 20
-  });
-  const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
   const hasDesignNotes = hasDesignDirection(project.designNotes, null);
   const explorationMode = !hasDesignNotes;
+  const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys] = await Promise.all([
+    loadRecentProjectMotifs(project.id),
+    loadRecentStyleFamilies({
+      organizationId: session.organizationId,
+      projectId: project.id,
+      limit: 20
+    }),
+    explorationMode
+      ? loadRecentLockupRecipeIds({
+          organizationId: session.organizationId,
+          projectId: project.id,
+          limit: 20
+        })
+      : Promise.resolve([]),
+    explorationMode
+      ? loadRecentExplorationSetKeys({
+          projectId: project.id,
+          limit: 8
+        })
+      : Promise.resolve([])
+  ]);
+  const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
   const bibleCreativeBrief = await extractBibleCreativeBrief({
     title: project.series_title,
     subtitle: project.series_subtitle,
@@ -4726,6 +4920,9 @@ export async function generateRoundOneAction(
   });
   const directionPlan = planDirectionSet({
     runSeed,
+    projectId: project.id,
+    round: 1,
+    explorationSetSeed: `${project.id}|round-1|${runSeed}`,
     enabledPresetKeys: enabledPresets.map((preset) => preset.key),
     optionCount: ROUND_OPTION_COUNT,
     seriesMarkRequested,
@@ -4736,6 +4933,8 @@ export async function generateRoundOneAction(
     recentMotifs,
     recentStyleFamilies,
     recentStyleBuckets,
+    recentExplorationSetKeys,
+    recentRecipeIds,
     explorationMode,
     brandMode: project.brandMode,
     seriesTitle: project.series_title,
@@ -4765,6 +4964,7 @@ export async function generateRoundOneAction(
     lockupPresetIds,
     referencesByOption: refsForOptions,
     forceDistinctRecipes: explorationMode,
+    recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
     brandMode: project.brandMode,
     typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
   });
@@ -4906,15 +5106,30 @@ export async function generateRoundTwoAction(
     description: project.series_description,
     designNotes: project.designNotes || chosenInputSeriesNotes || null
   });
-  const recentMotifs = await loadRecentProjectMotifs(project.id);
-  const recentStyleFamilies = await loadRecentStyleFamilies({
-    organizationId: session.organizationId,
-    projectId: project.id,
-    limit: 20
-  });
-  const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
   const hasDesignNotes = hasDesignDirection(project.designNotes, chosenInputSeriesNotes);
   const explorationMode = !hasDesignNotes;
+  const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys] = await Promise.all([
+    loadRecentProjectMotifs(project.id),
+    loadRecentStyleFamilies({
+      organizationId: session.organizationId,
+      projectId: project.id,
+      limit: 20
+    }),
+    explorationMode
+      ? loadRecentLockupRecipeIds({
+          organizationId: session.organizationId,
+          projectId: project.id,
+          limit: 20
+        })
+      : Promise.resolve([]),
+    explorationMode
+      ? loadRecentExplorationSetKeys({
+          projectId: project.id,
+          limit: 8
+        })
+      : Promise.resolve([])
+  ]);
+  const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
   const bibleCreativeBrief = await extractBibleCreativeBrief({
     title: project.series_title,
     subtitle: project.series_subtitle,
@@ -4925,6 +5140,9 @@ export async function generateRoundTwoAction(
   });
   const directionPlan = planDirectionSet({
     runSeed,
+    projectId: project.id,
+    round,
+    explorationSetSeed: `${project.id}|round-${round}|${runSeed}`,
     enabledPresetKeys: enabledPresets.map((preset) => preset.key),
     optionCount: ROUND_OPTION_COUNT,
     preferredFamilies: preferredDirectionFamiliesForStyleDirection(styleDirection),
@@ -4936,6 +5154,8 @@ export async function generateRoundTwoAction(
     recentMotifs,
     recentStyleFamilies,
     recentStyleBuckets,
+    recentExplorationSetKeys,
+    recentRecipeIds,
     explorationMode,
     brandMode: project.brandMode,
     seriesTitle: project.series_title,
@@ -4969,6 +5189,8 @@ export async function generateRoundTwoAction(
     referencesByOption: refsForOptions,
     keepLayout: chosenLockupLayout,
     forceNewLayout: shouldRequestNewLockupLayout,
+    forceDistinctRecipes: explorationMode,
+    recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
     brandMode: project.brandMode,
     typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
   });

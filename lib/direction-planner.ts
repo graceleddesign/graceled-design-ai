@@ -56,6 +56,8 @@ export type PlannedDirectionSpec = DirectionTemplate & {
   optionLabel: "A" | "B" | "C";
   wantsSeriesMark: boolean;
   wantsTitleStage: boolean;
+  explorationSetKey?: string;
+  explorationLaneKey?: string;
   styleFamily?: StyleFamilyKey;
   styleBucket?: StyleBucketKey;
   styleTone?: StyleToneKey;
@@ -340,10 +342,17 @@ const PLAYFUL_INTENT_KEYWORDS = [
 ] as const;
 
 type ExplorationLane = {
-  id: "A" | "B" | "C";
-  lane: "LIGHT_CLEAN" | "VIVID_PLAYFUL" | "MONO_OR_DARK";
-  allowedTones: readonly StyleToneKey[];
-  preferredMediums: readonly StyleMediumKey[];
+  key: string;
+  toneAllow: readonly StyleToneKey[];
+  mediumAllow: readonly StyleMediumKey[];
+  bucketAllow?: readonly StyleBucketKey[];
+  recipeAllow?: readonly string[];
+  mustBeTextFree: true;
+};
+
+type ExplorationSet = {
+  key: string;
+  lanes: [ExplorationLane, ExplorationLane, ExplorationLane];
 };
 
 type StyleFamilyPick = {
@@ -353,24 +362,181 @@ type StyleFamilyPick = {
   medium: StyleMediumKey;
 };
 
-const EXPLORATION_LANES: readonly ExplorationLane[] = [
+type ExplorationStyleFamilySelection = {
+  picks: StyleFamilyPick[];
+  explorationSetKey?: string;
+  explorationLaneKeys?: string[];
+};
+
+function explorationLane(params: {
+  key: string;
+  toneAllow: readonly StyleToneKey[];
+  mediumAllow: readonly StyleMediumKey[];
+  bucketAllow?: readonly StyleBucketKey[];
+  recipeAllow?: readonly string[];
+}): ExplorationLane {
+  return {
+    ...params,
+    mustBeTextFree: true
+  };
+}
+
+const EXPLORATION_SETS: readonly ExplorationSet[] = [
   {
-    id: "A",
-    lane: "LIGHT_CLEAN",
-    allowedTones: ["light"],
-    preferredMediums: ["photo", "architectural", "typography"]
+    key: "set_light_vivid_dark",
+    lanes: [
+      explorationLane({
+        key: "LIGHT_CLEAN",
+        toneAllow: ["light"],
+        mediumAllow: ["abstract", "typography", "architectural"],
+        bucketAllow: ["atmospheric", "minimal_structural", "editorial_typography", "diagrammatic_systems"],
+        recipeAllow: ["classic_stack", "split_title", "offset_kicker"]
+      }),
+      explorationLane({
+        key: "VIVID_PLAYFUL",
+        toneAllow: ["vivid"],
+        mediumAllow: ["illustration", "abstract", "3d"],
+        bucketAllow: ["playful_pop", "print_engraved"],
+        recipeAllow: ["banner_strip", "split_title", "stepped_baseline"]
+      }),
+      explorationLane({
+        key: "MONO_DARK",
+        toneAllow: ["mono", "dark"],
+        mediumAllow: ["photo", "architectural", "illustration"],
+        bucketAllow: ["atmospheric", "diagrammatic_systems", "print_engraved"],
+        recipeAllow: ["centered_classic", "vertical_spine", "framed_type"]
+      })
+    ]
   },
   {
-    id: "B",
-    lane: "VIVID_PLAYFUL",
-    allowedTones: ["vivid"],
-    preferredMediums: ["illustration", "abstract"]
+    key: "set_editorial_illustration_type",
+    lanes: [
+      explorationLane({
+        key: "EDITORIAL_PHOTO",
+        toneAllow: ["light", "neutral", "dark"],
+        mediumAllow: ["photo", "typography"],
+        bucketAllow: ["atmospheric", "editorial_typography"],
+        recipeAllow: ["classic_stack", "split_title", "offset_kicker"]
+      }),
+      explorationLane({
+        key: "BOLD_ILLUSTRATION",
+        toneAllow: ["vivid"],
+        mediumAllow: ["illustration", "3d"],
+        bucketAllow: ["playful_pop", "print_engraved"],
+        recipeAllow: ["banner_strip", "stepped_baseline", "framed_type"]
+      }),
+      explorationLane({
+        key: "MINIMAL_TYPE",
+        toneAllow: ["light", "neutral"],
+        mediumAllow: ["typography", "abstract"],
+        bucketAllow: ["editorial_typography", "minimal_structural", "atmospheric"],
+        recipeAllow: ["classic_stack", "vertical_spine", "offset_kicker"]
+      })
+    ]
   },
   {
-    id: "C",
-    lane: "MONO_OR_DARK",
-    allowedTones: ["mono", "dark"],
-    preferredMediums: ["photo", "3d", "architectural"]
+    key: "set_structural_pop_grid",
+    lanes: [
+      explorationLane({
+        key: "ARCH_STRUCTURAL",
+        toneAllow: ["mono", "neutral", "dark"],
+        mediumAllow: ["architectural"],
+        bucketAllow: ["diagrammatic_systems"],
+        recipeAllow: ["vertical_spine", "framed_type", "centered_classic"]
+      }),
+      explorationLane({
+        key: "POP_GRADIENT_ABSTRACT",
+        toneAllow: ["vivid", "light"],
+        mediumAllow: ["abstract", "3d", "illustration"],
+        bucketAllow: ["playful_pop", "minimal_structural", "print_engraved"],
+        recipeAllow: ["banner_strip", "split_title", "stepped_baseline"]
+      }),
+      explorationLane({
+        key: "CLEAN_GRID_TYPE",
+        toneAllow: ["light"],
+        mediumAllow: ["typography", "abstract"],
+        bucketAllow: ["editorial_typography", "atmospheric", "minimal_structural"],
+        recipeAllow: ["classic_stack", "split_title", "offset_kicker"]
+      })
+    ]
+  },
+  {
+    key: "set_cinematic_bright_retro",
+    lanes: [
+      explorationLane({
+        key: "CINEMATIC_PHOTO",
+        toneAllow: ["dark"],
+        mediumAllow: ["photo", "illustration"],
+        bucketAllow: ["atmospheric"],
+        recipeAllow: ["split_title", "classic_stack", "framed_type"]
+      }),
+      explorationLane({
+        key: "BRIGHT_MINIMAL",
+        toneAllow: ["light"],
+        mediumAllow: ["abstract", "typography", "architectural"],
+        bucketAllow: ["minimal_structural", "editorial_typography", "atmospheric", "diagrammatic_systems"],
+        recipeAllow: ["classic_stack", "vertical_spine", "offset_kicker"]
+      }),
+      explorationLane({
+        key: "RETRO_PRINT",
+        toneAllow: ["vivid", "neutral", "mono"],
+        mediumAllow: ["illustration", "typography"],
+        bucketAllow: ["print_engraved", "playful_pop"],
+        recipeAllow: ["centered_classic", "banner_strip", "seal_arc"]
+      })
+    ]
+  },
+  {
+    key: "set_mono_colorblock_airy",
+    lanes: [
+      explorationLane({
+        key: "MONO_MINIMAL",
+        toneAllow: ["mono", "dark", "light"],
+        mediumAllow: ["architectural", "abstract", "typography"],
+        bucketAllow: ["diagrammatic_systems", "minimal_structural", "editorial_typography", "atmospheric"],
+        recipeAllow: ["vertical_spine", "centered_classic", "framed_type"]
+      }),
+      explorationLane({
+        key: "COLORBLOCK_TYPE",
+        toneAllow: ["vivid"],
+        mediumAllow: ["abstract", "typography", "illustration"],
+        bucketAllow: ["playful_pop", "minimal_structural", "editorial_typography", "print_engraved"],
+        recipeAllow: ["banner_strip", "split_title", "offset_kicker"]
+      }),
+      explorationLane({
+        key: "AIRY_PHOTO",
+        toneAllow: ["light", "dark"],
+        mediumAllow: ["photo", "abstract", "illustration"],
+        bucketAllow: ["atmospheric", "minimal_structural"],
+        recipeAllow: ["classic_stack", "split_title", "offset_kicker"]
+      })
+    ]
+  },
+  {
+    key: "set_modern_type_cinematic",
+    lanes: [
+      explorationLane({
+        key: "MODERN_MINIMAL",
+        toneAllow: ["light", "neutral"],
+        mediumAllow: ["abstract", "typography", "architectural"],
+        bucketAllow: ["minimal_structural", "editorial_typography", "diagrammatic_systems", "atmospheric"],
+        recipeAllow: ["classic_stack", "vertical_spine", "offset_kicker"]
+      }),
+      explorationLane({
+        key: "EXPERIMENTAL_TYPOGRAPHY",
+        toneAllow: ["vivid", "light", "neutral"],
+        mediumAllow: ["typography", "illustration", "abstract"],
+        bucketAllow: ["editorial_typography", "playful_pop", "print_engraved", "minimal_structural"],
+        recipeAllow: ["split_title", "stepped_baseline", "framed_type"]
+      }),
+      explorationLane({
+        key: "CINEMATIC_PHOTO_DARK",
+        toneAllow: ["dark"],
+        mediumAllow: ["photo", "architectural"],
+        bucketAllow: ["atmospheric", "diagrammatic_systems"],
+        recipeAllow: ["classic_stack", "split_title", "vertical_spine"]
+      })
+    ]
   }
 ];
 
@@ -612,8 +778,44 @@ function normalizeRecentStyleBuckets(recentStyleBuckets?: readonly StyleBucketKe
   return normalized;
 }
 
-function explorationLaneForIndex(optionIndex: number): ExplorationLane {
-  return EXPLORATION_LANES[optionIndex] || EXPLORATION_LANES[EXPLORATION_LANES.length - 1];
+function normalizeRecentExplorationSetKeys(recentExplorationSetKeys?: readonly string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const key of recentExplorationSetKeys || []) {
+    const trimmed = typeof key === "string" ? key.trim() : "";
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function normalizeRecentRecipeIds(recentRecipeIds?: readonly string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const id of recentRecipeIds || []) {
+    const trimmed = typeof id === "string" ? id.trim() : "";
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function recencyPenalty(params: {
+  rank: number | undefined;
+  newestPenalty: number;
+  slope?: number;
+  freshBonus?: number;
+}): number {
+  if (params.rank === undefined) {
+    return params.freshBonus || 0;
+  }
+  return Math.min(0, -params.newestPenalty + params.rank * (params.slope ?? 1));
 }
 
 function hasLightOrVividTone(picks: readonly StyleFamilyPick[]): boolean {
@@ -630,8 +832,112 @@ function toStyleFamilyPick(family: StyleFamilyKey): StyleFamilyPick {
   };
 }
 
+function laneMatchesFamily(params: {
+  lane: ExplorationLane;
+  family: StyleFamilyKey;
+  heroOnly: boolean;
+}): boolean {
+  const record = STYLE_FAMILY_BANK[params.family];
+  if (params.heroOnly && record.explorationTier !== "hero") {
+    return false;
+  }
+  if (!params.lane.toneAllow.includes(record.tone)) {
+    return false;
+  }
+  if (!params.lane.mediumAllow.includes(record.medium)) {
+    return false;
+  }
+  if (params.lane.bucketAllow && !params.lane.bucketAllow.includes(record.bucket)) {
+    return false;
+  }
+  if (params.lane.mustBeTextFree && !record.backgroundMustBeTextFree) {
+    return false;
+  }
+  return true;
+}
+
+function lanesAreHeroSatisfiable(params: {
+  lanes: readonly ExplorationLane[];
+  seededOrder: readonly StyleFamilyKey[];
+}): boolean {
+  if (params.lanes.length <= 0) {
+    return true;
+  }
+
+  const laneCandidates = params.lanes.map((lane) =>
+    params.seededOrder.filter((family) =>
+      laneMatchesFamily({
+        lane,
+        family,
+        heroOnly: true
+      })
+    )
+  );
+
+  if (laneCandidates.some((candidates) => candidates.length === 0)) {
+    return false;
+  }
+
+  const used = new Set<StyleFamilyKey>();
+
+  const backtrack = (laneIndex: number): boolean => {
+    if (laneIndex >= laneCandidates.length) {
+      return true;
+    }
+
+    for (const family of laneCandidates[laneIndex]) {
+      if (used.has(family)) {
+        continue;
+      }
+      used.add(family);
+      if (backtrack(laneIndex + 1)) {
+        return true;
+      }
+      used.delete(family);
+    }
+    return false;
+  };
+
+  return backtrack(0);
+}
+
+function explorationSetNoveltyScore(params: {
+  set: ExplorationSet;
+  recentSetRanks: Map<string, number>;
+  recentRecipeRanks: Map<string, number>;
+  runSeed: string;
+}): number {
+  let score = 0;
+  score += recencyPenalty({
+    rank: params.recentSetRanks.get(params.set.key),
+    newestPenalty: 12,
+    slope: 2,
+    freshBonus: 7
+  });
+
+  for (const lane of params.set.lanes) {
+    if (!lane.recipeAllow || lane.recipeAllow.length === 0) {
+      continue;
+    }
+    const laneBestRecipeScore = lane.recipeAllow.reduce((best, recipeId) => {
+      const recipeScore = recencyPenalty({
+        rank: params.recentRecipeRanks.get(recipeId),
+        newestPenalty: 6,
+        slope: 1,
+        freshBonus: 3
+      });
+      return Math.max(best, recipeScore);
+    }, -3);
+    score += laneBestRecipeScore;
+  }
+
+  score += (hashToSeed(`${params.runSeed}|exploration-set-score|${params.set.key}`) / 0xffffffff) * 4;
+  return score;
+}
+
 function pickExplorationStyleFamilies(params: {
   runSeed: string;
+  explorationSeed: string;
   seededOrder: readonly StyleFamilyKey[];
   specs: readonly {
     laneFamily: DirectionLaneFamily;
@@ -640,74 +946,136 @@ function pickExplorationStyleFamilies(params: {
   }[];
   recentBuckets: Set<StyleBucketKey>;
   recentRanks: Map<StyleFamilyKey, number>;
+  recentExplorationSetRanks: Map<string, number>;
+  recentRecipeRanks: Map<string, number>;
   preferredLaneFamilies: Set<DirectionLaneFamily>;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
-}): StyleFamilyPick[] | null {
+}): ExplorationStyleFamilySelection | null {
   const count = params.specs.length;
   if (count <= 0) {
-    return [];
+    return {
+      picks: []
+    };
   }
 
-  const picks: StyleFamilyPick[] = [];
-  const usedFamilies = new Set<StyleFamilyKey>();
-  const usedBuckets = new Set<StyleBucketKey>();
-
-  const pickForLane = (optionIndex: number, allowSupportFallback: boolean): StyleFamilyPick | null => {
-    const lane = explorationLaneForIndex(optionIndex);
-    const spec = params.specs[optionIndex];
-    const candidates = params.seededOrder
-      .filter((family) => {
-        if (usedFamilies.has(family)) {
-          return false;
-        }
-        const record = STYLE_FAMILY_BANK[family];
-        if (!lane.allowedTones.includes(record.tone)) {
-          return false;
-        }
-        if (!allowSupportFallback && record.explorationTier !== "hero") {
-          return false;
-        }
-        return true;
-      })
-      .map((family) => {
-        const record = STYLE_FAMILY_BANK[family];
-        let score = styleFamilyScore({
-          family,
-          spec,
-          recentRanks: params.recentRanks,
-          preferredLaneFamilies: params.preferredLaneFamilies,
-          brandMode: params.brandMode,
-          playfulIntent: params.playfulIntent
-        });
-        score += lane.preferredMediums.includes(record.medium) ? 9 : -2;
-        score += usedBuckets.has(record.bucket) ? -2 : 2;
-        score += params.recentBuckets.has(record.bucket) ? -1 : 1;
-        score += record.explorationTier === "hero" ? 2 : 0;
-        score += record.backgroundRefHasTypographyRisk ? -1 : 1;
-        score += hashToSeed(`${params.runSeed}|exploration-lane|${optionIndex}|${lane.lane}|${family}`) / 0xffffffff;
-
-        return {
-          pick: toStyleFamilyPick(family),
-          score
-        };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    return candidates[0]?.pick || null;
-  };
-
-  for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
-    const selected = pickForLane(optionIndex, false) || pickForLane(optionIndex, true);
-    if (!selected) {
+  const evaluateSet = (set: ExplorationSet): {
+    picks: StyleFamilyPick[];
+    laneKeys: string[];
+    score: number;
+  } | null => {
+    const shuffledLanes = createSeededRandom(`${params.explorationSeed}|${set.key}|lane-order`).shuffle(set.lanes).slice(0, count);
+    if (!lanesAreHeroSatisfiable({ lanes: shuffledLanes, seededOrder: params.seededOrder })) {
       return null;
     }
-    picks.push(selected);
-    usedFamilies.add(selected.family);
-    usedBuckets.add(selected.bucket);
+
+    const picks: StyleFamilyPick[] = [];
+    const usedFamilies = new Set<StyleFamilyKey>();
+    const usedBuckets = new Set<StyleBucketKey>();
+    let score = explorationSetNoveltyScore({
+      set,
+      recentSetRanks: params.recentExplorationSetRanks,
+      recentRecipeRanks: params.recentRecipeRanks,
+      runSeed: params.runSeed
+    });
+
+    for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
+      const lane = shuffledLanes[optionIndex];
+      const spec = params.specs[optionIndex];
+      const candidates = params.seededOrder
+        .filter((family) => {
+          if (usedFamilies.has(family)) {
+            return false;
+          }
+          return laneMatchesFamily({
+            lane,
+            family,
+            heroOnly: true
+          });
+        })
+        .map((family) => {
+          const record = STYLE_FAMILY_BANK[family];
+          let laneScore = styleFamilyScore({
+            family,
+            spec,
+            recentRanks: params.recentRanks,
+            preferredLaneFamilies: params.preferredLaneFamilies,
+            brandMode: params.brandMode,
+            playfulIntent: params.playfulIntent
+          });
+          laneScore += usedBuckets.has(record.bucket) ? -4 : 4;
+          laneScore += recencyPenalty({
+            rank: params.recentRanks.get(family),
+            newestPenalty: 10,
+            slope: 1,
+            freshBonus: 5
+          });
+          laneScore += params.recentBuckets.has(record.bucket) ? -2 : 2;
+          laneScore += record.backgroundRefHasTypographyRisk ? -1 : 1;
+          if (lane.recipeAllow && lane.recipeAllow.length > 0) {
+            const bestRecipeScore = lane.recipeAllow.reduce((best, recipeId) => {
+              const recipeScore = recencyPenalty({
+                rank: params.recentRecipeRanks.get(recipeId),
+                newestPenalty: 6,
+                slope: 1,
+                freshBonus: 2
+              });
+              return Math.max(best, recipeScore);
+            }, -2);
+            laneScore += bestRecipeScore;
+          }
+          laneScore += hashToSeed(`${params.runSeed}|exploration-family|${set.key}|${optionIndex}|${lane.key}|${family}`) / 0xffffffff;
+          return {
+            pick: toStyleFamilyPick(family),
+            score: laneScore
+          };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      const selected = candidates[0];
+      if (!selected) {
+        return null;
+      }
+      picks.push(selected.pick);
+      usedFamilies.add(selected.pick.family);
+      usedBuckets.add(selected.pick.bucket);
+      score += selected.score;
+    }
+
+    if (!hasLightOrVividTone(picks)) {
+      return null;
+    }
+
+    score += new Set(picks.map((pick) => pick.bucket)).size * 2;
+    score += new Set(picks.map((pick) => pick.medium)).size * 1.5;
+    score += new Set(picks.map((pick) => pick.tone)).size;
+
+    return {
+      picks,
+      laneKeys: shuffledLanes.map((lane) => lane.key),
+      score
+    };
+  };
+
+  const scoredSets = EXPLORATION_SETS.map((set) => ({
+    set,
+    result: evaluateSet(set)
+  }))
+    .filter((entry): entry is { set: ExplorationSet; result: { picks: StyleFamilyPick[]; laneKeys: string[]; score: number } } =>
+      Boolean(entry.result)
+    )
+    .sort((a, b) => b.result.score - a.result.score);
+
+  const best = scoredSets[0];
+  if (!best) {
+    return null;
   }
 
-  return picks;
+  return {
+    picks: best.result.picks,
+    explorationSetKey: best.set.key,
+    explorationLaneKeys: best.result.laneKeys
+  };
 }
 
 function styleFamilyScore(params: {
@@ -774,6 +1142,7 @@ function styleFamilyScore(params: {
 
 function assignStyleFamilies(params: {
   runSeed: string;
+  explorationSeed: string;
   specs: readonly {
     laneFamily: DirectionLaneFamily;
     wantsSeriesMark: boolean;
@@ -782,24 +1151,33 @@ function assignStyleFamilies(params: {
   preferredLaneFamilies?: readonly DirectionLaneFamily[];
   recentStyleFamilies?: readonly StyleFamilyKey[];
   recentStyleBuckets?: readonly StyleBucketKey[];
+  recentExplorationSetKeys?: readonly string[];
+  recentRecipeIds?: readonly string[];
   explorationMode?: boolean;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
-}): StyleFamilyPick[] {
+}): ExplorationStyleFamilySelection {
   const seededOrder = createSeededRandom(`${params.runSeed}|style-family-order`).shuffle(STYLE_FAMILY_KEYS);
   const orderIndex = new Map(seededOrder.map((family, index) => [family, index] as const));
   const recentStyleFamilyOrder = normalizeRecentStyleFamilies(params.recentStyleFamilies);
   const recentRanks = new Map(recentStyleFamilyOrder.map((family, index) => [family, index] as const));
   const recentBuckets = new Set(normalizeRecentStyleBuckets(params.recentStyleBuckets));
+  const recentExplorationSetOrder = normalizeRecentExplorationSetKeys(params.recentExplorationSetKeys);
+  const recentRecipeOrder = normalizeRecentRecipeIds(params.recentRecipeIds);
+  const recentExplorationSetRanks = new Map(recentExplorationSetOrder.map((setKey, index) => [setKey, index] as const));
+  const recentRecipeRanks = new Map(recentRecipeOrder.map((recipeId, index) => [recipeId, index] as const));
   const preferredLaneFamilies = new Set(params.preferredLaneFamilies || []);
 
   if (params.explorationMode) {
     const explorationPicks = pickExplorationStyleFamilies({
       runSeed: params.runSeed,
+      explorationSeed: params.explorationSeed,
       seededOrder,
       specs: params.specs,
       recentBuckets,
       recentRanks,
+      recentExplorationSetRanks,
+      recentRecipeRanks,
       preferredLaneFamilies,
       brandMode: params.brandMode,
       playfulIntent: params.playfulIntent
@@ -952,7 +1330,9 @@ function assignStyleFamilies(params: {
     }
   }
 
-  return picks;
+  return {
+    picks
+  };
 }
 
 export function getDirectionTemplateCatalog(): readonly DirectionTemplate[] {
@@ -1260,6 +1640,9 @@ function assignMotifFocuses(params: {
 
 export function planDirectionSet(params: {
   runSeed: string;
+  projectId?: string;
+  round?: number;
+  explorationSetSeed?: string;
   enabledPresetKeys: readonly string[];
   optionCount?: number;
   preferredFamilies?: readonly DirectionLaneFamily[];
@@ -1271,6 +1654,8 @@ export function planDirectionSet(params: {
   recentMotifs?: readonly string[];
   recentStyleFamilies?: readonly StyleFamilyKey[];
   recentStyleBuckets?: readonly StyleBucketKey[];
+  recentExplorationSetKeys?: readonly string[];
+  recentRecipeIds?: readonly string[];
   explorationMode?: boolean;
   brandMode?: "brand" | "fresh";
   seriesTitle?: string | null;
@@ -1286,6 +1671,12 @@ export function planDirectionSet(params: {
 }): PlannedDirectionSpec[] {
   const count = Math.max(1, Math.min(params.optionCount || 3, 3));
   const runSeed = params.runSeed.trim() || "run-seed";
+  const explorationSeed =
+    params.explorationSetSeed?.trim() ||
+    [params.projectId?.trim() || "", typeof params.round === "number" ? `round-${params.round}` : "", runSeed]
+      .filter(Boolean)
+      .join("|") ||
+    runSeed;
   const rng = createSeededRandom(runSeed);
   const enabledPresetKeys = new Set(
     params.enabledPresetKeys
@@ -1359,10 +1750,13 @@ export function planDirectionSet(params: {
 
   const styleFamilies = assignStyleFamilies({
     runSeed,
+    explorationSeed,
     specs: baseSpecs,
     preferredLaneFamilies: params.preferredFamilies,
     recentStyleFamilies: params.recentStyleFamilies,
     recentStyleBuckets: params.recentStyleBuckets,
+    recentExplorationSetKeys: params.recentExplorationSetKeys,
+    recentRecipeIds: params.recentRecipeIds,
     explorationMode: params.explorationMode === true,
     brandMode: params.brandMode === "brand" ? "brand" : "fresh",
     playfulIntent
@@ -1384,10 +1778,12 @@ export function planDirectionSet(params: {
 
   return baseSpecs.map((spec, optionIndex) => ({
     ...spec,
-    styleFamily: styleFamilies[optionIndex]?.family,
-    styleBucket: styleFamilies[optionIndex]?.bucket,
-    styleTone: styleFamilies[optionIndex]?.tone,
-    styleMedium: styleFamilies[optionIndex]?.medium,
+    explorationSetKey: styleFamilies.explorationSetKey,
+    explorationLaneKey: styleFamilies.explorationLaneKeys?.[optionIndex],
+    styleFamily: styleFamilies.picks[optionIndex]?.family,
+    styleBucket: styleFamilies.picks[optionIndex]?.bucket,
+    styleTone: styleFamilies.picks[optionIndex]?.tone,
+    styleMedium: styleFamilies.picks[optionIndex]?.medium,
     motifFocus: motifFocusByDirection[optionIndex] || [],
     motifScope: params.motifScope
   }));
