@@ -43,6 +43,11 @@ import {
   type ReferenceLibraryItem
 } from "@/lib/referenceLibrary";
 import { normalizeStyleDirection, type StyleDirection } from "@/lib/style-direction";
+import {
+  isStyleFamilyKey,
+  STYLE_FAMILY_BANK,
+  type StyleFamilyKey
+} from "@/lib/style-family-bank";
 import { buildBackgroundPrompt, renderTemplate, type TemplateBrief } from "@/lib/templates";
 import {
   buildCleanMinimalOverlaySvg,
@@ -163,6 +168,8 @@ const LOCKUP_LAYOUT_ARCHETYPES = [
 ] as const;
 type LockupLayoutArchetype = (typeof LOCKUP_LAYOUT_ARCHETYPES)[number];
 const LOCKUP_LAYOUT_ARCHETYPE_SET = new Set<string>(LOCKUP_LAYOUT_ARCHETYPES);
+const DIRECTION_LANE_FAMILIES = ["premium_modern", "editorial", "minimal", "photo_centric", "retro"] as const;
+const DIRECTION_LANE_FAMILY_SET = new Set<string>(DIRECTION_LANE_FAMILIES);
 const LOCKUP_LAYOUT_PREFERRED_BY_STYLE_MODE: Record<LockupStyleMode, readonly LockupLayoutArchetype[]> = {
   engraved_stamp: ["seal_arc", "centered_classic", "monogram_mark", "banner_strip", "stepped_baseline"],
   modern_editorial: ["editorial_stack", "split_title", "vertical_spine", "framed_type", "offset_kicker"]
@@ -612,6 +619,7 @@ function resolveLockupStyleMode(params: {
   const preset = (params.lockupPresetId || "").toLowerCase();
   const directionText = [
     params.directionSpec?.styleFamily || "",
+    params.directionSpec?.laneFamily || "",
     params.directionSpec?.compositionType || "",
     params.directionSpec?.backgroundMode || "",
     params.directionSpec?.lanePrompt || ""
@@ -636,6 +644,10 @@ function chooseLockupIntegrationMode(styleMode: LockupStyleMode): LockupIntegrat
 
 function isLockupLayoutArchetype(value: unknown): value is LockupLayoutArchetype {
   return typeof value === "string" && LOCKUP_LAYOUT_ARCHETYPE_SET.has(value);
+}
+
+function isDirectionLaneFamily(value: unknown): value is DirectionStyleFamily {
+  return typeof value === "string" && DIRECTION_LANE_FAMILY_SET.has(value);
 }
 
 function hashForDeterministicOrdering(seed: string, value: string): string {
@@ -751,6 +763,47 @@ function resolvePlannedLockupLayouts(params: {
   });
 }
 
+const STYLE_FAMILY_LOCKUP_LAYOUT_BIAS: Partial<Record<StyleFamilyKey, readonly LockupLayoutArchetype[]>> = {
+  modern_geometric_blocks: ["editorial_stack", "split_title", "framed_type", "offset_kicker"],
+  abstract_organic_papercut: ["centered_classic", "editorial_stack", "stepped_baseline"],
+  editorial_grid_minimal: ["editorial_stack", "split_title", "vertical_spine", "offset_kicker"],
+  typographic_only_statement: ["editorial_stack", "split_title", "stepped_baseline", "vertical_spine"],
+  monoline_icon_system: ["monogram_mark", "editorial_stack", "centered_classic", "banner_strip"],
+  blueprint_diagram: ["vertical_spine", "framed_type", "editorial_stack", "monogram_mark"],
+  light_gradient_stage: ["editorial_stack", "split_title", "offset_kicker"],
+  engraved_heritage: ["seal_arc", "centered_classic", "monogram_mark", "banner_strip"],
+  emblem_seal_system: ["monogram_mark", "seal_arc", "centered_classic", "banner_strip"]
+};
+
+const PLAYFUL_STYLE_FAMILY_KEYS = new Set<StyleFamilyKey>([
+  "playful_neon_pool",
+  "comic_storyboard",
+  "bubbly_3d_clay",
+  "sticker_pack_pop",
+  "paper_cut_collage_playful"
+]);
+
+function resolveDirectionStyleFamily(directionSpec?: PlannedDirectionSpec | null): {
+  key: StyleFamilyKey;
+  name: string;
+  backgroundRules: string[];
+  lockupRules: string[];
+  forbids: string[];
+} | null {
+  const styleFamily = directionSpec?.styleFamily;
+  if (!isStyleFamilyKey(styleFamily)) {
+    return null;
+  }
+  const family = STYLE_FAMILY_BANK[styleFamily];
+  return {
+    key: styleFamily,
+    name: family.name,
+    backgroundRules: family.backgroundRules,
+    lockupRules: family.lockupRules,
+    forbids: family.forbids
+  };
+}
+
 function buildLockupGenerationPrompt(params: {
   title: string;
   subtitle: string;
@@ -767,9 +820,23 @@ function buildLockupGenerationPrompt(params: {
   const subtitleLine = params.subtitle
     ? `Series subtitle (must be secondary): ${truncateForPrompt(params.subtitle, 140)}`
     : "Series subtitle: none (render only the title).";
+  const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionLine = params.directionSpec
-    ? `Direction context: ${params.directionSpec.styleFamily} / ${params.directionSpec.compositionType} / ${params.directionSpec.backgroundMode}.`
+    ? `Direction context: ${params.directionSpec.styleFamily || "unassigned"} / ${params.directionSpec.laneFamily} / ${
+        params.directionSpec.compositionType
+      } / ${params.directionSpec.backgroundMode}.`
     : "";
+  const styleFamilyLockupRulesLine = styleFamily
+    ? `Style family: ${styleFamily.name}. Lockup rules: ${styleFamily.lockupRules.join(" ")}`
+    : "";
+  const styleFamilyForbidsLine = styleFamily ? `Style family forbids: ${styleFamily.forbids.join("; ")}.` : "";
+  const compatibleLayouts = styleFamily ? STYLE_FAMILY_LOCKUP_LAYOUT_BIAS[styleFamily.key] : null;
+  const styleFamilyLayoutBiasLine =
+    styleFamily && compatibleLayouts && !compatibleLayouts.includes(params.lockupLayout)
+      ? `Style family/layout bias note: keep ${params.lockupLayout} authoritative, but use ${styleFamily.name} detailing with restraint because this family usually fits ${compatibleLayouts.join(
+          ", "
+        )}.`
+      : "";
   const referenceTags = summarizeReferenceTags(params.references);
   const referenceLine = referenceTags
     ? `Style reference tags: ${referenceTags}.`
@@ -826,6 +893,9 @@ function buildLockupGenerationPrompt(params: {
     `Series title (required): ${truncateForPrompt(params.title, 140)}`,
     subtitleLine,
     directionLine,
+    styleFamilyLockupRulesLine,
+    styleFamilyForbidsLine,
+    styleFamilyLayoutBiasLine,
     referenceLine,
     styleSpecificLine,
     archetypeLine,
@@ -1076,6 +1146,7 @@ type ReusableGenerationAssets = {
   sourceGenerationId: string;
   masterBackgroundPng: Buffer | null;
   lockupPng: Buffer | null;
+  styleFamily: StyleFamilyKey | null;
 };
 
 function pickAssetPathBySlots(
@@ -1115,6 +1186,7 @@ async function loadReusableAssetsFromGeneration(params: {
     },
     select: {
       id: true,
+      output: true,
       assets: {
         select: {
           kind: true,
@@ -1146,7 +1218,8 @@ async function loadReusableAssetsFromGeneration(params: {
   return {
     sourceGenerationId: generation.id,
     masterBackgroundPng,
-    lockupPng
+    lockupPng,
+    styleFamily: readStyleFamilyFromGenerationOutput(generation.output)
   };
 }
 
@@ -1237,6 +1310,29 @@ function readMotifFocusFromGenerationOutput(output: unknown): string[] {
   return safeArrayOfStrings((designSpec as { motifFocus?: unknown }).motifFocus, []);
 }
 
+function readStyleFamilyFromGenerationOutput(output: unknown): StyleFamilyKey | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+  const directStyleFamily = (designSpec as { styleFamily?: unknown }).styleFamily;
+  if (isStyleFamilyKey(directStyleFamily)) {
+    return directStyleFamily;
+  }
+  const nestedDirectionSpec = (designSpec as { directionSpec?: { styleFamily?: unknown } | null }).directionSpec;
+  if (nestedDirectionSpec && isStyleFamilyKey(nestedDirectionSpec.styleFamily)) {
+    return nestedDirectionSpec.styleFamily;
+  }
+  return null;
+}
+
 async function loadRecentProjectMotifs(projectId: string): Promise<string[]> {
   const recentGenerations = await prisma.generation.findMany({
     where: {
@@ -1272,6 +1368,59 @@ async function loadRecentProjectMotifs(projectId: string): Promise<string[]> {
   }
 
   return [...recent];
+}
+
+async function loadRecentStyleFamilies(params: {
+  organizationId: string;
+  projectId: string;
+  limit?: number;
+}): Promise<StyleFamilyKey[]> {
+  const target = Math.max(1, Math.min(params.limit || 20, 40));
+  const [projectGenerations, organizationGenerations] = await Promise.all([
+    prisma.generation.findMany({
+      where: {
+        projectId: params.projectId
+      },
+      orderBy: [{ round: "desc" }, { createdAt: "desc" }],
+      take: 24,
+      select: {
+        output: true
+      }
+    }),
+    prisma.generation.findMany({
+      where: {
+        project: {
+          organizationId: params.organizationId,
+          id: {
+            not: params.projectId
+          }
+        }
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: 60,
+      select: {
+        output: true
+      }
+    })
+  ]);
+
+  const ordered = [...projectGenerations, ...organizationGenerations];
+  const seen = new Set<StyleFamilyKey>();
+  const recent: StyleFamilyKey[] = [];
+
+  for (const generation of ordered) {
+    const styleFamily = readStyleFamilyFromGenerationOutput(generation.output);
+    if (!styleFamily || seen.has(styleFamily)) {
+      continue;
+    }
+    seen.add(styleFamily);
+    recent.push(styleFamily);
+    if (recent.length >= target) {
+      break;
+    }
+  }
+
+  return recent;
 }
 
 function fallbackStyleBrief(optionIndex: number, palette: string[]): StyleBrief {
@@ -1835,6 +1984,7 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     });
   }
   const fallbackDesignSpec: Record<string, unknown> = {
+    styleFamily: directionSpec?.styleFamily || null,
     wantsTitleStage,
     wantsSeriesMark: directionSpec?.wantsSeriesMark === true,
     motifFocus: directionSpec?.motifFocus || [],
@@ -2011,10 +2161,16 @@ function readDirectionSpecFromInput(input: unknown, optionIndex: number): Planne
   }
 
   const parsed = candidate as Partial<PlannedDirectionSpec>;
+  const legacyLaneCandidate = (candidate as { styleFamily?: unknown }).styleFamily;
+  const laneFamilyCandidate = isDirectionLaneFamily(parsed.laneFamily)
+    ? parsed.laneFamily
+    : isDirectionLaneFamily(legacyLaneCandidate)
+      ? legacyLaneCandidate
+      : null;
   if (
     typeof parsed.presetKey !== "string" ||
     typeof parsed.lockupPresetId !== "string" ||
-    typeof parsed.styleFamily !== "string" ||
+    !laneFamilyCandidate ||
     typeof parsed.compositionType !== "string" ||
     typeof parsed.backgroundMode !== "string" ||
     typeof parsed.typeProfile !== "string" ||
@@ -2029,8 +2185,10 @@ function readDirectionSpecFromInput(input: unknown, optionIndex: number): Planne
     ...(candidate as PlannedDirectionSpec),
     optionIndex,
     optionLabel: optionLane(optionIndex),
+    laneFamily: laneFamilyCandidate,
     wantsSeriesMark: parsed.wantsSeriesMark === true,
     wantsTitleStage: parsed.wantsTitleStage === true,
+    styleFamily: isStyleFamilyKey(parsed.styleFamily) ? parsed.styleFamily : undefined,
     motifFocus: safeArrayOfStrings(parsed.motifFocus, []).slice(0, 2)
   };
 }
@@ -2274,9 +2432,11 @@ function buildTemplateBackgroundPrompt(params: {
   brandPaletteHardConstraint?: string;
   paletteComplianceBoost?: string;
 }): string {
+  const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionHint = params.directionSpec
     ? [
-        `Direction family: ${params.directionSpec.styleFamily}.`,
+        `Direction family: ${params.directionSpec.styleFamily || "unassigned"}.`,
+        `Direction lane: ${params.directionSpec.laneFamily}.`,
         `Composition: ${params.directionSpec.compositionType}.`,
         `Background mode: ${params.directionSpec.backgroundMode}.`,
         `Type profile: ${params.directionSpec.typeProfile}.`,
@@ -2284,6 +2444,14 @@ function buildTemplateBackgroundPrompt(params: {
         params.directionSpec.lanePrompt
       ].join(" ")
     : "";
+  const styleFamilyBackgroundRulesLine = styleFamily
+    ? `Style family: ${styleFamily.name}. Follow these rules strongly: ${styleFamily.backgroundRules.join(" ")}`
+    : "";
+  const styleFamilyForbidsLine = styleFamily ? `Style family forbids: ${styleFamily.forbids.join("; ")}.` : "";
+  const playfulBrandModeLine =
+    params.brandMode === "brand" && styleFamily && PLAYFUL_STYLE_FAMILY_KEYS.has(styleFamily.key)
+      ? "If brand mode, express playfulness via shapes/composition/texture only; DO NOT introduce forbidden hues."
+      : "";
   // Bible creative brief fields are used as symbolic visual guidance for background generation.
   const bibleSummaryLine = params.bibleCreativeBrief ? `Bible brief summary: ${params.bibleCreativeBrief.summary}` : "";
   const bibleThemeLine =
@@ -2322,6 +2490,9 @@ function buildTemplateBackgroundPrompt(params: {
   return [
     buildBackgroundPrompt(params.brief, params.styleFamily),
     directionHint,
+    styleFamilyBackgroundRulesLine,
+    styleFamilyForbidsLine,
+    playfulBrandModeLine,
     bibleSummaryLine,
     bibleThemeLine,
     bibleMotifLine,
@@ -2750,6 +2921,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const shouldReuseBackground =
         feedbackControls.regenerateBackground === false && Boolean(reusableAssets?.masterBackgroundPng);
       const shouldReuseLockup = feedbackControls.regenerateLockup === false && Boolean(reusableAssets?.lockupPng);
+      const effectiveDirectionStyleFamily =
+        (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleFamily
+          ? reusableAssets.styleFamily
+          : directionSpec?.styleFamily;
       const lockupRecipeForRender = shouldReuseLockup
         ? sourceLockupRecipe
         : applyLockupRecipeGuardrails({
@@ -2965,8 +3140,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const promptUsed = [
         `master(${OPTION_MASTER_BACKGROUND_SHAPE}): ${masterAttempt.prompt}`,
         directionSpec
-          ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily} / ${directionSpec.compositionType}]`
+          ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily || "unassigned"} / ${directionSpec.laneFamily} / ${directionSpec.compositionType}]`
           : "",
+        effectiveDirectionStyleFamily ? `[style-family: ${effectiveDirectionStyleFamily}]` : "",
         shouldReuseBackground && reusableAssets ? `[reuse: background from ${reusableAssets.sourceGenerationId}]` : "",
         shouldReuseLockup && reusableAssets ? `[reuse: lockup from ${reusableAssets.sourceGenerationId}]` : "",
         `[lockup-style-mode: ${lockupStyleMode}]`,
@@ -3044,6 +3220,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             directionSpec,
             templateStyleFamily: optionStyleFamily,
             styleFamilies: designBrief.styleFamilies,
+            styleFamily: effectiveDirectionStyleFamily || null,
             lockupPresetId,
             lockupLayout,
             wantsTitleStage: directionSpec?.wantsTitleStage === true,
@@ -3311,6 +3488,11 @@ export async function generateRoundOneAction(
     designNotes: project.designNotes
   });
   const recentMotifs = await loadRecentProjectMotifs(project.id);
+  const recentStyleFamilies = await loadRecentStyleFamilies({
+    organizationId: session.organizationId,
+    projectId: project.id,
+    limit: 20
+  });
   const bibleCreativeBrief = await extractBibleCreativeBrief({
     title: project.series_title,
     subtitle: project.series_subtitle,
@@ -3324,10 +3506,18 @@ export async function generateRoundOneAction(
     enabledPresetKeys: enabledPresets.map((preset) => preset.key),
     optionCount: ROUND_OPTION_COUNT,
     seriesMarkRequested,
+    wantsSeriesMarkLane: seriesMarkRequested,
     motifs: bibleCreativeBrief.motifs,
     allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
     markIdeas: bibleCreativeBrief.markIdeas,
-    recentMotifs
+    recentMotifs,
+    recentStyleFamilies,
+    brandMode: project.brandMode,
+    seriesTitle: project.series_title,
+    seriesSubtitle: project.series_subtitle,
+    seriesDescription: project.series_description,
+    designNotes: project.designNotes,
+    topicNames: motifBankContext.topicNames
   });
   const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
   const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
@@ -3486,6 +3676,11 @@ export async function generateRoundTwoAction(
     designNotes: project.designNotes || chosenInputSeriesNotes || null
   });
   const recentMotifs = await loadRecentProjectMotifs(project.id);
+  const recentStyleFamilies = await loadRecentStyleFamilies({
+    organizationId: session.organizationId,
+    projectId: project.id,
+    limit: 20
+  });
   const bibleCreativeBrief = await extractBibleCreativeBrief({
     title: project.series_title,
     subtitle: project.series_subtitle,
@@ -3500,10 +3695,18 @@ export async function generateRoundTwoAction(
     optionCount: ROUND_OPTION_COUNT,
     preferredFamilies: preferredDirectionFamiliesForStyleDirection(styleDirection),
     seriesMarkRequested,
+    wantsSeriesMarkLane: seriesMarkRequested,
     motifs: bibleCreativeBrief.motifs,
     allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
     markIdeas: bibleCreativeBrief.markIdeas,
-    recentMotifs
+    recentMotifs,
+    recentStyleFamilies,
+    brandMode: project.brandMode,
+    seriesTitle: project.series_title,
+    seriesSubtitle: project.series_subtitle,
+    seriesDescription: project.series_description,
+    designNotes: project.designNotes || chosenInputSeriesNotes || null,
+    topicNames: motifBankContext.topicNames
   });
   const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
   const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
