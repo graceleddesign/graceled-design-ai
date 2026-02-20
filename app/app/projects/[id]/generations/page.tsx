@@ -5,6 +5,13 @@ import { DirectionOptionCard } from "@/components/direction-option-card";
 import { requireSession } from "@/lib/auth";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
+import {
+  isStyleBucketKey,
+  isStyleFamilyKey,
+  isStyleMediumKey,
+  isStyleToneKey,
+  STYLE_FAMILY_BANK
+} from "@/lib/style-family-bank";
 
 type PreviewFields = {
   square: string;
@@ -21,6 +28,11 @@ type GenerationAssetRecord = {
 type OptionDesignSpecSummary = {
   wantsTitleStage: boolean;
   wantsSeriesMark: boolean;
+  styleBucket: string | null;
+  styleTone: string | null;
+  styleMedium: string | null;
+  motifScope: "whole_book" | "multi_passage" | "specific_passage" | null;
+  styleFamilyName: string | null;
   lockupLayout: string | null;
   motifFocus: string[];
 };
@@ -114,6 +126,11 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   const fallback: OptionDesignSpecSummary = {
     wantsTitleStage: false,
     wantsSeriesMark: false,
+    styleBucket: null,
+    styleTone: null,
+    styleMedium: null,
+    motifScope: null,
+    styleFamilyName: null,
     lockupLayout: null,
     motifFocus: []
   };
@@ -137,6 +154,11 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
         | {
             wantsTitleStage?: unknown;
             wantsSeriesMark?: unknown;
+            styleBucket?: unknown;
+            styleTone?: unknown;
+            styleMedium?: unknown;
+            motifScope?: unknown;
+            styleFamily?: unknown;
             lockupLayout?: unknown;
             motifFocus?: unknown;
           }
@@ -145,13 +167,55 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   ).directionSpec;
   const directWantsTitleStage = (designSpec as { wantsTitleStage?: unknown }).wantsTitleStage;
   const directWantsSeriesMark = (designSpec as { wantsSeriesMark?: unknown }).wantsSeriesMark;
+  const directStyleBucket = (designSpec as { styleBucket?: unknown }).styleBucket;
+  const directStyleTone = (designSpec as { styleTone?: unknown }).styleTone;
+  const directStyleMedium = (designSpec as { styleMedium?: unknown }).styleMedium;
+  const directMotifScope = (designSpec as { motifScope?: unknown }).motifScope;
+  const directStyleFamily = (designSpec as { styleFamily?: unknown }).styleFamily;
   const directLockupLayout = (designSpec as { lockupLayout?: unknown }).lockupLayout;
   const directMotifFocus = (designSpec as { motifFocus?: unknown }).motifFocus;
   const nestedWantsTitleStage = nestedDirectionSpec?.wantsTitleStage;
   const nestedWantsSeriesMark = nestedDirectionSpec?.wantsSeriesMark;
+  const nestedStyleBucket = nestedDirectionSpec?.styleBucket;
+  const nestedStyleTone = nestedDirectionSpec?.styleTone;
+  const nestedStyleMedium = nestedDirectionSpec?.styleMedium;
+  const nestedMotifScope = nestedDirectionSpec?.motifScope;
+  const nestedStyleFamily = nestedDirectionSpec?.styleFamily;
   const nestedLockupLayout = nestedDirectionSpec?.lockupLayout;
   const nestedMotifFocus = nestedDirectionSpec?.motifFocus;
 
+  const styleFamilyCandidate = isStyleFamilyKey(directStyleFamily)
+    ? directStyleFamily
+    : isStyleFamilyKey(nestedStyleFamily)
+      ? nestedStyleFamily
+      : null;
+  const styleBucketCandidate = isStyleBucketKey(directStyleBucket)
+    ? directStyleBucket
+    : isStyleBucketKey(nestedStyleBucket)
+      ? nestedStyleBucket
+      : styleFamilyCandidate
+        ? STYLE_FAMILY_BANK[styleFamilyCandidate].bucket
+        : null;
+  const styleToneCandidate = isStyleToneKey(directStyleTone)
+    ? directStyleTone
+    : isStyleToneKey(nestedStyleTone)
+      ? nestedStyleTone
+      : styleFamilyCandidate
+        ? STYLE_FAMILY_BANK[styleFamilyCandidate].tone
+        : null;
+  const styleMediumCandidate = isStyleMediumKey(directStyleMedium)
+    ? directStyleMedium
+    : isStyleMediumKey(nestedStyleMedium)
+      ? nestedStyleMedium
+      : styleFamilyCandidate
+        ? STYLE_FAMILY_BANK[styleFamilyCandidate].medium
+        : null;
+  const motifScopeCandidate =
+    directMotifScope === "whole_book" || directMotifScope === "multi_passage" || directMotifScope === "specific_passage"
+      ? directMotifScope
+      : nestedMotifScope === "whole_book" || nestedMotifScope === "multi_passage" || nestedMotifScope === "specific_passage"
+        ? nestedMotifScope
+        : null;
   const lockupLayoutCandidate = typeof directLockupLayout === "string" ? directLockupLayout : nestedLockupLayout;
   const motifFocusCandidate = Array.isArray(directMotifFocus) ? directMotifFocus : nestedMotifFocus;
   const motifFocus = Array.isArray(motifFocusCandidate)
@@ -165,6 +229,11 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   return {
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
     wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
+    styleBucket: styleBucketCandidate,
+    styleTone: styleToneCandidate,
+    styleMedium: styleMediumCandidate,
+    motifScope: motifScopeCandidate,
+    styleFamilyName: styleFamilyCandidate ? STYLE_FAMILY_BANK[styleFamilyCandidate].name : null,
     lockupLayout: typeof lockupLayoutCandidate === "string" && lockupLayoutCandidate.trim() ? lockupLayoutCandidate : null,
     motifFocus
   };
@@ -376,6 +445,11 @@ export default async function ProjectGenerationsPage({
                       styleRefCount={typeof styleRefCount === "number" ? styleRefCount : null}
                       isTitleStage={designSpecSummary.wantsTitleStage}
                       wantsSeriesMark={designSpecSummary.wantsSeriesMark}
+                      styleBucket={designSpecSummary.styleBucket}
+                      styleTone={designSpecSummary.styleTone}
+                      styleMedium={designSpecSummary.styleMedium}
+                      motifScope={designSpecSummary.motifScope}
+                      styleFamilyName={designSpecSummary.styleFamilyName}
                       lockupLayout={designSpecSummary.lockupLayout}
                       motifFocus={designSpecSummary.motifFocus}
                       brandMode={project.brandMode === "brand" ? "brand" : "fresh"}

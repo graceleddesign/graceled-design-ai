@@ -1,0 +1,2 @@
+-- Prisma enum update only.
+-- SQLite persists enum columns as TEXT, so no schema DDL is required for adding AssetKind values.

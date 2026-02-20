@@ -1,10 +1,15 @@
 import type { TemplateStyleFamily } from "@/lib/design-brief";
+import type { ScriptureScope } from "@/lib/bible-motif-bank";
 import { isGenericMotif } from "@/lib/motif-guardrails";
 import {
+  isStyleBucketKey,
   isStyleFamilyKey,
   STYLE_FAMILY_BANK,
   STYLE_FAMILY_KEYS,
-  type StyleFamilyKey
+  type StyleBucketKey,
+  type StyleFamilyKey,
+  type StyleMediumKey,
+  type StyleToneKey
 } from "@/lib/style-family-bank";
 
 export type DirectionLaneFamily = "premium_modern" | "editorial" | "minimal" | "photo_centric" | "retro";
@@ -52,7 +57,11 @@ export type PlannedDirectionSpec = DirectionTemplate & {
   wantsSeriesMark: boolean;
   wantsTitleStage: boolean;
   styleFamily?: StyleFamilyKey;
+  styleBucket?: StyleBucketKey;
+  styleTone?: StyleToneKey;
+  styleMedium?: StyleMediumKey;
   motifFocus?: string[];
+  motifScope?: ScriptureScope;
 };
 
 const OPTION_LABELS: Array<"A" | "B" | "C"> = ["A", "B", "C"];
@@ -330,6 +339,41 @@ const PLAYFUL_INTENT_KEYWORDS = [
   "welcome"
 ] as const;
 
+type ExplorationLane = {
+  id: "A" | "B" | "C";
+  lane: "LIGHT_CLEAN" | "VIVID_PLAYFUL" | "MONO_OR_DARK";
+  allowedTones: readonly StyleToneKey[];
+  preferredMediums: readonly StyleMediumKey[];
+};
+
+type StyleFamilyPick = {
+  family: StyleFamilyKey;
+  bucket: StyleBucketKey;
+  tone: StyleToneKey;
+  medium: StyleMediumKey;
+};
+
+const EXPLORATION_LANES: readonly ExplorationLane[] = [
+  {
+    id: "A",
+    lane: "LIGHT_CLEAN",
+    allowedTones: ["light"],
+    preferredMediums: ["photo", "architectural", "typography"]
+  },
+  {
+    id: "B",
+    lane: "VIVID_PLAYFUL",
+    allowedTones: ["vivid"],
+    preferredMediums: ["illustration", "abstract"]
+  },
+  {
+    id: "C",
+    lane: "MONO_OR_DARK",
+    allowedTones: ["mono", "dark"],
+    preferredMediums: ["photo", "3d", "architectural"]
+  }
+];
+
 const SOLEMN_INTENT_KEYWORDS = [
   "good friday",
   "lament",
@@ -555,6 +599,117 @@ function normalizeRecentStyleFamilies(recentStyleFamilies?: readonly StyleFamily
   return normalized;
 }
 
+function normalizeRecentStyleBuckets(recentStyleBuckets?: readonly StyleBucketKey[]): StyleBucketKey[] {
+  const normalized: StyleBucketKey[] = [];
+  const seen = new Set<StyleBucketKey>();
+  for (const bucket of recentStyleBuckets || []) {
+    if (!isStyleBucketKey(bucket) || seen.has(bucket)) {
+      continue;
+    }
+    seen.add(bucket);
+    normalized.push(bucket);
+  }
+  return normalized;
+}
+
+function explorationLaneForIndex(optionIndex: number): ExplorationLane {
+  return EXPLORATION_LANES[optionIndex] || EXPLORATION_LANES[EXPLORATION_LANES.length - 1];
+}
+
+function hasLightOrVividTone(picks: readonly StyleFamilyPick[]): boolean {
+  return picks.some((pick) => pick.tone === "light" || pick.tone === "vivid");
+}
+
+function toStyleFamilyPick(family: StyleFamilyKey): StyleFamilyPick {
+  const record = STYLE_FAMILY_BANK[family];
+  return {
+    family,
+    bucket: record.bucket,
+    tone: record.tone,
+    medium: record.medium
+  };
+}
+
+function pickExplorationStyleFamilies(params: {
+  runSeed: string;
+  seededOrder: readonly StyleFamilyKey[];
+  specs: readonly {
+    laneFamily: DirectionLaneFamily;
+    wantsSeriesMark: boolean;
+    wantsTitleStage: boolean;
+  }[];
+  recentBuckets: Set<StyleBucketKey>;
+  recentRanks: Map<StyleFamilyKey, number>;
+  preferredLaneFamilies: Set<DirectionLaneFamily>;
+  brandMode: "brand" | "fresh";
+  playfulIntent: PlayfulIntentSignal;
+}): StyleFamilyPick[] | null {
+  const count = params.specs.length;
+  if (count <= 0) {
+    return [];
+  }
+
+  const picks: StyleFamilyPick[] = [];
+  const usedFamilies = new Set<StyleFamilyKey>();
+  const usedBuckets = new Set<StyleBucketKey>();
+
+  const pickForLane = (optionIndex: number, allowSupportFallback: boolean): StyleFamilyPick | null => {
+    const lane = explorationLaneForIndex(optionIndex);
+    const spec = params.specs[optionIndex];
+    const candidates = params.seededOrder
+      .filter((family) => {
+        if (usedFamilies.has(family)) {
+          return false;
+        }
+        const record = STYLE_FAMILY_BANK[family];
+        if (!lane.allowedTones.includes(record.tone)) {
+          return false;
+        }
+        if (!allowSupportFallback && record.explorationTier !== "hero") {
+          return false;
+        }
+        return true;
+      })
+      .map((family) => {
+        const record = STYLE_FAMILY_BANK[family];
+        let score = styleFamilyScore({
+          family,
+          spec,
+          recentRanks: params.recentRanks,
+          preferredLaneFamilies: params.preferredLaneFamilies,
+          brandMode: params.brandMode,
+          playfulIntent: params.playfulIntent
+        });
+        score += lane.preferredMediums.includes(record.medium) ? 9 : -2;
+        score += usedBuckets.has(record.bucket) ? -2 : 2;
+        score += params.recentBuckets.has(record.bucket) ? -1 : 1;
+        score += record.explorationTier === "hero" ? 2 : 0;
+        score += record.backgroundRefHasTypographyRisk ? -1 : 1;
+        score += hashToSeed(`${params.runSeed}|exploration-lane|${optionIndex}|${lane.lane}|${family}`) / 0xffffffff;
+
+        return {
+          pick: toStyleFamilyPick(family),
+          score
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    return candidates[0]?.pick || null;
+  };
+
+  for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
+    const selected = pickForLane(optionIndex, false) || pickForLane(optionIndex, true);
+    if (!selected) {
+      return null;
+    }
+    picks.push(selected);
+    usedFamilies.add(selected.family);
+    usedBuckets.add(selected.bucket);
+  }
+
+  return picks;
+}
+
 function styleFamilyScore(params: {
   family: StyleFamilyKey;
   spec: {
@@ -626,38 +781,80 @@ function assignStyleFamilies(params: {
   }[];
   preferredLaneFamilies?: readonly DirectionLaneFamily[];
   recentStyleFamilies?: readonly StyleFamilyKey[];
+  recentStyleBuckets?: readonly StyleBucketKey[];
+  explorationMode?: boolean;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
-}): StyleFamilyKey[] {
+}): StyleFamilyPick[] {
   const seededOrder = createSeededRandom(`${params.runSeed}|style-family-order`).shuffle(STYLE_FAMILY_KEYS);
   const orderIndex = new Map(seededOrder.map((family, index) => [family, index] as const));
-  const recent = normalizeRecentStyleFamilies(params.recentStyleFamilies);
-  const recentRanks = new Map(recent.map((family, index) => [family, index] as const));
+  const recentStyleFamilyOrder = normalizeRecentStyleFamilies(params.recentStyleFamilies);
+  const recentRanks = new Map(recentStyleFamilyOrder.map((family, index) => [family, index] as const));
+  const recentBuckets = new Set(normalizeRecentStyleBuckets(params.recentStyleBuckets));
   const preferredLaneFamilies = new Set(params.preferredLaneFamilies || []);
 
-  const picks: StyleFamilyKey[] = [];
+  if (params.explorationMode) {
+    const explorationPicks = pickExplorationStyleFamilies({
+      runSeed: params.runSeed,
+      seededOrder,
+      specs: params.specs,
+      recentBuckets,
+      recentRanks,
+      preferredLaneFamilies,
+      brandMode: params.brandMode,
+      playfulIntent: params.playfulIntent
+    });
+    if (explorationPicks) {
+      return explorationPicks;
+    }
+  }
+
+  const picks: StyleFamilyPick[] = [];
   const used = new Set<StyleFamilyKey>();
+  const usedBuckets = new Set<StyleBucketKey>();
+  const usedTones = new Set<StyleToneKey>();
+  const usedMediums = new Set<StyleMediumKey>();
 
   for (const [optionIndex, spec] of params.specs.entries()) {
-    const candidates = seededOrder.filter((family) => !used.has(family));
-    if (candidates.length === 0) {
+    const candidates = seededOrder.filter(
+      (family) => !used.has(family) && (!params.explorationMode || !usedBuckets.has(STYLE_FAMILY_BANK[family].bucket))
+    );
+    const fallbackCandidates = seededOrder.filter((family) => !used.has(family));
+    const effectiveCandidates = candidates.length > 0 ? candidates : fallbackCandidates;
+    if (effectiveCandidates.length === 0) {
       break;
     }
 
-    const ranked = candidates
-      .map((family) => ({
-        family,
-        score: styleFamilyScore({
+    const ranked = effectiveCandidates
+      .map((family) => {
+        const record = STYLE_FAMILY_BANK[family];
+        const bucket = record.bucket;
+        let score = styleFamilyScore({
           family,
           spec,
           recentRanks,
           preferredLaneFamilies,
           brandMode: params.brandMode,
           playfulIntent: params.playfulIntent
-        }),
-        tieBreak: orderIndex.get(family) || 0,
-        hashTie: hashToSeed(`${params.runSeed}|style-family|${optionIndex}|${family}`)
-      }))
+        });
+        if (!params.explorationMode && usedBuckets.has(bucket)) {
+          score -= 2;
+        }
+        if (params.explorationMode) {
+          score += usedTones.has(record.tone) ? -3 : 3;
+          score += usedMediums.has(record.medium) ? -3 : 3;
+          if (record.tone === "light" || record.tone === "vivid") {
+            score += 2;
+          }
+        }
+        return {
+          family,
+          bucket,
+          score,
+          tieBreak: orderIndex.get(family) || 0,
+          hashTie: hashToSeed(`${params.runSeed}|style-family|${optionIndex}|${family}`)
+        };
+      })
       .sort((a, b) => {
         if (b.score !== a.score) {
           return b.score - a.score;
@@ -668,9 +865,91 @@ function assignStyleFamilies(params: {
         return a.hashTie - b.hashTie;
       });
 
-    const selected = ranked[0]?.family || candidates[0];
-    picks.push(selected);
-    used.add(selected);
+    const selectedFamily = ranked[0]?.family || effectiveCandidates[0];
+    const selectedRecord = STYLE_FAMILY_BANK[selectedFamily];
+    picks.push({
+      family: selectedFamily,
+      bucket: selectedRecord.bucket,
+      tone: selectedRecord.tone,
+      medium: selectedRecord.medium
+    });
+    used.add(selectedFamily);
+    usedBuckets.add(selectedRecord.bucket);
+    usedTones.add(selectedRecord.tone);
+    usedMediums.add(selectedRecord.medium);
+  }
+
+  if (params.explorationMode && picks.length > 0 && !hasLightOrVividTone(picks)) {
+    for (let optionIndex = picks.length - 1; optionIndex >= 0; optionIndex -= 1) {
+      const remainingBuckets = new Set(
+        picks.filter((_, index) => index !== optionIndex).map((pick) => pick.bucket)
+      );
+      const remainingFamilies = new Set(
+        picks.filter((_, index) => index !== optionIndex).map((pick) => pick.family)
+      );
+      const replacementCandidates = seededOrder.filter((family) => {
+        if (remainingFamilies.has(family)) {
+          return false;
+        }
+        const record = STYLE_FAMILY_BANK[family];
+        if (remainingBuckets.has(record.bucket)) {
+          return false;
+        }
+        return record.tone === "light" || record.tone === "vivid";
+      });
+      if (replacementCandidates.length === 0) {
+        continue;
+      }
+      const spec = params.specs[optionIndex];
+      const replacement = replacementCandidates
+        .map((family) => ({
+          family,
+          score:
+            styleFamilyScore({
+              family,
+              spec,
+              recentRanks,
+              preferredLaneFamilies,
+              brandMode: params.brandMode,
+              playfulIntent: params.playfulIntent
+            }) + hashToSeed(`${params.runSeed}|light-vivid-repair|${optionIndex}|${family}`) / 0xffffffff
+        }))
+        .sort((a, b) => b.score - a.score)[0]?.family;
+      if (!replacement) {
+        continue;
+      }
+      const replacementRecord = STYLE_FAMILY_BANK[replacement];
+      picks[optionIndex] = {
+        family: replacement,
+        bucket: replacementRecord.bucket,
+        tone: replacementRecord.tone,
+        medium: replacementRecord.medium
+      };
+      break;
+    }
+
+    if (!hasLightOrVividTone(picks)) {
+      const remainingBuckets = new Set(picks.slice(1).map((pick) => pick.bucket));
+      for (const family of seededOrder) {
+        if (used.has(family)) {
+          continue;
+        }
+        const record = STYLE_FAMILY_BANK[family];
+        if (record.tone !== "light" && record.tone !== "vivid") {
+          continue;
+        }
+        if (remainingBuckets.has(record.bucket)) {
+          continue;
+        }
+        picks[0] = {
+          family,
+          bucket: record.bucket,
+          tone: record.tone,
+          medium: record.medium
+        };
+        break;
+      }
+    }
   }
 
   return picks;
@@ -819,20 +1098,32 @@ function assignMotifFocuses(params: {
   allowedGenericMotifs?: readonly string[];
   markIdeas?: readonly string[];
   recentMotifs?: readonly string[];
+  motifScope?: ScriptureScope;
+  primaryThemes?: readonly string[];
+  secondaryThemes?: readonly string[];
+  sceneMotifs?: readonly string[];
+  sceneMotifRequested?: boolean;
 }): string[][] {
   const optionCount = params.specs.length;
   if (optionCount <= 0) {
     return [];
   }
 
+  const motifScope = params.motifScope || "specific_passage";
   const motifs = normalizeMotifs(params.motifs);
   if (motifs.length === 0) {
     return Array.from({ length: optionCount }, () => []);
   }
 
+  const sceneSet = new Set(normalizeMotifs(params.sceneMotifs).map((item) => normalizeMotifKey(item)));
+  const sceneAllowed = motifScope !== "whole_book" || params.sceneMotifRequested === true;
+  const removeSceneMotifs = (pool: string[]): string[] =>
+    sceneAllowed || sceneSet.size === 0 ? pool : pool.filter((motif) => !sceneSet.has(normalizeMotifKey(motif)));
+
   const allowedGeneric = new Set(normalizeMotifs(params.allowedGenericMotifs).map((item) => item.toLowerCase()));
-  const nonGeneric = motifs.filter((motif) => !isGenericMotif(motif));
-  const allowedGenericPool = motifs.filter((motif) => {
+  const scopedMotifs = removeSceneMotifs(motifs);
+  const nonGeneric = scopedMotifs.filter((motif) => !isGenericMotif(motif));
+  const allowedGenericPool = scopedMotifs.filter((motif) => {
     if (!isGenericMotif(motif)) {
       return false;
     }
@@ -841,8 +1132,81 @@ function assignMotifFocuses(params: {
     }
     return allowedGeneric.has(motif.toLowerCase());
   });
-  const fallbackGeneric = motifs.filter((motif) => isGenericMotif(motif) && !allowedGeneric.has(motif.toLowerCase()));
+  const fallbackGeneric = scopedMotifs.filter((motif) => isGenericMotif(motif) && !allowedGeneric.has(motif.toLowerCase()));
   const recentMotifSet = new Set(normalizeMotifs(params.recentMotifs).map((item) => normalizeMotifKey(item)));
+
+  if (motifScope === "whole_book") {
+    const requestedSceneMotifs = sceneAllowed ? normalizeMotifs(params.sceneMotifs) : [];
+    const scopedPrimaryThemes = removeSceneMotifs(normalizeMotifs(params.primaryThemes));
+    const scopedSecondaryThemes = removeSceneMotifs(normalizeMotifs(params.secondaryThemes));
+    const primaryThemes = scopedPrimaryThemes.filter((motif) => !isGenericMotif(motif));
+    const secondaryThemes = scopedSecondaryThemes.filter((motif) => !isGenericMotif(motif));
+    const basePrimaryPool = primaryThemes.length > 0 ? primaryThemes : nonGeneric.length > 0 ? nonGeneric : scopedMotifs;
+    const primaryPool =
+      params.sceneMotifRequested && requestedSceneMotifs.length > 0
+        ? dedupe([...requestedSceneMotifs, ...basePrimaryPool])
+        : basePrimaryPool;
+    const secondaryPool =
+      params.sceneMotifRequested && requestedSceneMotifs.length > 0
+        ? dedupe([...requestedSceneMotifs, ...(secondaryThemes.length > 0 ? secondaryThemes : nonGeneric)])
+        : secondaryThemes.length > 0
+          ? secondaryThemes
+          : nonGeneric;
+
+    const rankPool = (pool: string[], salt: string): string[] => {
+      return [...pool]
+        .map((motif, index) => {
+          const noveltyBoost = recentMotifSet.has(normalizeMotifKey(motif)) ? 0 : 2;
+          const priorityBoost = Math.max(0, pool.length - index) / Math.max(1, pool.length);
+          const tieBreak = hashToSeed(`${params.runSeed}|motif-scope|${salt}|${motif}`) / 0xffffffff;
+          return { motif, score: noveltyBoost + priorityBoost + tieBreak * 0.25 };
+        })
+        .sort((a, b) => b.score - a.score)
+        .map((entry) => entry.motif);
+    };
+
+    const rankedPrimary = dedupe(rankPool(primaryPool, "primary"));
+    const rankedSecondary = dedupe(rankPool(secondaryPool, "secondary"));
+    const usedPrimary = new Set<string>();
+    const focusByDirection = Array.from({ length: optionCount }, (_, optionIndex) => {
+      const nextPrimary =
+        rankedPrimary.find((motif) => !usedPrimary.has(normalizeMotifKey(motif))) ||
+        rankedPrimary[optionIndex % Math.max(1, rankedPrimary.length)] ||
+        "";
+      if (!nextPrimary) {
+        return [];
+      }
+      usedPrimary.add(normalizeMotifKey(nextPrimary));
+
+      const secondaryStart = rankedPrimary.length > 0 ? (optionIndex + 1) % rankedPrimary.length : 0;
+      const rotatedPrimary = [...rankedPrimary.slice(secondaryStart), ...rankedPrimary.slice(0, secondaryStart)];
+      const secondPrimary = rotatedPrimary.find((motif) => normalizeMotifKey(motif) !== normalizeMotifKey(nextPrimary));
+      if (secondPrimary) {
+        return [nextPrimary, secondPrimary];
+      }
+      const fallbackSecondary = rankedSecondary.find((motif) => normalizeMotifKey(motif) !== normalizeMotifKey(nextPrimary));
+      return fallbackSecondary ? [nextPrimary, fallbackSecondary] : [nextPrimary];
+    });
+
+    const seriesMarkDirectionIndex = params.specs.findIndex((spec) => spec.wantsSeriesMark);
+    const markSupportMotif =
+      seriesMarkDirectionIndex >= 0
+        ? pickMarkSupportMotif({
+            motifs: primaryPool,
+            markIdeas: params.markIdeas || [],
+            recentMotifs: params.recentMotifs || []
+          })
+        : null;
+    if (seriesMarkDirectionIndex >= 0 && markSupportMotif && (!sceneSet.has(normalizeMotifKey(markSupportMotif)) || sceneAllowed)) {
+      const currentFocus = focusByDirection[seriesMarkDirectionIndex] || [];
+      if (!currentFocus.includes(markSupportMotif)) {
+        focusByDirection[seriesMarkDirectionIndex] =
+          currentFocus.length >= 2 ? [markSupportMotif, currentFocus[0]] : [...currentFocus, markSupportMotif];
+      }
+    }
+
+    return focusByDirection.map((focus) => focus.slice(0, 2));
+  }
 
   const rng = createSeededRandom(`${params.runSeed}|motif-focus`);
   const baseOrderedMotifs = dedupe([
@@ -906,12 +1270,19 @@ export function planDirectionSet(params: {
   markIdeas?: readonly string[];
   recentMotifs?: readonly string[];
   recentStyleFamilies?: readonly StyleFamilyKey[];
+  recentStyleBuckets?: readonly StyleBucketKey[];
+  explorationMode?: boolean;
   brandMode?: "brand" | "fresh";
   seriesTitle?: string | null;
   seriesSubtitle?: string | null;
   seriesDescription?: string | null;
   designNotes?: string | null;
   topicNames?: readonly string[];
+  motifScope?: ScriptureScope;
+  primaryThemes?: readonly string[];
+  secondaryThemes?: readonly string[];
+  sceneMotifs?: readonly string[];
+  sceneMotifRequested?: boolean;
 }): PlannedDirectionSpec[] {
   const count = Math.max(1, Math.min(params.optionCount || 3, 3));
   const runSeed = params.runSeed.trim() || "run-seed";
@@ -991,6 +1362,8 @@ export function planDirectionSet(params: {
     specs: baseSpecs,
     preferredLaneFamilies: params.preferredFamilies,
     recentStyleFamilies: params.recentStyleFamilies,
+    recentStyleBuckets: params.recentStyleBuckets,
+    explorationMode: params.explorationMode === true,
     brandMode: params.brandMode === "brand" ? "brand" : "fresh",
     playfulIntent
   });
@@ -1001,12 +1374,21 @@ export function planDirectionSet(params: {
     motifs: params.motifs,
     allowedGenericMotifs: params.allowedGenericMotifs,
     markIdeas: params.markIdeas,
-    recentMotifs: params.recentMotifs
+    recentMotifs: params.recentMotifs,
+    motifScope: params.motifScope,
+    primaryThemes: params.primaryThemes,
+    secondaryThemes: params.secondaryThemes,
+    sceneMotifs: params.sceneMotifs,
+    sceneMotifRequested: params.sceneMotifRequested
   });
 
   return baseSpecs.map((spec, optionIndex) => ({
     ...spec,
-    styleFamily: styleFamilies[optionIndex],
-    motifFocus: motifFocusByDirection[optionIndex] || []
+    styleFamily: styleFamilies[optionIndex]?.family,
+    styleBucket: styleFamilies[optionIndex]?.bucket,
+    styleTone: styleFamilies[optionIndex]?.tone,
+    styleMedium: styleFamilies[optionIndex]?.medium,
+    motifFocus: motifFocusByDirection[optionIndex] || [],
+    motifScope: params.motifScope
   }));
 }

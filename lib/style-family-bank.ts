@@ -25,7 +25,30 @@ export type StyleFamilyKey =
   | "sticker_pack_pop"
   | "paper_cut_collage_playful";
 
+export type StyleBucketKey =
+  | "atmospheric"
+  | "print_engraved"
+  | "minimal_structural"
+  | "diagrammatic_systems"
+  | "pattern_texture"
+  | "playful_pop"
+  | "editorial_typography";
+
+export type StyleToneKey = "light" | "vivid" | "neutral" | "dark" | "mono";
+
+export type StyleMediumKey = "typography" | "illustration" | "abstract" | "photo" | "3d" | "architectural";
+export type ExplorationTier = "hero" | "support";
+
 export type StyleFamilyDefinition = {
+  bucket: StyleBucketKey;
+  bucketRules: string;
+  tone: StyleToneKey;
+  medium: StyleMediumKey;
+  explorationTier: ExplorationTier;
+  backgroundMustBeTextFree: boolean;
+  backgroundRefHasTypographyRisk: boolean;
+  toneRules: string;
+  mediumRules: string;
   name: string;
   description: string;
   backgroundRules: string[];
@@ -35,6 +58,220 @@ export type StyleFamilyDefinition = {
   bestFor: string[];
   markFriendly: boolean;
 };
+
+type BaseStyleFamilyDefinition = Omit<
+  StyleFamilyDefinition,
+  | "bucket"
+  | "bucketRules"
+  | "tone"
+  | "medium"
+  | "explorationTier"
+  | "backgroundMustBeTextFree"
+  | "backgroundRefHasTypographyRisk"
+  | "toneRules"
+  | "mediumRules"
+>;
+
+export const STYLE_BUCKET_KEYS: StyleBucketKey[] = [
+  "atmospheric",
+  "print_engraved",
+  "minimal_structural",
+  "diagrammatic_systems",
+  "pattern_texture",
+  "playful_pop",
+  "editorial_typography"
+];
+
+const STYLE_BUCKET_RULES: Record<StyleBucketKey, string> = {
+  atmospheric: "Prioritize mood depth, soft transitions, and calm focal hierarchy over literal iconography.",
+  print_engraved: "Render with analog print discipline: limited inks, intentional grain, and controlled line density.",
+  minimal_structural: "Build from bold structure and negative space; keep surfaces restrained and composition load-bearing.",
+  diagrammatic_systems: "Use system logic: measured lines, directional cues, and engineered spacing with clear lanes.",
+  pattern_texture: "Let repeating texture systems lead while preserving scale control and readable breathing room.",
+  playful_pop: "Use high-clarity playful forms, punchy motion cues, and clean hierarchy without novelty clutter.",
+  editorial_typography: "Treat typography and grid as the hero; ornament is secondary and rigorously minimal."
+};
+
+const STYLE_FAMILY_BUCKET_MAP: Record<StyleFamilyKey, StyleBucketKey> = {
+  modern_geometric_blocks: "minimal_structural",
+  abstract_organic_papercut: "atmospheric",
+  editorial_grid_minimal: "editorial_typography",
+  typographic_only_statement: "editorial_typography",
+  monoline_icon_system: "diagrammatic_systems",
+  symbol_collage: "pattern_texture",
+  halftone_print_poster: "print_engraved",
+  risograph_duotone: "print_engraved",
+  blueprint_diagram: "diagrammatic_systems",
+  map_wayfinding: "diagrammatic_systems",
+  architecture_structural_forms: "diagrammatic_systems",
+  textile_woven_pattern: "pattern_texture",
+  topographic_contour_lines: "pattern_texture",
+  light_gradient_stage: "atmospheric",
+  painterly_atmosphere: "atmospheric",
+  photographic_graphic_overlay: "atmospheric",
+  macro_texture_minimal: "minimal_structural",
+  engraved_heritage: "print_engraved",
+  manuscript_marginalia: "print_engraved",
+  emblem_seal_system: "print_engraved",
+  playful_neon_pool: "playful_pop",
+  comic_storyboard: "playful_pop",
+  bubbly_3d_clay: "playful_pop",
+  sticker_pack_pop: "playful_pop",
+  paper_cut_collage_playful: "playful_pop"
+};
+
+export const STYLE_TONE_KEYS: StyleToneKey[] = ["light", "vivid", "neutral", "dark", "mono"];
+
+export const STYLE_MEDIUM_KEYS: StyleMediumKey[] = [
+  "typography",
+  "illustration",
+  "abstract",
+  "photo",
+  "3d",
+  "architectural"
+];
+
+const STYLE_TONE_RULES: Record<StyleToneKey, string> = {
+  light:
+    "High-key bright/clean treatment with white or near-white staging, airy minimal structure, and soft restrained shadowing. Forbid sepia, parchment, beige paper texture, vintage styling, film grain, and dusty/desaturated grading. Avoid filmic grading.",
+  vivid: "High saturation, playful palette, strong contrast, avoid muted or dusty colorways.",
+  neutral: "Balanced saturation with clean value separation; avoid extreme mood grading.",
+  dark: "Low-key moody contrast with deep values and controlled highlights; avoid pastel drift.",
+  mono: "Strict monochrome or grayscale only, strong contrast, cinematic treatment is allowed."
+};
+
+const STYLE_MEDIUM_RULES: Record<StyleMediumKey, string> = {
+  typography: "Type-led composition first; minimize illustrative elements and keep forms text-centric.",
+  illustration: "Illustrated forms should drive the scene; keep linework/shapes intentional and readable.",
+  abstract: "Favor abstract geometric/organic forms over literal objects; keep symbolism non-literal.",
+  photo: "Photo-led realism and texture should anchor the composition; overlays stay secondary.",
+  "3d": "Use volumetric 3D form language with clear lighting and controlled surface materials.",
+  architectural: "Structural/architectural forms should define composition with measured perspective discipline."
+};
+
+const STYLE_FAMILY_TONE_MAP: Record<StyleFamilyKey, StyleToneKey> = {
+  modern_geometric_blocks: "light",
+  abstract_organic_papercut: "light",
+  editorial_grid_minimal: "light",
+  typographic_only_statement: "neutral",
+  monoline_icon_system: "light",
+  symbol_collage: "neutral",
+  halftone_print_poster: "vivid",
+  risograph_duotone: "vivid",
+  blueprint_diagram: "mono",
+  map_wayfinding: "neutral",
+  architecture_structural_forms: "dark",
+  textile_woven_pattern: "neutral",
+  topographic_contour_lines: "mono",
+  light_gradient_stage: "light",
+  painterly_atmosphere: "dark",
+  photographic_graphic_overlay: "dark",
+  macro_texture_minimal: "neutral",
+  engraved_heritage: "mono",
+  manuscript_marginalia: "neutral",
+  emblem_seal_system: "mono",
+  playful_neon_pool: "vivid",
+  comic_storyboard: "vivid",
+  bubbly_3d_clay: "vivid",
+  sticker_pack_pop: "vivid",
+  paper_cut_collage_playful: "vivid"
+};
+
+const STYLE_FAMILY_MEDIUM_MAP: Record<StyleFamilyKey, StyleMediumKey> = {
+  modern_geometric_blocks: "abstract",
+  abstract_organic_papercut: "illustration",
+  editorial_grid_minimal: "typography",
+  typographic_only_statement: "typography",
+  monoline_icon_system: "illustration",
+  symbol_collage: "illustration",
+  halftone_print_poster: "illustration",
+  risograph_duotone: "illustration",
+  blueprint_diagram: "architectural",
+  map_wayfinding: "architectural",
+  architecture_structural_forms: "architectural",
+  textile_woven_pattern: "abstract",
+  topographic_contour_lines: "abstract",
+  light_gradient_stage: "abstract",
+  painterly_atmosphere: "illustration",
+  photographic_graphic_overlay: "photo",
+  macro_texture_minimal: "photo",
+  engraved_heritage: "illustration",
+  manuscript_marginalia: "typography",
+  emblem_seal_system: "typography",
+  playful_neon_pool: "abstract",
+  comic_storyboard: "illustration",
+  bubbly_3d_clay: "3d",
+  sticker_pack_pop: "illustration",
+  paper_cut_collage_playful: "illustration"
+};
+
+const STYLE_FAMILY_TONE_RULE_OVERRIDES: Partial<Record<StyleFamilyKey, string>> = {
+  light_gradient_stage:
+    "High-key luminous field with white or near-white brightness, clean airy spacing, and soft shadows only. Forbid sepia, parchment, beige paper texture, vintage styling, film grain, and dusty/desaturated grading.",
+  halftone_print_poster: "Keep punchy high-chroma poster energy with bold value jumps; never mute into dusty tones.",
+  risograph_duotone: "Use vivid ink-forward contrast with assertive color separation; avoid gray-washed treatment.",
+  blueprint_diagram: "Strict monochrome blueprint/cyanotype behavior with high line contrast and no multi-hue drift.",
+  playful_neon_pool: "Bright vivid palette with playful contrast and joyful energy; avoid muted cinematic color grading.",
+  comic_storyboard: "Keep panels lively and saturated with clear color blocks; avoid melancholy filmic desaturation.",
+  photographic_graphic_overlay: "Cinematic low-key mood is allowed, but preserve decisive contrast and avoid flat haze.",
+  architecture_structural_forms: "Low-key architectural mood with deep values and controlled highlights; no pastel treatment."
+};
+
+const STYLE_FAMILY_MEDIUM_RULE_OVERRIDES: Partial<Record<StyleFamilyKey, string>> = {
+  typographic_only_statement: "Typography is the image: forms, spacing, and hierarchy must carry the composition.",
+  editorial_grid_minimal: "Grid-driven type system should dominate with editorial restraint and minimal supporting graphics.",
+  blueprint_diagram: "Architectural/drafting line systems should be primary with measured spacing and structural callouts.",
+  architecture_structural_forms: "Use architectural massing, planes, and framework geometry as the dominant visual medium.",
+  photographic_graphic_overlay: "Photo base must remain primary; overlays only organize hierarchy and pacing.",
+  bubbly_3d_clay: "3D rounded forms should lead with clear volume, soft material response, and uncluttered staging."
+};
+
+const HERO_EXPLORATION_FAMILY_SET = new Set<StyleFamilyKey>([
+  "modern_geometric_blocks",
+  "abstract_organic_papercut",
+  "editorial_grid_minimal",
+  "monoline_icon_system",
+  "halftone_print_poster",
+  "risograph_duotone",
+  "architecture_structural_forms",
+  "light_gradient_stage",
+  "painterly_atmosphere",
+  "photographic_graphic_overlay",
+  "playful_neon_pool",
+  "comic_storyboard",
+  "bubbly_3d_clay",
+  "sticker_pack_pop",
+  "paper_cut_collage_playful"
+]);
+
+const SUPPORT_EXPLORATION_FAMILY_SET = new Set<StyleFamilyKey>([
+  "blueprint_diagram",
+  "map_wayfinding",
+  "textile_woven_pattern",
+  "topographic_contour_lines",
+  "macro_texture_minimal"
+]);
+
+const BACKGROUND_TEXT_OPTIONAL_FAMILY_SET = new Set<StyleFamilyKey>([]);
+
+const BACKGROUND_REF_TYPOGRAPHY_RISK_FAMILY_SET = new Set<StyleFamilyKey>([
+  "editorial_grid_minimal",
+  "typographic_only_statement",
+  "blueprint_diagram",
+  "map_wayfinding",
+  "manuscript_marginalia",
+  "emblem_seal_system"
+]);
+
+function resolveExplorationTier(familyKey: StyleFamilyKey): ExplorationTier {
+  if (HERO_EXPLORATION_FAMILY_SET.has(familyKey)) {
+    return "hero";
+  }
+  if (SUPPORT_EXPLORATION_FAMILY_SET.has(familyKey)) {
+    return "support";
+  }
+  return "support";
+}
 
 export const STYLE_FAMILY_KEYS: StyleFamilyKey[] = [
   "modern_geometric_blocks",
@@ -64,7 +301,7 @@ export const STYLE_FAMILY_KEYS: StyleFamilyKey[] = [
   "paper_cut_collage_playful"
 ];
 
-export const STYLE_FAMILY_BANK: Record<StyleFamilyKey, StyleFamilyDefinition> = {
+const BASE_STYLE_FAMILY_BANK: Record<StyleFamilyKey, BaseStyleFamilyDefinition> = {
   modern_geometric_blocks: {
     name: "Modern Geometric Blocks",
     description: "Bold shape-led modernism with clean blocks, overlaps, and disciplined edge control.",
@@ -539,8 +776,47 @@ export const STYLE_FAMILY_BANK: Record<StyleFamilyKey, StyleFamilyDefinition> = 
   }
 };
 
+export const STYLE_FAMILY_BANK: Record<StyleFamilyKey, StyleFamilyDefinition> = Object.fromEntries(
+  STYLE_FAMILY_KEYS.map((familyKey) => {
+    const bucket = STYLE_FAMILY_BUCKET_MAP[familyKey];
+    const tone = STYLE_FAMILY_TONE_MAP[familyKey];
+    const medium = STYLE_FAMILY_MEDIUM_MAP[familyKey];
+    const base = BASE_STYLE_FAMILY_BANK[familyKey];
+    return [
+      familyKey,
+      {
+        ...base,
+        bucket,
+        bucketRules: STYLE_BUCKET_RULES[bucket],
+        tone,
+        medium,
+        explorationTier: resolveExplorationTier(familyKey),
+        backgroundMustBeTextFree: !BACKGROUND_TEXT_OPTIONAL_FAMILY_SET.has(familyKey),
+        backgroundRefHasTypographyRisk: BACKGROUND_REF_TYPOGRAPHY_RISK_FAMILY_SET.has(familyKey),
+        toneRules: STYLE_FAMILY_TONE_RULE_OVERRIDES[familyKey] || STYLE_TONE_RULES[tone],
+        mediumRules: STYLE_FAMILY_MEDIUM_RULE_OVERRIDES[familyKey] || STYLE_MEDIUM_RULES[medium]
+      }
+    ];
+  })
+) as Record<StyleFamilyKey, StyleFamilyDefinition>;
+
 const STYLE_FAMILY_KEY_SET = new Set<string>(STYLE_FAMILY_KEYS);
+const STYLE_BUCKET_KEY_SET = new Set<string>(STYLE_BUCKET_KEYS);
+const STYLE_TONE_KEY_SET = new Set<string>(STYLE_TONE_KEYS);
+const STYLE_MEDIUM_KEY_SET = new Set<string>(STYLE_MEDIUM_KEYS);
 
 export function isStyleFamilyKey(value: unknown): value is StyleFamilyKey {
   return typeof value === "string" && STYLE_FAMILY_KEY_SET.has(value);
+}
+
+export function isStyleBucketKey(value: unknown): value is StyleBucketKey {
+  return typeof value === "string" && STYLE_BUCKET_KEY_SET.has(value);
+}
+
+export function isStyleToneKey(value: unknown): value is StyleToneKey {
+  return typeof value === "string" && STYLE_TONE_KEY_SET.has(value);
+}
+
+export function isStyleMediumKey(value: unknown): value is StyleMediumKey {
+  return typeof value === "string" && STYLE_MEDIUM_KEY_SET.has(value);
 }
