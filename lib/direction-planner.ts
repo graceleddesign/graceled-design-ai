@@ -368,6 +368,17 @@ type ExplorationStyleFamilySelection = {
   explorationLaneKeys?: string[];
 };
 
+export type ExplorationSetConstraint = "any" | "same" | "different";
+
+export type ExplorationFallbackStyleFamilyPick = {
+  family: StyleFamilyKey;
+  bucket: StyleBucketKey;
+  tone: StyleToneKey;
+  medium: StyleMediumKey;
+  explorationSetKey: string;
+  explorationLaneKey: string;
+};
+
 function explorationLane(params: {
   key: string;
   toneAllow: readonly StyleToneKey[];
@@ -854,6 +865,100 @@ function laneMatchesFamily(params: {
     return false;
   }
   return true;
+}
+
+export function pickExplorationFallbackStyleFamily(params: {
+  runSeed: string;
+  laneFamily: DirectionLaneFamily;
+  currentStyleFamily: StyleFamilyKey;
+  currentExplorationSetKey?: string | null;
+  tone: StyleToneKey;
+  medium: StyleMediumKey;
+  recentStyleFamilies?: readonly StyleFamilyKey[];
+  avoidFamilies?: readonly StyleFamilyKey[];
+  setConstraint?: ExplorationSetConstraint;
+}): ExplorationFallbackStyleFamilyPick | null {
+  const seededOrder = createSeededRandom(`${params.runSeed}|fallback-style-family-order`).shuffle(STYLE_FAMILY_KEYS);
+  const recentFamilyOrder = normalizeRecentStyleFamilies(params.recentStyleFamilies);
+  const recentRanks = new Map(recentFamilyOrder.map((family, index) => [family, index] as const));
+  const avoid = new Set<StyleFamilyKey>([params.currentStyleFamily, ...(params.avoidFamilies || [])]);
+  const currentSetKey = params.currentExplorationSetKey?.trim() || "";
+  const setConstraint = params.setConstraint || "any";
+
+  const candidateSets = EXPLORATION_SETS.filter((set) => {
+    if (setConstraint === "same" && currentSetKey) {
+      return set.key === currentSetKey;
+    }
+    if (setConstraint === "different" && currentSetKey) {
+      return set.key !== currentSetKey;
+    }
+    return true;
+  });
+
+  if (candidateSets.length === 0) {
+    return null;
+  }
+
+  const scoredCandidates: Array<{
+    score: number;
+    pick: ExplorationFallbackStyleFamilyPick;
+  }> = [];
+
+  for (const set of candidateSets) {
+    const matchingLanes = set.lanes.filter(
+      (lane) => lane.toneAllow.includes(params.tone) && lane.mediumAllow.includes(params.medium)
+    );
+    if (matchingLanes.length === 0) {
+      continue;
+    }
+
+    for (const lane of matchingLanes) {
+      for (const family of seededOrder) {
+        if (avoid.has(family)) {
+          continue;
+        }
+        if (
+          !laneMatchesFamily({
+            lane,
+            family,
+            heroOnly: false
+          })
+        ) {
+          continue;
+        }
+
+        const record = STYLE_FAMILY_BANK[family];
+        let score = 0;
+        score += record.explorationTier === "hero" ? 9 : 2;
+        score += STYLE_FAMILY_TO_LANE_FAMILY[family] === params.laneFamily ? 6 : -2;
+        score += recencyPenalty({
+          rank: recentRanks.get(family),
+          newestPenalty: 14,
+          slope: 1,
+          freshBonus: 6
+        });
+        if (currentSetKey) {
+          score += set.key === currentSetKey ? 2.5 : 0.5;
+        }
+        score += hashToSeed(`${params.runSeed}|fallback-style-family|${set.key}|${lane.key}|${family}`) / 0xffffffff;
+
+        scoredCandidates.push({
+          score,
+          pick: {
+            family,
+            bucket: record.bucket,
+            tone: record.tone,
+            medium: record.medium,
+            explorationSetKey: set.key,
+            explorationLaneKey: lane.key
+          }
+        });
+      }
+    }
+  }
+
+  scoredCandidates.sort((a, b) => b.score - a.score);
+  return scoredCandidates[0]?.pick || null;
 }
 
 function lanesAreHeroSatisfiable(params: {
