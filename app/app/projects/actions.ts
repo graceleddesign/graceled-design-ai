@@ -43,6 +43,11 @@ import {
   sampleRefsForOption,
   type ReferenceLibraryItem
 } from "@/lib/referenceLibrary";
+import { getCuratedReferences } from "@/lib/referenceCuration";
+import {
+  deriveRecentReferenceIds,
+  getRound1VariationTemplateByKey
+} from "@/lib/referenceSelector";
 import { normalizeStyleDirection, type StyleDirection } from "@/lib/style-direction";
 import {
   isStyleMediumKey,
@@ -1889,6 +1894,36 @@ function buildLockupGenerationPrompt(params: {
   const referenceLine = referenceTags
     ? `Style reference tags: ${referenceTags}.`
     : "";
+  const variationTemplate =
+    typeof params.directionSpec?.variationTemplateKey === "string" && params.directionSpec.variationTemplateKey.trim()
+      ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
+      : null;
+  const variationTemplateLine = variationTemplate
+    ? `Variation template (${variationTemplate.key}): ${variationTemplate.lockupLayoutInstruction}`
+    : "";
+  const referenceAnchorContextLine = params.directionSpec?.referenceId
+    ? `Reference anchor: ${params.directionSpec.referenceId} (${params.directionSpec.referenceCluster || "other"}, ${
+        params.directionSpec.referenceTier || "unknown"
+      }).`
+    : "";
+  const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
+    ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
+    : "";
+  const originalityRuleLine = params.directionSpec?.referenceId
+    ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
+    : "";
+  const motifRecompositionLine = params.directionSpec?.referenceId
+    ? "Use the sermon motif/themes (from our motif system) to create a new focal element."
+    : "";
+  const referenceLockupLayoutFamilyLine = params.directionSpec?.lockupLayoutFamily
+    ? `Reference cluster lockup family: ${params.directionSpec.lockupLayoutFamily}.`
+    : "";
+  const referenceToneMediumLine =
+    params.directionSpec?.referenceToneHint || params.directionSpec?.referenceMediumHint
+      ? `Reference cluster style map: tone=${params.directionSpec?.referenceToneHint || "auto"}, medium=${
+          params.directionSpec?.referenceMediumHint || "auto"
+        }.`
+      : "";
   const styleAuthorityOverrideLine =
     "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const styleSpecificLine =
@@ -1957,6 +1992,13 @@ function buildLockupGenerationPrompt(params: {
     styleFamilyForbidsLine,
     styleFamilyLayoutBiasLine,
     styleAuthorityOverrideLine,
+    referenceAnchorContextLine,
+    referenceAnchorDirectiveLine,
+    originalityRuleLine,
+    motifRecompositionLine,
+    referenceLockupLayoutFamilyLine,
+    referenceToneMediumLine,
+    variationTemplateLine,
     referenceLine,
     styleSpecificLine,
     archetypeLine,
@@ -3004,6 +3046,55 @@ async function loadRecentStyleFamilies(params: {
   return recent;
 }
 
+async function loadRecentReferenceIds(params: {
+  organizationId: string;
+  projectId: string;
+  projectLimit?: number;
+  globalLimit?: number;
+}): Promise<{
+  projectRecent: string[];
+  globalRecent: string[];
+}> {
+  const projectLimit = Math.max(1, Math.min(params.projectLimit || 12, 30));
+  const globalLimit = Math.max(1, Math.min(params.globalLimit || 30, 80));
+
+  const [projectGenerations, organizationGenerations] = await Promise.all([
+    prisma.generation.findMany({
+      where: {
+        projectId: params.projectId
+      },
+      orderBy: [{ round: "desc" }, { createdAt: "desc" }],
+      take: 40,
+      select: {
+        output: true
+      }
+    }),
+    prisma.generation.findMany({
+      where: {
+        project: {
+          organizationId: params.organizationId,
+          id: {
+            not: params.projectId
+          }
+        }
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: 100,
+      select: {
+        output: true
+      }
+    })
+  ]);
+
+  const projectRecent = deriveRecentReferenceIds(projectGenerations, { limit: projectLimit });
+  const globalRecent = deriveRecentReferenceIds([...projectGenerations, ...organizationGenerations], { limit: globalLimit });
+
+  return {
+    projectRecent,
+    globalRecent
+  };
+}
+
 async function loadRecentLockupRecipeIds(params: {
   organizationId: string;
   projectId: string;
@@ -3769,6 +3860,7 @@ type GenerationOutputPayload = {
   meta: {
     styleRefCount: number;
     usedStylePaths: string[];
+    usedReferenceIds?: string[];
     revisedPrompt?: string;
     debug?: {
       styleFamilyFallback?: {
@@ -3898,6 +3990,11 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     motifScope: directionSpec?.motifScope || params.motifBankContext?.scriptureScope || null,
     wantsTitleStage,
     wantsSeriesMark: directionSpec?.wantsSeriesMark === true,
+    referenceIds: dedupeReferencesById(params.referenceItems || []).map((reference) => reference.id),
+    referenceId: directionSpec?.referenceId || params.referenceItems?.[0]?.id || null,
+    referenceCluster: directionSpec?.referenceCluster || null,
+    referenceTier: directionSpec?.referenceTier || null,
+    variationTemplateKey: directionSpec?.variationTemplateKey || null,
     motifFocus: directionSpec?.motifFocus || [],
     bookKeys: params.motifBankContext?.bookKeys || [],
     bookNames: params.motifBankContext?.bookNames || [],
@@ -3915,6 +4012,7 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     meta: {
       styleRefCount: params.referenceItems?.length || 0,
       usedStylePaths: (params.referenceItems || []).map((ref) => ref.path || ref.thumbPath),
+      usedReferenceIds: dedupeReferencesById(params.referenceItems || []).map((reference) => reference.id),
       revisedPrompt: params.revisedPrompt,
       ...(!hasDesignNotes
         ? {
@@ -4175,13 +4273,32 @@ async function findEnabledPresetsForOrganization(organizationId: string): Promis
   });
 }
 
-async function pickReferenceSetsForRound(projectId: string, round: number, optionCount: number): Promise<ReferenceLibraryItem[][]> {
+function dedupeReferencesById(references: ReferenceLibraryItem[]): ReferenceLibraryItem[] {
+  const deduped: ReferenceLibraryItem[] = [];
+  const seen = new Set<string>();
+  for (const reference of references) {
+    const normalizedId = reference.id.trim().toLowerCase();
+    if (!normalizedId || seen.has(normalizedId)) {
+      continue;
+    }
+    seen.add(normalizedId);
+    deduped.push(reference);
+  }
+  return deduped;
+}
+
+async function pickReferenceSetsForRound(
+  projectId: string,
+  round: number,
+  optionCount: number,
+  directionPlan?: readonly PlannedDirectionSpec[]
+): Promise<ReferenceLibraryItem[][]> {
   const refs = await loadIndex();
   if (refs.length === 0) {
     return Array.from({ length: optionCount }, () => []);
   }
 
-  return Promise.all(
+  const fallbackSets = await Promise.all(
     Array.from({ length: optionCount }, (_, optionIndex) =>
       sampleRefsForOption({
         projectId,
@@ -4191,6 +4308,21 @@ async function pickReferenceSetsForRound(projectId: string, round: number, optio
       })
     )
   );
+  if (!directionPlan || round !== 1) {
+    return fallbackSets;
+  }
+
+  const referenceById = new Map(refs.map((reference) => [reference.id.trim().toLowerCase(), reference] as const));
+  return fallbackSets.map((fallbackRefs, optionIndex) => {
+    const anchorId = directionPlan[optionIndex]?.referenceId?.trim().toLowerCase() || "";
+    const anchorReference = anchorId ? referenceById.get(anchorId) || null : null;
+    if (!anchorReference) {
+      return fallbackRefs;
+    }
+
+    const merged = dedupeReferencesById([anchorReference, ...fallbackRefs]);
+    return merged.slice(0, 3);
+  });
 }
 
 type PlannedGeneration = {
@@ -4413,6 +4545,27 @@ function buildTemplateBackgroundPrompt(params: {
         " "
       )} Forbids: ${styleFamily.forbids.join("; ")}.`
     : "";
+  const variationTemplate =
+    typeof params.directionSpec?.variationTemplateKey === "string" && params.directionSpec.variationTemplateKey.trim()
+      ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
+      : null;
+  const variationTemplateLine = variationTemplate
+    ? `Variation template (${variationTemplate.key}): ${variationTemplate.backgroundLayoutInstruction}`
+    : "";
+  const referenceAnchorContextLine = params.directionSpec?.referenceId
+    ? `Reference anchor: ${params.directionSpec.referenceId} (${params.directionSpec.referenceCluster || "other"}, ${
+        params.directionSpec.referenceTier || "unknown"
+      }).`
+    : "";
+  const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
+    ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
+    : "";
+  const originalityRuleLine = params.directionSpec?.referenceId
+    ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
+    : "";
+  const motifRecompositionLine = params.directionSpec?.referenceId
+    ? "Use the sermon motif/themes (from our motif system) to create a new focal element."
+    : "";
   const styleAuthorityOverrideLine =
     "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const backgroundTextFreeRuleLine =
@@ -4477,6 +4630,11 @@ function buildTemplateBackgroundPrompt(params: {
     hardMediumConstraintLine,
     mediumRulesLine,
     styleFamilyBackgroundRulesLine,
+    referenceAnchorContextLine,
+    referenceAnchorDirectiveLine,
+    originalityRuleLine,
+    motifRecompositionLine,
+    variationTemplateLine,
     styleAuthorityOverrideLine,
     backgroundTextFreeRuleLine,
     ignoreTypographyRefLine,
@@ -4871,7 +5029,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const optionStyleFamily = ((directionSpec?.templateStyleFamily ||
         designBrief.styleFamilies[plannedGeneration.optionIndex] ||
         designBrief.styleFamilies[0]) as StyleFamily);
-      const references =
+      const sampledReferences =
         plannedGeneration.references.length > 0
           ? plannedGeneration.references.slice(0, 3)
           : referenceIndex.length > 0
@@ -4882,6 +5040,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 n: 3
               })
             : [];
+      const anchorReferenceId = directionSpec?.referenceId?.trim().toLowerCase() || "";
+      const anchorReference =
+        anchorReferenceId.length > 0
+          ? sampledReferences.find((reference) => reference.id.trim().toLowerCase() === anchorReferenceId) ||
+            referenceIndex.find((reference) => reference.id.trim().toLowerCase() === anchorReferenceId) ||
+            null
+          : null;
+      const references = anchorReference
+        ? dedupeReferencesById([anchorReference, ...sampledReferences]).slice(0, 3)
+        : sampledReferences;
       const lockupStyleMode = resolveLockupStyleMode({
         directionSpec,
         styleFamily: optionStyleFamily,
@@ -5742,6 +5910,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         directionSpec
           ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily || "unassigned"} / ${directionSpec.laneFamily} / ${directionSpec.compositionType}]`
           : "",
+        directionSpec?.referenceId
+          ? `[reference-anchor: ${directionSpec.referenceId}${directionSpec.referenceCluster ? `/${directionSpec.referenceCluster}` : ""}]`
+          : "",
+        directionSpec?.variationTemplateKey ? `[variation-template: ${directionSpec.variationTemplateKey}]` : "",
         effectiveDirectionStyleFamily ? `[style-family: ${effectiveDirectionStyleFamily}]` : "",
         effectiveDirectionStyleBucket ? `[style-bucket: ${effectiveDirectionStyleBucket}]` : "",
         effectiveDirectionStyleTone ? `[style-tone: ${effectiveDirectionStyleTone}]` : "",
@@ -5831,6 +6003,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         meta: {
           styleRefCount: references.length,
           usedStylePaths: references.map((reference) => reference.path || reference.thumbPath),
+          usedReferenceIds: dedupeReferencesById(references).map((reference) => reference.id),
           lockupValidation: {
             ok: lockupTextValidation?.valid ?? true,
             reasons: lockupTextValidation?.reasons || [],
@@ -5879,6 +6052,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             styleBucket: effectiveDirectionStyleBucket || null,
             styleTone: effectiveDirectionStyleTone || null,
             styleMedium: effectiveDirectionStyleMedium || null,
+            referenceIds: dedupeReferencesById(references).map((reference) => reference.id),
+            referenceId: directionSpec?.referenceId || references[0]?.id || null,
+            referenceCluster: directionSpec?.referenceCluster || null,
+            referenceTier: directionSpec?.referenceTier || null,
+            variationTemplateKey: directionSpec?.variationTemplateKey || null,
             motifScope: directionSpec?.motifScope || motifBankContext.scriptureScope,
             lockupPresetId,
             lockupLayout,
@@ -6151,7 +6329,8 @@ export async function generateRoundOneAction(
   });
   const hasDesignNotes = hasDesignDirection(project.designNotes, null);
   const explorationMode = !hasDesignNotes;
-  const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys] = await Promise.all([
+  const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys, recentReferenceIds, curatedRefs] =
+    await Promise.all([
     loadRecentProjectMotifs(project.id),
     loadRecentStyleFamilies({
       organizationId: session.organizationId,
@@ -6170,7 +6349,19 @@ export async function generateRoundOneAction(
           projectId: project.id,
           limit: 8
         })
-      : Promise.resolve([])
+      : Promise.resolve([]),
+    explorationMode
+      ? loadRecentReferenceIds({
+          organizationId: session.organizationId,
+          projectId: project.id,
+          projectLimit: 12,
+          globalLimit: 30
+        })
+      : Promise.resolve({
+          projectRecent: [],
+          globalRecent: []
+        }),
+    explorationMode ? getCuratedReferences() : Promise.resolve([])
   ]);
   const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
   const bibleCreativeBrief = await extractBibleCreativeBrief({
@@ -6209,7 +6400,10 @@ export async function generateRoundOneAction(
     primaryThemes: motifBankContext.primaryThemeCandidates,
     secondaryThemes: motifBankContext.secondaryThemeCandidates,
     sceneMotifs: motifBankContext.sceneMotifCandidates,
-    sceneMotifRequested: motifBankContext.sceneMotifRequested
+    sceneMotifRequested: motifBankContext.sceneMotifRequested,
+    curatedRefs,
+    recentReferenceIdsProject: recentReferenceIds.projectRecent,
+    recentReferenceIdsGlobal: recentReferenceIds.globalRecent
   });
   const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
   const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
@@ -6219,7 +6413,7 @@ export async function generateRoundOneAction(
     return { error: "At least three presets are required to generate options." };
   }
 
-  const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT);
+  const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT, directionPlan);
   const lockupLayoutsForOptions = resolvePlannedLockupLayouts({
     seed: `${runSeed}:round-1`,
     directionPlan,

@@ -1,0 +1,315 @@
+{
+  "version": 1,
+  "items": {
+    "ref_0001": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0002": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0003": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0004": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0009": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0011": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0016": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0017": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0019": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0020": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0021": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0023": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0030": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0031": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0033": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0034": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0037": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0038": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0041": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0044": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0046": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0048": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0050": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0051": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0055": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0057": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0062": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0064": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0066": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0071": {
+      "tier": "experimental",
+      "cluster": "architectural",
+      "tags": []
+    },
+    "ref_0072": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0073": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0076": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0083": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0086": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0089": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0090": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0091": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0093": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0097": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0098": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0100": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0101": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0105": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0106": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0107": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0114": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0115": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0118": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0122": {
+      "tier": "pro",
+      "cluster": "modern_abstract",
+      "tags": []
+    },
+    "ref_0125": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0134": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0135": {
+      "tier": "pro",
+      "cluster": "editorial_photo",
+      "tags": []
+    },
+    "ref_0139": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0143": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0144": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0148": {
+      "tier": "pro",
+      "cluster": "illustration",
+      "tags": []
+    },
+    "ref_0149": {
+      "tier": "experimental",
+      "cluster": "retro_print",
+      "tags": []
+    },
+    "ref_0150": {
+      "tier": "pro",
+      "cluster": "minimal",
+      "tags": []
+    },
+    "ref_0155": {
+      "tier": "pro",
+      "cluster": "bold_type",
+      "tags": []
+    },
+    "ref_0157": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    },
+    "ref_0161": {
+      "tier": "pro",
+      "cluster": "cinematic",
+      "tags": []
+    }
+  }
+}

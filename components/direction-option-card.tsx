@@ -51,6 +51,10 @@ type DirectionOptionCardProps = {
   styleMedium?: string | null;
   motifScope?: "whole_book" | "multi_passage" | "specific_passage" | null;
   brandMode?: "brand" | "fresh";
+  debugReferenceId?: string | null;
+  debugReferenceCluster?: string | null;
+  debugVariationTemplateKey?: string | null;
+  showDebugChips?: boolean;
   previewUrls: Record<DirectionPreviewFormat, string>;
   finalizeAction: () => Promise<void>;
 };
@@ -73,6 +77,10 @@ export function DirectionOptionCard({
   styleMedium = null,
   motifScope = null,
   brandMode,
+  debugReferenceId = null,
+  debugReferenceCluster = null,
+  debugVariationTemplateKey = null,
+  showDebugChips = false,
   previewUrls,
   finalizeAction
 }: DirectionOptionCardProps) {
@@ -92,7 +100,10 @@ export function DirectionOptionCard({
     styleFamilyName ? `Style: ${styleFamilyName}` : null,
     lockupLayout ? `Lockup Layout: ${lockupLayout}` : null,
     motifFocus.length > 0 ? `Motif focus: ${motifFocus.join(" + ")}` : null,
-    brandMode ? `Mode: ${brandMode === "brand" ? "Brand-aligned" : "Fresh"}` : null
+    brandMode ? `Mode: ${brandMode === "brand" ? "Brand-aligned" : "Fresh"}` : null,
+    showDebugChips && debugReferenceId ? `Ref ID: ${debugReferenceId}` : null,
+    showDebugChips && debugReferenceCluster ? `Ref cluster: ${debugReferenceCluster}` : null,
+    showDebugChips && debugVariationTemplateKey ? `Template: ${debugVariationTemplateKey}` : null
   ].filter((chip): chip is string => Boolean(chip));
 
   useEffect(() => {
