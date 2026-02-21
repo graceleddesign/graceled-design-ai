@@ -1454,6 +1454,75 @@ export const BIBLE_MOTIF_BANK: Record<string, MotifBankEntry> = Object.fromEntri
   MOTIF_BANK_ENTRIES.map((entry) => [entry.key, entry])
 ) as Record<string, MotifBankEntry>;
 
+export const BOOK_CHAPTER_COUNTS: Record<string, number> = {
+  genesis: 50,
+  exodus: 40,
+  leviticus: 27,
+  numbers: 36,
+  deuteronomy: 34,
+  joshua: 24,
+  judges: 21,
+  ruth: 4,
+  "1_samuel": 31,
+  "2_samuel": 24,
+  "1_kings": 22,
+  "2_kings": 25,
+  "1_chronicles": 29,
+  "2_chronicles": 36,
+  ezra: 10,
+  nehemiah: 13,
+  esther: 10,
+  job: 42,
+  psalms: 150,
+  proverbs: 31,
+  ecclesiastes: 12,
+  song_of_solomon: 8,
+  isaiah: 66,
+  jeremiah: 52,
+  lamentations: 5,
+  ezekiel: 48,
+  daniel: 12,
+  hosea: 14,
+  joel: 3,
+  amos: 9,
+  obadiah: 1,
+  jonah: 4,
+  micah: 7,
+  nahum: 3,
+  habakkuk: 3,
+  zephaniah: 3,
+  haggai: 2,
+  zechariah: 14,
+  malachi: 4,
+  matthew: 28,
+  mark: 16,
+  luke: 24,
+  john: 21,
+  acts: 28,
+  romans: 16,
+  "1_corinthians": 16,
+  "2_corinthians": 13,
+  galatians: 6,
+  ephesians: 6,
+  philippians: 4,
+  colossians: 4,
+  "1_thessalonians": 5,
+  "2_thessalonians": 3,
+  "1_timothy": 6,
+  "2_timothy": 4,
+  titus: 3,
+  philemon: 1,
+  hebrews: 13,
+  james: 5,
+  "1_peter": 5,
+  "2_peter": 3,
+  "1_john": 5,
+  "2_john": 1,
+  "3_john": 1,
+  jude: 1,
+  revelation: 22
+};
+
 const TOPICAL_MOTIF_BANK_ENTRIES: TopicalMotifBankEntry[] = [
   {
     key: "advent",
@@ -2215,6 +2284,7 @@ export function detectBookKeysFromText(text: string): string[] {
 
 const CHAPTER_VERSE_PATTERN = /\b\d{1,3}:\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?\b/;
 const REFERENCE_SEPARATOR_PATTERN = /[;,]/;
+const CHAPTER_RANGE_WITHOUT_VERSE_PATTERN = /^\s*(.+?)\s+(\d{1,3})\s*[-\u2013\u2014]\s*(\d{1,3})\s*$/;
 const BARE_REFERENCE_SEGMENT_PATTERN =
   /^\s*\d{1,3}(?::\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?)?(?:\s*[-\u2013]\s*\d{1,3}(?::\d{1,3})?)?\s*$/;
 const SCRIPTURE_SCOPE_DEBUG_FLAG = "BIBLE_MOTIF_SCOPE_DEBUG";
@@ -2252,6 +2322,69 @@ function isBookOnlyReference(value: string): boolean {
 
 function hasChapterVerse(value: string): boolean {
   return CHAPTER_VERSE_PATTERN.test(value || "");
+}
+
+function resolveCanonicalBookKey(value: string): string | null {
+  const raw = (value || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const normalized = normalizeLookupValue(raw);
+  const directMatch = BOOK_ALIAS_TO_KEY.get(normalized);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const normalizedPhrase = normalizeScopePhrase(raw)
+    .replace(/^the\s+/, "")
+    .replace(/^gospel\s+of\s+/, "")
+    .replace(/^book\s+of\s+/, "")
+    .trim();
+  if (!normalizedPhrase) {
+    return null;
+  }
+
+  const phraseMatch = BOOK_ALIAS_TO_KEY.get(normalizeLookupValue(normalizedPhrase));
+  if (phraseMatch) {
+    return phraseMatch;
+  }
+
+  const compactOrdinalPhrase = normalizedPhrase.replace(/^([1-3])(?=[a-z])/, "$1 ");
+  if (compactOrdinalPhrase !== normalizedPhrase) {
+    const compactOrdinalMatch = BOOK_ALIAS_TO_KEY.get(normalizeLookupValue(compactOrdinalPhrase));
+    if (compactOrdinalMatch) {
+      return compactOrdinalMatch;
+    }
+  }
+
+  const detected = detectBookKeysFromText(raw);
+  return detected.length === 1 ? detected[0] : null;
+}
+
+function parseChapterRangeWithoutVerses(value: string): { bookKey: string; startChapter: number; endChapter: number } | null {
+  const raw = (value || "").trim();
+  if (!raw || raw.includes(":") || hasExplicitMultiReference(raw) || REFERENCE_SEPARATOR_PATTERN.test(raw)) {
+    return null;
+  }
+
+  const match = raw.match(CHAPTER_RANGE_WITHOUT_VERSE_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  const bookKey = resolveCanonicalBookKey(match[1] || "");
+  if (!bookKey) {
+    return null;
+  }
+
+  const startChapter = Number.parseInt(match[2] || "", 10);
+  const endChapter = Number.parseInt(match[3] || "", 10);
+  if (!Number.isInteger(startChapter) || !Number.isInteger(endChapter) || startChapter < 1 || endChapter < 1) {
+    return null;
+  }
+
+  return { bookKey, startChapter, endChapter };
 }
 
 function splitReferenceSegments(value: string): string[] {
@@ -2359,6 +2492,19 @@ export function inferScriptureScope(input: {
 
   const explicitMultiReference = [passageRef, seriesTitle, sermonTitle, subtitle].some((value) => hasExplicitMultiReference(value));
   if (explicitMultiReference) {
+    return complete("multi_passage");
+  }
+
+  const chapterRangeWithoutVerses = parseChapterRangeWithoutVerses(passageRef);
+  if (chapterRangeWithoutVerses) {
+    const chapterCount = BOOK_CHAPTER_COUNTS[chapterRangeWithoutVerses.bookKey];
+    if (
+      typeof chapterCount === "number" &&
+      chapterRangeWithoutVerses.startChapter === 1 &&
+      chapterRangeWithoutVerses.endChapter >= chapterCount
+    ) {
+      return complete("whole_book");
+    }
     return complete("multi_passage");
   }
 

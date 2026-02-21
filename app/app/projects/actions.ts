@@ -179,6 +179,15 @@ const MONO_TONE_OVERRIDE_RETRY_BOOST =
 const DARK_TONE_OVERRIDE_RETRY_BOOST =
   "DARK OVERRIDE RETRY: dark but readable; avoid pure black; include visible midtones and highlights; clear forms and structure; maintain strong contrast for title-safe area.";
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
+const ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT = 4;
+const ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT = 2;
+const ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO = 0.06;
+const ROUND1_EXPLORATION_LOCKUP_MIN_HEIGHT_RATIO = 0.28;
+const TITLE_SAFE_EDGE_SOFT_MAX = 0.085;
+const TITLE_SAFE_VARIANCE_TARGET = 24;
+const TITLE_SAFE_VARIANCE_TOLERANCE = 22;
+const MIDTONE_CRUSHED_RATIO_FLOOR = 0.06;
+const MIDTONE_CRUSHED_RATIO_CEILING = 0.42;
 const LOCKUP_ASSET_SLOT = "series_lockup";
 const LOCKUP_LAYOUT_ARCHETYPES = [
   "editorial_stack",
@@ -852,6 +861,13 @@ function evaluateToneCompliance(tone: "light" | "vivid" | "dark" | "mono", stats
   return { passed: failures.length === 0, failures };
 }
 
+function passesDesignPresence(stats: ImageToneStats | null): boolean {
+  if (!stats) {
+    return false;
+  }
+  return stats.luminanceStdDev >= DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV && stats.edgeDensity >= DESIGN_PRESENCE_MIN_EDGE_DENSITY;
+}
+
 function shouldCheckToneCompliance(tone: StyleToneKey | null): tone is "light" | "vivid" | "dark" | "mono" {
   return tone === "light" || tone === "vivid" || tone === "dark" || tone === "mono";
 }
@@ -884,6 +900,299 @@ async function computeImageToneStatsFromUrl(url: string): Promise<ImageToneStats
   } catch {
     return null;
   }
+}
+
+type TitleSafeBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+type TitleSafeRegionScore = {
+  sampleCount: number;
+  edgeDensity: number;
+  luminanceStdDev: number;
+  edgeSimplicity: number;
+  varianceModeration: number;
+  score: number;
+};
+
+async function scoreTitleSafeRegion(imageUrl: string, titleSafeBox: TitleSafeBox): Promise<TitleSafeRegionScore | null> {
+  const source = imageUrl.trim();
+  if (!source) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(source);
+    if (!response.ok) {
+      return null;
+    }
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const raster = await sharp(bytes, { failOn: "none" })
+      .resize({
+        width: TONE_STATS_SAMPLE_SIZE,
+        height: TONE_STATS_SAMPLE_SIZE,
+        fit: "fill"
+      })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const { data, info } = raster;
+    const width = Math.max(1, info.width || TONE_STATS_SAMPLE_SIZE);
+    const height = Math.max(1, info.height || TONE_STATS_SAMPLE_SIZE);
+    const channels = Math.max(4, info.channels || 4);
+    const leftRatio = clampNumber(titleSafeBox.left, 0, 0.95);
+    const topRatio = clampNumber(titleSafeBox.top, 0, 0.95);
+    const widthRatio = clampNumber(titleSafeBox.width, 0.05, 1);
+    const heightRatio = clampNumber(titleSafeBox.height, 0.05, 1);
+    const left = clampNumber(Math.round(width * leftRatio), 0, Math.max(0, width - 2));
+    const top = clampNumber(Math.round(height * topRatio), 0, Math.max(0, height - 2));
+    const regionWidth = clampNumber(Math.round(width * widthRatio), 2, Math.max(2, width - left));
+    const regionHeight = clampNumber(Math.round(height * heightRatio), 2, Math.max(2, height - top));
+    const right = clampNumber(left + regionWidth, left + 1, width);
+    const bottom = clampNumber(top + regionHeight, top + 1, height);
+    const regionPixelCount = Math.max(1, (right - left) * (bottom - top));
+    const luminanceByPixel = new Float32Array(regionPixelCount);
+    const opaqueMask = new Uint8Array(regionPixelCount);
+
+    let sampleCount = 0;
+    let luminanceSum = 0;
+    for (let y = top; y < bottom; y += 1) {
+      for (let x = left; x < right; x += 1) {
+        const index = (y - top) * (right - left) + (x - left);
+        const offset = (y * width + x) * channels;
+        const alpha = data[offset + 3];
+        const r = data[offset];
+        const g = data[offset + 1];
+        const b = data[offset + 2];
+        const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        luminanceByPixel[index] = luminance;
+        if (alpha <= 10) {
+          continue;
+        }
+        opaqueMask[index] = 1;
+        sampleCount += 1;
+        luminanceSum += luminance;
+      }
+    }
+
+    if (sampleCount <= 0) {
+      return null;
+    }
+
+    const regionWidthPx = right - left;
+    const regionHeightPx = bottom - top;
+    const meanLuminance = luminanceSum / sampleCount;
+    let varianceSum = 0;
+    for (let index = 0; index < regionPixelCount; index += 1) {
+      if (!opaqueMask[index]) {
+        continue;
+      }
+      const delta = luminanceByPixel[index] - meanLuminance;
+      varianceSum += delta * delta;
+    }
+    const luminanceStdDev = Math.sqrt(varianceSum / sampleCount);
+
+    let edgeCount = 0;
+    let edgeSampleCount = 0;
+    for (let y = 1; y < regionHeightPx - 1; y += 1) {
+      for (let x = 1; x < regionWidthPx - 1; x += 1) {
+        const idx = y * regionWidthPx + x;
+        const leftIdx = idx - 1;
+        const rightIdx = idx + 1;
+        const upIdx = idx - regionWidthPx;
+        const downIdx = idx + regionWidthPx;
+        if (!opaqueMask[idx] || !opaqueMask[leftIdx] || !opaqueMask[rightIdx] || !opaqueMask[upIdx] || !opaqueMask[downIdx]) {
+          continue;
+        }
+        edgeSampleCount += 1;
+        const gx = Math.abs(luminanceByPixel[rightIdx] - luminanceByPixel[leftIdx]);
+        const gy = Math.abs(luminanceByPixel[downIdx] - luminanceByPixel[upIdx]);
+        if (gx + gy >= DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD) {
+          edgeCount += 1;
+        }
+      }
+    }
+
+    const edgeDensity = edgeSampleCount > 0 ? edgeCount / edgeSampleCount : 0;
+    const edgeSimplicity = 1 - clampNumber(edgeDensity / TITLE_SAFE_EDGE_SOFT_MAX, 0, 1);
+    const varianceModeration =
+      1 - clampNumber(Math.abs(luminanceStdDev - TITLE_SAFE_VARIANCE_TARGET) / TITLE_SAFE_VARIANCE_TOLERANCE, 0, 1);
+    const score = clampNumber(edgeSimplicity * 0.68 + varianceModeration * 0.32, 0, 1);
+
+    return {
+      sampleCount,
+      edgeDensity,
+      luminanceStdDev,
+      edgeSimplicity,
+      varianceModeration,
+      score
+    };
+  } catch {
+    return null;
+  }
+}
+
+type MidtoneRangeScore = {
+  sampleCount: number;
+  shadowClippedRatio: number;
+  highlightClippedRatio: number;
+  score: number;
+};
+
+async function scoreMidtoneRangeFromBuffer(imageBuffer: Buffer): Promise<MidtoneRangeScore | null> {
+  try {
+    const raster = await sharp(imageBuffer, { failOn: "none" })
+      .resize({
+        width: TONE_STATS_SAMPLE_SIZE,
+        height: TONE_STATS_SAMPLE_SIZE,
+        fit: "fill"
+      })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const { data, info } = raster;
+    const width = Math.max(1, info.width || TONE_STATS_SAMPLE_SIZE);
+    const height = Math.max(1, info.height || TONE_STATS_SAMPLE_SIZE);
+    const channels = Math.max(4, info.channels || 4);
+    const totalPixels = width * height;
+
+    let sampleCount = 0;
+    let shadowClippedCount = 0;
+    let highlightClippedCount = 0;
+    for (let index = 0; index < totalPixels; index += 1) {
+      const offset = index * channels;
+      const alpha = data[offset + 3];
+      if (alpha <= 10) {
+        continue;
+      }
+      const r = data[offset];
+      const g = data[offset + 1];
+      const b = data[offset + 2];
+      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      sampleCount += 1;
+      if (luminance <= 18) {
+        shadowClippedCount += 1;
+      }
+      if (luminance >= 237) {
+        highlightClippedCount += 1;
+      }
+    }
+
+    if (sampleCount <= 0) {
+      return null;
+    }
+
+    const shadowClippedRatio = shadowClippedCount / sampleCount;
+    const highlightClippedRatio = highlightClippedCount / sampleCount;
+    const crushedRatio = shadowClippedRatio + highlightClippedRatio;
+    const score =
+      1 -
+      clampNumber(
+        (crushedRatio - MIDTONE_CRUSHED_RATIO_FLOOR) / (MIDTONE_CRUSHED_RATIO_CEILING - MIDTONE_CRUSHED_RATIO_FLOOR),
+        0,
+        1
+      );
+
+    return {
+      sampleCount,
+      shadowClippedRatio,
+      highlightClippedRatio,
+      score
+    };
+  } catch {
+    return null;
+  }
+}
+
+type LockupFitCheck = {
+  fitPass: boolean;
+  insideTitleSafeWithMargin: boolean;
+  notTooSmall: boolean;
+  fittedWidth: number;
+  fittedHeight: number;
+  safeHeightRatio: number;
+  safeCoverage: number;
+  score: number;
+};
+
+function evaluateLockupFit(params: {
+  lockupWidth: number;
+  lockupHeight: number;
+  shape: PreviewShape;
+  canvasWidth: number;
+  canvasHeight: number;
+  marginRatio: number;
+}): LockupFitCheck {
+  const safeRatio = LOCKUP_SAFE_REGION_RATIOS[params.shape];
+  const safeWidth = Math.max(1, Math.round(params.canvasWidth * safeRatio.width));
+  const safeHeight = Math.max(1, Math.round(params.canvasHeight * safeRatio.height));
+  const marginX = Math.max(1, Math.round(safeWidth * clampNumber(params.marginRatio, 0, 0.2)));
+  const marginY = Math.max(1, Math.round(safeHeight * clampNumber(params.marginRatio, 0, 0.2)));
+  const innerWidth = Math.max(1, safeWidth - marginX * 2);
+  const innerHeight = Math.max(1, safeHeight - marginY * 2);
+  const lockupWidth = Math.max(1, params.lockupWidth);
+  const lockupHeight = Math.max(1, params.lockupHeight);
+  const scale = Math.min(innerWidth / lockupWidth, innerHeight / lockupHeight);
+  const fittedWidth = Math.max(1, Math.round(lockupWidth * scale));
+  const fittedHeight = Math.max(1, Math.round(lockupHeight * scale));
+  const insideTitleSafeWithMargin = fittedWidth <= innerWidth && fittedHeight <= innerHeight;
+  const safeHeightRatio = fittedHeight / safeHeight;
+  const notTooSmall = safeHeightRatio >= ROUND1_EXPLORATION_LOCKUP_MIN_HEIGHT_RATIO;
+  const safeCoverage = (fittedWidth * fittedHeight) / Math.max(1, innerWidth * innerHeight);
+  const heightTarget = 0.44;
+  const coverageTarget = 0.52;
+  const heightScore = 1 - clampNumber(Math.abs(safeHeightRatio - heightTarget) / 0.28, 0, 1);
+  const coverageScore = 1 - clampNumber(Math.abs(safeCoverage - coverageTarget) / 0.44, 0, 1);
+  const score = clampNumber(heightScore * 0.6 + coverageScore * 0.4, 0, 1);
+
+  return {
+    fitPass: insideTitleSafeWithMargin && notTooSmall,
+    insideTitleSafeWithMargin,
+    notTooSmall,
+    fittedWidth,
+    fittedHeight,
+    safeHeightRatio,
+    safeCoverage,
+    score
+  };
+}
+
+async function padLockupForSafeMargin(lockupPng: Buffer, marginRatio: number): Promise<Buffer> {
+  const margin = clampNumber(marginRatio, 0, 0.2);
+  if (margin <= 0) {
+    return lockupPng;
+  }
+
+  const metadata = await sharp(lockupPng, { failOn: "none" }).metadata();
+  const sourceWidth = Math.max(1, Math.round(metadata.width || 1));
+  const sourceHeight = Math.max(1, Math.round(metadata.height || 1));
+  const denom = Math.max(0.2, 1 - margin * 2);
+  const padX = Math.max(1, Math.round((sourceWidth * margin) / denom));
+  const padY = Math.max(1, Math.round((sourceHeight * margin) / denom));
+  const canvasWidth = sourceWidth + padX * 2;
+  const canvasHeight = sourceHeight + padY * 2;
+
+  return sharp({
+    create: {
+      width: canvasWidth,
+      height: canvasHeight,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    }
+  })
+    .composite([
+      {
+        input: lockupPng,
+        left: padX,
+        top: padY
+      }
+    ])
+    .png()
+    .toBuffer();
 }
 
 function pngBufferToDataUrl(png: Buffer): string {
@@ -2979,6 +3288,63 @@ type BuildGenerationOutputParams = {
   motifBankContext?: MotifBankContext;
 };
 
+type BackgroundRerankCandidateDebug = {
+  url: string;
+  score: number;
+  checks: {
+    textFree: boolean;
+    tonePass: boolean;
+    designPresencePass: boolean;
+  };
+  stats: {
+    textRetryCount: number;
+    toneRetryCount: number;
+    closestDistance: number;
+    tone: ImageToneStats | null;
+    titleSafe: {
+      sampleCount: number;
+      edgeDensity: number;
+      luminanceStdDev: number;
+      edgeSimplicity: number;
+      varianceModeration: number;
+      score: number;
+    } | null;
+    midtoneRange: {
+      sampleCount: number;
+      shadowClippedRatio: number;
+      highlightClippedRatio: number;
+      score: number;
+    } | null;
+  };
+};
+
+type LockupRerankCandidateDebug = {
+  url: string;
+  score: number;
+  checks: {
+    textIntegrity: boolean;
+    fitPass: boolean;
+    insideTitleSafeWithMargin: boolean;
+    notTooSmall: boolean;
+  };
+  stats: {
+    width: number;
+    height: number;
+    fittedWidth: number;
+    fittedHeight: number;
+    safeHeightRatio: number;
+    safeCoverage: number;
+    textOverrideRetried: boolean;
+  };
+};
+
+type RerankDebugMeta = {
+  backgroundCandidates?: BackgroundRerankCandidateDebug[];
+  backgroundWinnerIndex?: number;
+  lockupCandidates?: LockupRerankCandidateDebug[];
+  lockupWinnerIndex?: number;
+};
+
 type GenerationOutputPayload = {
   designDoc: DesignDoc;
   designDocByShape: Record<PreviewShape, DesignDoc>;
@@ -2990,6 +3356,7 @@ type GenerationOutputPayload = {
     revisedPrompt?: string;
     toneCheck?: ToneCheckSummary;
     backgroundTextCheck?: BackgroundTextCheckSummary;
+    rerank?: RerankDebugMeta;
     designSpec?: Record<string, unknown>;
   };
   preview?: {
@@ -3730,7 +4097,7 @@ async function generateValidatedBackgroundPng(params: {
   paletteComplianceBoost?: string;
   toneComplianceBoost?: string;
   textArtifactRetryBoost?: string;
-}): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number }> {
+}): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number; textCheckPassed: boolean }> {
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
 
@@ -3765,7 +4132,8 @@ async function generateValidatedBackgroundPng(params: {
       return {
         backgroundPng,
         prompt,
-        textRetryCount: attempt
+        textRetryCount: attempt,
+        textCheckPassed: true
       };
     }
 
@@ -3776,7 +4144,8 @@ async function generateValidatedBackgroundPng(params: {
   return {
     backgroundPng: lastBackgroundPng as Buffer,
     prompt: lastPrompt,
-    textRetryCount: 2
+    textRetryCount: 2,
+    textCheckPassed: false
   };
 }
 
@@ -4125,8 +4494,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             lockupLayout
           });
       const typographicRecipe = lockupTypographicRecipeForArchetype(lockupLayout);
+      const titleSafeBox: TitleSafeBox = LOCKUP_SAFE_REGION_RATIOS[OPTION_MASTER_BACKGROUND_SHAPE];
+      let rerankMeta: RerankDebugMeta = {};
 
-      const renderMasterAttempt = async (originalityBoost?: string) => {
+      const renderMasterAttempt = async (originalityBoost?: string, candidateSuffix = "") => {
         if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
           const backgroundPng = await normalizePngToShape(
             reusableAssets.masterBackgroundPng,
@@ -4144,15 +4515,17 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             toneRetryCount: 0,
             toneCheck: null as ToneCheckSummary | null,
             textArtifactRetryCount: 0,
-            backgroundTextCheck: null as BackgroundTextCheckSummary | null
+            backgroundTextCheck: null as BackgroundTextCheckSummary | null,
+            textCheckPassed: true
           };
         }
 
+        const generationSeedPrefix = `${runSeed}|${plannedGeneration.optionIndex}${candidateSuffix}`;
         const initialBackground = await generateValidatedBackgroundPng({
           brief: templateBrief,
           styleFamily: optionStyleFamily,
           shape: OPTION_MASTER_BACKGROUND_SHAPE,
-          generationId: `${runSeed}|${plannedGeneration.optionIndex}`,
+          generationId: generationSeedPrefix,
           directionSpec,
           brandMode: params.project.brandMode,
           explorationMode: shouldRunExplorationToneCheck,
@@ -4204,7 +4577,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 brief: templateBrief,
                 styleFamily: optionStyleFamily,
                 shape: OPTION_MASTER_BACKGROUND_SHAPE,
-                generationId: `${runSeed}|${plannedGeneration.optionIndex}|palette-retry`,
+                generationId: `${generationSeedPrefix}|palette-retry`,
                 directionSpec,
                 brandMode: params.project.brandMode,
                 explorationMode: shouldRunExplorationToneCheck,
@@ -4259,7 +4632,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               brief: templateBrief,
               styleFamily: optionStyleFamily,
               shape: OPTION_MASTER_BACKGROUND_SHAPE,
-              generationId: `${runSeed}|${plannedGeneration.optionIndex}|tone-retry`,
+              generationId: `${generationSeedPrefix}|tone-retry`,
               directionSpec,
               brandMode: params.project.brandMode,
               explorationMode: shouldRunExplorationToneCheck,
@@ -4316,7 +4689,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               brief: templateBrief,
               styleFamily: optionStyleFamily,
               shape: OPTION_MASTER_BACKGROUND_SHAPE,
-              generationId: `${runSeed}|${plannedGeneration.optionIndex}|text-artifact-retry`,
+              generationId: `${generationSeedPrefix}|text-artifact-retry`,
               directionSpec,
               brandMode: params.project.brandMode,
               explorationMode: shouldRunExplorationToneCheck,
@@ -4370,17 +4743,121 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           toneRetryCount,
           toneCheck,
           textArtifactRetryCount,
-          backgroundTextCheck
+          backgroundTextCheck,
+          textCheckPassed: validatedBackground.textCheckPassed
         };
       };
 
-      let masterAttempt = await renderMasterAttempt();
+      const selectBackgroundWinner = async (originalityBoost?: string) => {
+        if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
+          return {
+            attempt: await renderMasterAttempt(originalityBoost),
+            winnerIndex: 0
+          };
+        }
+
+        const candidateTag = originalityBoost ? "orig" : "base";
+        const candidates: Array<{
+          attempt: Awaited<ReturnType<typeof renderMasterAttempt>>;
+          score: number;
+          checks: {
+            textFree: boolean;
+            tonePass: boolean;
+            designPresencePass: boolean;
+          };
+          stats: {
+            tone: ImageToneStats | null;
+            titleSafe: TitleSafeRegionScore | null;
+            midtoneRange: MidtoneRangeScore | null;
+          };
+          debugUrl: string;
+        }> = [];
+
+        for (let candidateIndex = 0; candidateIndex < ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT; candidateIndex += 1) {
+          const attempt = await renderMasterAttempt(
+            originalityBoost,
+            `|${candidateTag}-bg-candidate-${candidateIndex}`
+          );
+          const toneStats = attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(attempt.backgroundPng));
+          const tonePass = toneTargetForCompliance
+            ? toneStats
+              ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
+              : false
+            : true;
+          const textArtifactDetected = await detectTextArtifactsHeuristic(attempt.backgroundPng);
+          const textFree = attempt.textCheckPassed && !textArtifactDetected;
+          const designPresencePass = passesDesignPresence(toneStats);
+          const titleSafe = await scoreTitleSafeRegion(pngBufferToDataUrl(attempt.backgroundPng), titleSafeBox);
+          const midtoneRange = await scoreMidtoneRangeFromBuffer(attempt.backgroundPng);
+          let score = 0;
+          score += tonePass ? 140 : -140;
+          score += textFree ? 140 : -140;
+          score += designPresencePass ? 90 : -90;
+          score += (titleSafe?.score || 0) * 30;
+          score += (midtoneRange?.score || 0) * 35;
+          score -= attempt.textRetryCount * 2;
+          score -= attempt.textArtifactRetryCount * 4;
+          const debugUrl = await writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}.png`,
+            png: attempt.backgroundPng
+          });
+
+          candidates.push({
+            attempt,
+            score,
+            checks: {
+              textFree,
+              tonePass,
+              designPresencePass
+            },
+            stats: {
+              tone: toneStats,
+              titleSafe,
+              midtoneRange
+            },
+            debugUrl
+          });
+        }
+
+        const eligible = candidates
+          .map((candidate, index) => ({ candidate, index }))
+          .filter((entry) => entry.candidate.checks.textFree && entry.candidate.checks.tonePass && entry.candidate.checks.designPresencePass);
+        const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
+        const winner = pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0]);
+
+        rerankMeta = {
+          ...rerankMeta,
+          backgroundCandidates: candidates.map((candidate) => ({
+            url: candidate.debugUrl,
+            score: candidate.score,
+            checks: candidate.checks,
+            stats: {
+              textRetryCount: candidate.attempt.textRetryCount,
+              toneRetryCount: candidate.attempt.toneRetryCount,
+              closestDistance: candidate.attempt.closestDistance,
+              tone: candidate.stats.tone,
+              titleSafe: candidate.stats.titleSafe,
+              midtoneRange: candidate.stats.midtoneRange
+            }
+          })),
+          backgroundWinnerIndex: winner.index
+        };
+
+        return {
+          attempt: winner.candidate.attempt,
+          winnerIndex: winner.index
+        };
+      };
+
+      const initialMasterSelection = await selectBackgroundWinner();
+      let masterAttempt = initialMasterSelection.attempt;
       let originalityRetried = false;
       if (!shouldReuseBackground && Number.isFinite(masterAttempt.closestDistance) && masterAttempt.closestDistance < 6) {
         originalityRetried = true;
-        masterAttempt = await renderMasterAttempt(
+        const originalityMasterSelection = await selectBackgroundWinner(
           "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
         );
+        masterAttempt = originalityMasterSelection.attempt;
       }
       const masterLayout = computeCleanMinimalLayout({
         width: masterDimensions.width,
@@ -4410,6 +4887,18 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         ...lockupPaletteForMaster,
         autoScrim: false
       };
+      const renderLockupAttempt = async (fontSeed: string) =>
+        renderValidatedLockupPng({
+          width: masterDimensions.width,
+          height: masterDimensions.height,
+          content,
+          palette: lockupPaletteForRender,
+          lockupRecipe: lockupRecipeForRender,
+          lockupPresetId,
+          styleFamily: optionStyleFamily,
+          fontSeed,
+          lockupPrompt
+        });
       const lockupRenderComputation = shouldReuseLockup && reusableAssets?.lockupPng
         ? {
             renderResult: {
@@ -4421,21 +4910,94 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             textValidation: null as LockupSvgTextValidation | null,
             textOverrideRetried: false
           }
-        : await renderValidatedLockupPng({
-            width: masterDimensions.width,
-            height: masterDimensions.height,
-            content,
-            palette: lockupPaletteForRender,
-            lockupRecipe: lockupRecipeForRender,
-            lockupPresetId,
-            styleFamily: optionStyleFamily,
-            fontSeed: fontSeedBase,
-            lockupPrompt
-          });
+        : shouldRunExplorationToneCheck
+          ? await (async () => {
+              const candidates: Array<{
+                computation: Awaited<ReturnType<typeof renderLockupAttempt>>;
+                score: number;
+                checks: {
+                  textIntegrity: boolean;
+                  fitPass: boolean;
+                  insideTitleSafeWithMargin: boolean;
+                  notTooSmall: boolean;
+                };
+                fit: LockupFitCheck;
+                debugUrl: string;
+              }> = [];
+
+              for (let candidateIndex = 0; candidateIndex < ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT; candidateIndex += 1) {
+                const computation = await renderLockupAttempt(`${fontSeedBase}|lockup-candidate-${candidateIndex}`);
+                const validation = computation.textValidation;
+                const textIntegrity = validation.valid && validation.unexpected.length === 0 && validation.missing.length === 0;
+                const fit = evaluateLockupFit({
+                  lockupWidth: computation.renderResult.width,
+                  lockupHeight: computation.renderResult.height,
+                  shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                  canvasWidth: masterDimensions.width,
+                  canvasHeight: masterDimensions.height,
+                  marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO
+                });
+                let score = 0;
+                score += textIntegrity ? 130 : -130;
+                score += fit.fitPass ? 95 : -95;
+                score += fit.notTooSmall ? 26 : -26;
+                score += fit.score * 28;
+                score -= computation.textOverrideRetried ? 4 : 0;
+                const debugUrl = await writeGenerationPreviewFiles({
+                  fileName: `${plannedGeneration.id}-lockup-candidate-${candidateIndex}.png`,
+                  png: computation.renderResult.png
+                });
+
+                candidates.push({
+                  computation,
+                  score,
+                  checks: {
+                    textIntegrity,
+                    fitPass: fit.fitPass,
+                    insideTitleSafeWithMargin: fit.insideTitleSafeWithMargin,
+                    notTooSmall: fit.notTooSmall
+                  },
+                  fit,
+                  debugUrl
+                });
+              }
+
+              const eligible = candidates
+                .map((candidate, index) => ({ candidate, index }))
+                .filter((entry) => entry.candidate.checks.textIntegrity && entry.candidate.checks.fitPass);
+              const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
+              const winner = pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0]);
+
+              rerankMeta = {
+                ...rerankMeta,
+                lockupCandidates: candidates.map((candidate) => ({
+                  url: candidate.debugUrl,
+                  score: candidate.score,
+                  checks: candidate.checks,
+                  stats: {
+                    width: candidate.computation.renderResult.width,
+                    height: candidate.computation.renderResult.height,
+                    fittedWidth: candidate.fit.fittedWidth,
+                    fittedHeight: candidate.fit.fittedHeight,
+                    safeHeightRatio: candidate.fit.safeHeightRatio,
+                    safeCoverage: candidate.fit.safeCoverage,
+                    textOverrideRetried: candidate.computation.textOverrideRetried
+                  }
+                })),
+                lockupWinnerIndex: winner.index
+              };
+
+              return winner.candidate.computation;
+            })()
+          : await renderLockupAttempt(fontSeedBase);
       const lockupRenderResult = lockupRenderComputation.renderResult;
       const effectiveLockupPrompt = lockupRenderComputation.effectivePrompt;
       const lockupTextValidation = lockupRenderComputation.textValidation;
       const lockupTextOverrideRetried = lockupRenderComputation.textOverrideRetried;
+      const lockupPngForComposite =
+        shouldRunExplorationToneCheck && !shouldReuseLockup
+          ? await padLockupForSafeMargin(lockupRenderResult.png, ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO)
+          : lockupRenderResult.png;
       const lockupPath = await writeGenerationPreviewFiles({
         fileName: `${plannedGeneration.id}-lockup.png`,
         png: lockupRenderResult.png
@@ -4471,7 +5033,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const titleBlock = layout.blocks.find((block) => block.key === "title");
           const finalPng = await composeLockupOnBackground({
             backgroundPng,
-            lockupPng: lockupRenderResult.png,
+            lockupPng: lockupPngForComposite,
             shape,
             width: dimensions.width,
             height: dimensions.height,
@@ -4526,6 +5088,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           : lockupTextValidation
             ? "[lockup-text-validation: passed]"
             : "",
+        rerankMeta.backgroundCandidates
+          ? `[rerank-background: winner=${(rerankMeta.backgroundWinnerIndex ?? 0) + 1}/${rerankMeta.backgroundCandidates.length}]`
+          : "",
+        rerankMeta.lockupCandidates
+          ? `[rerank-lockup: winner=${(rerankMeta.lockupWinnerIndex ?? 0) + 1}/${rerankMeta.lockupCandidates.length}]`
+          : "",
         originalityRetried ? "[retry: originality-guard]" : "",
         masterAttempt.textRetryCount > 0 ? `[retry: no-text x${masterAttempt.textRetryCount}]` : "",
         masterAttempt.paletteRetryCount > 0 ? `[retry: brand-palette x${masterAttempt.paletteRetryCount}]` : "",
@@ -4600,7 +5168,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                   attempted: false,
                   detected: false,
                   retried: false
-                }
+                },
+                ...(rerankMeta.backgroundCandidates || rerankMeta.lockupCandidates
+                  ? {
+                      rerank: rerankMeta
+                    }
+                  : {})
               }
             : {}),
           designSpec: {
