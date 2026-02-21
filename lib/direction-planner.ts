@@ -1,6 +1,12 @@
 import type { TemplateStyleFamily } from "@/lib/design-brief";
 import type { ScriptureScope } from "@/lib/bible-motif-bank";
 import { isGenericMotif } from "@/lib/motif-guardrails";
+import type { CuratedReference, ReferenceCluster, ReferenceTier } from "@/lib/referenceCuration";
+import {
+  getRound1ClusterProfile,
+  pickRound1ReferenceTriplet,
+  pickRound1VariationTemplateKey
+} from "@/lib/referenceSelector";
 import {
   isStyleBucketKey,
   isStyleFamilyKey,
@@ -64,6 +70,13 @@ export type PlannedDirectionSpec = DirectionTemplate & {
   styleMedium?: StyleMediumKey;
   motifFocus?: string[];
   motifScope?: ScriptureScope;
+  referenceId?: string;
+  referenceCluster?: ReferenceCluster;
+  referenceTier?: ReferenceTier;
+  variationTemplateKey?: string;
+  referenceToneHint?: StyleToneKey;
+  referenceMediumHint?: StyleMediumKey;
+  lockupLayoutFamily?: string;
 };
 
 const OPTION_LABELS: Array<"A" | "B" | "C"> = ["A", "B", "C"];
@@ -366,6 +379,18 @@ type ExplorationStyleFamilySelection = {
   picks: StyleFamilyPick[];
   explorationSetKey?: string;
   explorationLaneKeys?: string[];
+};
+
+type Round1ReferenceAssignment = {
+  referenceId: string;
+  referenceCluster: ReferenceCluster;
+  referenceTier: ReferenceTier;
+  variationTemplateKey?: string;
+  referenceToneHint?: StyleToneKey;
+  referenceMediumHint?: StyleMediumKey;
+  lockupLayoutFamily?: string;
+  lockupPresetId?: string;
+  allowedStyleFamilies: readonly StyleFamilyKey[];
 };
 
 export type ExplorationSetConstraint = "any" | "same" | "different";
@@ -1056,6 +1081,7 @@ function pickExplorationStyleFamilies(params: {
   preferredLaneFamilies: Set<DirectionLaneFamily>;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
+  allowedFamilySetsByOption?: readonly (ReadonlySet<StyleFamilyKey> | null)[];
 }): ExplorationStyleFamilySelection | null {
   const count = params.specs.length;
   if (count <= 0) {
@@ -1087,9 +1113,13 @@ function pickExplorationStyleFamilies(params: {
     for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
       const lane = shuffledLanes[optionIndex];
       const spec = params.specs[optionIndex];
+      const allowedSet = params.allowedFamilySetsByOption?.[optionIndex] || null;
       const candidates = params.seededOrder
         .filter((family) => {
           if (usedFamilies.has(family)) {
+            return false;
+          }
+          if (allowedSet && !allowedSet.has(family)) {
             return false;
           }
           return laneMatchesFamily({
@@ -1261,6 +1291,7 @@ function assignStyleFamilies(params: {
   explorationMode?: boolean;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
+  allowedFamiliesByOption?: readonly (readonly StyleFamilyKey[] | undefined)[];
 }): ExplorationStyleFamilySelection {
   const seededOrder = createSeededRandom(`${params.runSeed}|style-family-order`).shuffle(STYLE_FAMILY_KEYS);
   const orderIndex = new Map(seededOrder.map((family, index) => [family, index] as const));
@@ -1272,6 +1303,14 @@ function assignStyleFamilies(params: {
   const recentExplorationSetRanks = new Map(recentExplorationSetOrder.map((setKey, index) => [setKey, index] as const));
   const recentRecipeRanks = new Map(recentRecipeOrder.map((recipeId, index) => [recipeId, index] as const));
   const preferredLaneFamilies = new Set(params.preferredLaneFamilies || []);
+  const allowedFamilySetsByOption = Array.from({ length: params.specs.length }, (_, optionIndex) => {
+    const rawAllowed = params.allowedFamiliesByOption?.[optionIndex];
+    if (!rawAllowed || rawAllowed.length <= 0) {
+      return null;
+    }
+    const normalized = rawAllowed.filter((family): family is StyleFamilyKey => isStyleFamilyKey(family));
+    return normalized.length > 0 ? new Set(normalized) : null;
+  });
 
   if (params.explorationMode) {
     const explorationPicks = pickExplorationStyleFamilies({
@@ -1285,7 +1324,8 @@ function assignStyleFamilies(params: {
       recentRecipeRanks,
       preferredLaneFamilies,
       brandMode: params.brandMode,
-      playfulIntent: params.playfulIntent
+      playfulIntent: params.playfulIntent,
+      allowedFamilySetsByOption
     });
     if (explorationPicks) {
       return explorationPicks;
@@ -1299,11 +1339,25 @@ function assignStyleFamilies(params: {
   const usedMediums = new Set<StyleMediumKey>();
 
   for (const [optionIndex, spec] of params.specs.entries()) {
-    const candidates = seededOrder.filter(
-      (family) => !used.has(family) && (!params.explorationMode || !usedBuckets.has(STYLE_FAMILY_BANK[family].bucket))
-    );
-    const fallbackCandidates = seededOrder.filter((family) => !used.has(family));
-    const effectiveCandidates = candidates.length > 0 ? candidates : fallbackCandidates;
+    const allowedSet = allowedFamilySetsByOption[optionIndex];
+    const candidates = seededOrder.filter((family) => {
+      if (used.has(family)) {
+        return false;
+      }
+      if (allowedSet && !allowedSet.has(family)) {
+        return false;
+      }
+      return !params.explorationMode || !usedBuckets.has(STYLE_FAMILY_BANK[family].bucket);
+    });
+    const fallbackCandidates = seededOrder.filter((family) => {
+      if (used.has(family)) {
+        return false;
+      }
+      return !allowedSet || allowedSet.has(family);
+    });
+    const unconstrainedFallbackCandidates = seededOrder.filter((family) => !used.has(family));
+    const effectiveCandidates =
+      candidates.length > 0 ? candidates : fallbackCandidates.length > 0 ? fallbackCandidates : unconstrainedFallbackCandidates;
     if (effectiveCandidates.length === 0) {
       break;
     }
@@ -1370,8 +1424,12 @@ function assignStyleFamilies(params: {
       const remainingFamilies = new Set(
         picks.filter((_, index) => index !== optionIndex).map((pick) => pick.family)
       );
-      const replacementCandidates = seededOrder.filter((family) => {
+      const allowedSet = allowedFamilySetsByOption[optionIndex];
+      const constrainedReplacementCandidates = seededOrder.filter((family) => {
         if (remainingFamilies.has(family)) {
+          return false;
+        }
+        if (allowedSet && !allowedSet.has(family)) {
           return false;
         }
         const record = STYLE_FAMILY_BANK[family];
@@ -1380,6 +1438,19 @@ function assignStyleFamilies(params: {
         }
         return record.tone === "light" || record.tone === "vivid";
       });
+      const replacementCandidates =
+        constrainedReplacementCandidates.length > 0
+          ? constrainedReplacementCandidates
+          : seededOrder.filter((family) => {
+              if (remainingFamilies.has(family)) {
+                return false;
+              }
+              const record = STYLE_FAMILY_BANK[family];
+              if (remainingBuckets.has(record.bucket)) {
+                return false;
+              }
+              return record.tone === "light" || record.tone === "vivid";
+            });
       if (replacementCandidates.length === 0) {
         continue;
       }
@@ -1413,7 +1484,12 @@ function assignStyleFamilies(params: {
 
     if (!hasLightOrVividTone(picks)) {
       const remainingBuckets = new Set(picks.slice(1).map((pick) => pick.bucket));
-      for (const family of seededOrder) {
+      const allowedSet = allowedFamilySetsByOption[0];
+      const replacementPool =
+        allowedSet && seededOrder.some((family) => allowedSet.has(family))
+          ? seededOrder.filter((family) => allowedSet.has(family))
+          : seededOrder;
+      for (const family of replacementPool) {
         if (used.has(family)) {
           continue;
         }
@@ -1743,6 +1819,101 @@ function assignMotifFocuses(params: {
   return focusByDirection.map((focus) => focus.slice(0, 2));
 }
 
+function pickRound1LockupPresetId(params: {
+  runSeed: string;
+  optionIndex: number;
+  cluster: ReferenceCluster;
+  preferredLockupPresetIds: readonly string[];
+  fallbackLockupPresetId: string;
+  usedLockupPresetIds: Set<string>;
+}): string {
+  if (params.preferredLockupPresetIds.length <= 0) {
+    return params.fallbackLockupPresetId;
+  }
+
+  const ordered = [...params.preferredLockupPresetIds].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|cluster-${params.cluster}|option-${params.optionIndex}|lockup-preset|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|cluster-${params.cluster}|option-${params.optionIndex}|lockup-preset|${b}`);
+    return aHash - bHash;
+  });
+  const unused = ordered.find((presetId) => !params.usedLockupPresetIds.has(presetId));
+  const selected = unused || ordered[0] || params.fallbackLockupPresetId;
+  params.usedLockupPresetIds.add(selected);
+  return selected;
+}
+
+function buildRound1ReferenceAssignments(params: {
+  runSeed: string;
+  optionCount: number;
+  round?: number;
+  explorationMode?: boolean;
+  curatedRefs?: readonly CuratedReference[];
+  recentReferenceIdsProject?: readonly string[];
+  recentReferenceIdsGlobal?: readonly string[];
+  fallbackLockupPresetIds: readonly string[];
+}): Array<Round1ReferenceAssignment | null> {
+  const shouldUseRound1ReferencePlan =
+    params.explorationMode === true && params.round === 1 && (params.curatedRefs?.length || 0) > 0;
+  if (!shouldUseRound1ReferencePlan) {
+    return Array.from({ length: params.optionCount }, () => null);
+  }
+
+  const pickedTriplet = pickRound1ReferenceTriplet({
+    seed: `${params.runSeed}|round1-reference-triplet`,
+    recentReferenceIdsProject: params.recentReferenceIdsProject,
+    recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
+    curatedRefs: params.curatedRefs || []
+  });
+  if (pickedTriplet.length <= 0) {
+    return Array.from({ length: params.optionCount }, () => null);
+  }
+
+  const usedTemplateKeys = new Set<string>();
+  const usedLockupPresetIds = new Set<string>();
+
+  return Array.from({ length: params.optionCount }, (_, optionIndex) => {
+    const reference = pickedTriplet[optionIndex] || pickedTriplet[optionIndex % pickedTriplet.length];
+    if (!reference) {
+      return null;
+    }
+
+    const profile = getRound1ClusterProfile(reference.cluster);
+    const variationTemplateKey = pickRound1VariationTemplateKey({
+      seed: `${params.runSeed}|option-${optionIndex}|reference-${reference.id}`,
+      cluster: reference.cluster,
+      usedTemplateKeys: [...usedTemplateKeys]
+    });
+    if (variationTemplateKey) {
+      usedTemplateKeys.add(variationTemplateKey);
+    }
+
+    const fallbackLockupPresetId =
+      params.fallbackLockupPresetIds[optionIndex] ||
+      params.fallbackLockupPresetIds[params.fallbackLockupPresetIds.length - 1] ||
+      "split_title_dynamic";
+    const lockupPresetId = pickRound1LockupPresetId({
+      runSeed: params.runSeed,
+      optionIndex,
+      cluster: reference.cluster,
+      preferredLockupPresetIds: profile.lockupPresetIds,
+      fallbackLockupPresetId,
+      usedLockupPresetIds
+    });
+
+    return {
+      referenceId: reference.id,
+      referenceCluster: reference.cluster,
+      referenceTier: reference.tier,
+      variationTemplateKey: variationTemplateKey || undefined,
+      referenceToneHint: profile.toneHints[0],
+      referenceMediumHint: profile.mediumHints[0],
+      lockupLayoutFamily: profile.lockupLayoutFamily,
+      lockupPresetId,
+      allowedStyleFamilies: profile.allowedStyleFamilies
+    };
+  });
+}
+
 export function planDirectionSet(params: {
   runSeed: string;
   projectId?: string;
@@ -1773,6 +1944,9 @@ export function planDirectionSet(params: {
   secondaryThemes?: readonly string[];
   sceneMotifs?: readonly string[];
   sceneMotifRequested?: boolean;
+  curatedRefs?: readonly CuratedReference[];
+  recentReferenceIdsProject?: readonly string[];
+  recentReferenceIdsGlobal?: readonly string[];
 }): PlannedDirectionSpec[] {
   const count = Math.max(1, Math.min(params.optionCount || 3, 3));
   const runSeed = params.runSeed.trim() || "run-seed";
@@ -1845,6 +2019,28 @@ export function planDirectionSet(params: {
     wantsTitleStage: optionIndex === wantsTitleStageIndex
   }));
 
+  const round1ReferenceAssignments = buildRound1ReferenceAssignments({
+    runSeed,
+    optionCount: count,
+    round: params.round,
+    explorationMode: params.explorationMode === true,
+    curatedRefs: params.curatedRefs,
+    recentReferenceIdsProject: params.recentReferenceIdsProject,
+    recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
+    fallbackLockupPresetIds: baseSpecs.map((spec) => spec.lockupPresetId)
+  });
+  const referenceAwareSpecs = baseSpecs.map((spec, optionIndex) => {
+    const assignment = round1ReferenceAssignments[optionIndex];
+    if (!assignment) {
+      return spec;
+    }
+    return {
+      ...spec,
+      lockupPresetId: assignment.lockupPresetId || spec.lockupPresetId
+    };
+  });
+  const allowedFamiliesByOption = round1ReferenceAssignments.map((assignment) => assignment?.allowedStyleFamilies);
+
   const playfulIntent = detectPlayfulIntent({
     title: params.seriesTitle,
     subtitle: params.seriesSubtitle,
@@ -1856,7 +2052,7 @@ export function planDirectionSet(params: {
   const styleFamilies = assignStyleFamilies({
     runSeed,
     explorationSeed,
-    specs: baseSpecs,
+    specs: referenceAwareSpecs,
     preferredLaneFamilies: params.preferredFamilies,
     recentStyleFamilies: params.recentStyleFamilies,
     recentStyleBuckets: params.recentStyleBuckets,
@@ -1864,12 +2060,13 @@ export function planDirectionSet(params: {
     recentRecipeIds: params.recentRecipeIds,
     explorationMode: params.explorationMode === true,
     brandMode: params.brandMode === "brand" ? "brand" : "fresh",
-    playfulIntent
+    playfulIntent,
+    allowedFamiliesByOption
   });
 
   const motifFocusByDirection = assignMotifFocuses({
     runSeed,
-    specs: baseSpecs,
+    specs: referenceAwareSpecs,
     motifs: params.motifs,
     allowedGenericMotifs: params.allowedGenericMotifs,
     markIdeas: params.markIdeas,
@@ -1881,7 +2078,9 @@ export function planDirectionSet(params: {
     sceneMotifRequested: params.sceneMotifRequested
   });
 
-  return baseSpecs.map((spec, optionIndex) => ({
+  return referenceAwareSpecs.map((spec, optionIndex) => {
+    const referenceAssignment = round1ReferenceAssignments[optionIndex];
+    return {
     ...spec,
     explorationSetKey: styleFamilies.explorationSetKey,
     explorationLaneKey: styleFamilies.explorationLaneKeys?.[optionIndex],
@@ -1890,6 +2089,14 @@ export function planDirectionSet(params: {
     styleTone: styleFamilies.picks[optionIndex]?.tone,
     styleMedium: styleFamilies.picks[optionIndex]?.medium,
     motifFocus: motifFocusByDirection[optionIndex] || [],
-    motifScope: params.motifScope
-  }));
+    motifScope: params.motifScope,
+    referenceId: referenceAssignment?.referenceId,
+    referenceCluster: referenceAssignment?.referenceCluster,
+    referenceTier: referenceAssignment?.referenceTier,
+    variationTemplateKey: referenceAssignment?.variationTemplateKey,
+    referenceToneHint: referenceAssignment?.referenceToneHint,
+    referenceMediumHint: referenceAssignment?.referenceMediumHint,
+    lockupLayoutFamily: referenceAssignment?.lockupLayoutFamily
+  };
+  });
 }

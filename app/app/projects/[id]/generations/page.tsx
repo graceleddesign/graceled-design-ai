@@ -35,6 +35,9 @@ type OptionDesignSpecSummary = {
   styleFamilyName: string | null;
   lockupLayout: string | null;
   motifFocus: string[];
+  referenceId: string | null;
+  referenceCluster: string | null;
+  variationTemplateKey: string | null;
 };
 
 const OPTION_TINTS = [
@@ -132,7 +135,10 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     motifScope: null,
     styleFamilyName: null,
     lockupLayout: null,
-    motifFocus: []
+    motifFocus: [],
+    referenceId: null,
+    referenceCluster: null,
+    variationTemplateKey: null
   };
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return fallback;
@@ -161,6 +167,9 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
             styleFamily?: unknown;
             lockupLayout?: unknown;
             motifFocus?: unknown;
+            referenceId?: unknown;
+            referenceCluster?: unknown;
+            variationTemplateKey?: unknown;
           }
         | null;
     }
@@ -174,6 +183,9 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   const directStyleFamily = (designSpec as { styleFamily?: unknown }).styleFamily;
   const directLockupLayout = (designSpec as { lockupLayout?: unknown }).lockupLayout;
   const directMotifFocus = (designSpec as { motifFocus?: unknown }).motifFocus;
+  const directReferenceId = (designSpec as { referenceId?: unknown }).referenceId;
+  const directReferenceCluster = (designSpec as { referenceCluster?: unknown }).referenceCluster;
+  const directVariationTemplateKey = (designSpec as { variationTemplateKey?: unknown }).variationTemplateKey;
   const nestedWantsTitleStage = nestedDirectionSpec?.wantsTitleStage;
   const nestedWantsSeriesMark = nestedDirectionSpec?.wantsSeriesMark;
   const nestedStyleBucket = nestedDirectionSpec?.styleBucket;
@@ -183,6 +195,9 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   const nestedStyleFamily = nestedDirectionSpec?.styleFamily;
   const nestedLockupLayout = nestedDirectionSpec?.lockupLayout;
   const nestedMotifFocus = nestedDirectionSpec?.motifFocus;
+  const nestedReferenceId = nestedDirectionSpec?.referenceId;
+  const nestedReferenceCluster = nestedDirectionSpec?.referenceCluster;
+  const nestedVariationTemplateKey = nestedDirectionSpec?.variationTemplateKey;
 
   const styleFamilyCandidate = isStyleFamilyKey(directStyleFamily)
     ? directStyleFamily
@@ -225,6 +240,24 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
         .filter(Boolean)
         .slice(0, 2)
     : [];
+  const referenceIdCandidate =
+    typeof directReferenceId === "string"
+      ? directReferenceId
+      : typeof nestedReferenceId === "string"
+        ? nestedReferenceId
+        : null;
+  const referenceClusterCandidate =
+    typeof directReferenceCluster === "string"
+      ? directReferenceCluster
+      : typeof nestedReferenceCluster === "string"
+        ? nestedReferenceCluster
+        : null;
+  const variationTemplateKeyCandidate =
+    typeof directVariationTemplateKey === "string"
+      ? directVariationTemplateKey
+      : typeof nestedVariationTemplateKey === "string"
+        ? nestedVariationTemplateKey
+        : null;
 
   return {
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
@@ -235,7 +268,11 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     motifScope: motifScopeCandidate,
     styleFamilyName: styleFamilyCandidate ? STYLE_FAMILY_BANK[styleFamilyCandidate].name : null,
     lockupLayout: typeof lockupLayoutCandidate === "string" && lockupLayoutCandidate.trim() ? lockupLayoutCandidate : null,
-    motifFocus
+    motifFocus,
+    referenceId: referenceIdCandidate && referenceIdCandidate.trim() ? referenceIdCandidate.trim() : null,
+    referenceCluster: referenceClusterCandidate && referenceClusterCandidate.trim() ? referenceClusterCandidate.trim() : null,
+    variationTemplateKey:
+      variationTemplateKeyCandidate && variationTemplateKeyCandidate.trim() ? variationTemplateKeyCandidate.trim() : null
   };
 }
 
@@ -453,6 +490,10 @@ export default async function ProjectGenerationsPage({
                       lockupLayout={designSpecSummary.lockupLayout}
                       motifFocus={designSpecSummary.motifFocus}
                       brandMode={project.brandMode === "brand" ? "brand" : "fresh"}
+                      debugReferenceId={designSpecSummary.referenceId}
+                      debugReferenceCluster={designSpecSummary.referenceCluster}
+                      debugVariationTemplateKey={designSpecSummary.variationTemplateKey}
+                      showDebugChips={debugStageEnabled}
                       previewUrls={previewUrls}
                       finalizeAction={finalizeAction}
                     />
