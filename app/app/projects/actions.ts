@@ -20,6 +20,7 @@ import {
 } from "@/lib/design-brief";
 import {
   planDirectionSet,
+  pickExplorationFallbackStyleFamily,
   type PlannedDirectionSpec,
   type StyleFamily as DirectionStyleFamily
 } from "@/lib/direction-planner";
@@ -170,6 +171,10 @@ const MONO_TONE_MAX_LUMINANCE = 125;
 const DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV = 35;
 const DESIGN_PRESENCE_MIN_EDGE_DENSITY = 0.012;
 const DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD = 68;
+const ROUND1_RERANK_MIN_EDGES_FULL = 0.01;
+const ROUND1_RERANK_MIN_STD_FULL = 20;
+const ROUND1_RERANK_MIN_EDGES_NON_TITLE = 0.008;
+const ROUND1_RERANK_MIN_ACCEPTABLE_SCORE = 180;
 const LIGHT_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must satisfy tone targets. LIGHT must be high-key bright/clean (white or near-white background), NOT parchment/sepia/vintage. Avoid filmic grading, avoid desaturation, avoid heavy grain. Prioritize tone compliance over atmosphere.";
 const VIVID_TONE_OVERRIDE_RETRY_BOOST =
@@ -1043,6 +1048,126 @@ type MidtoneRangeScore = {
   score: number;
 };
 
+type BackgroundHardFailStats = {
+  edgeDensityFull: number;
+  luminanceStdFull: number;
+  edgeDensityNonTitle: number;
+  passes: boolean;
+};
+
+async function computeBackgroundHardFailStatsFromBuffer(
+  imageBuffer: Buffer,
+  titleSafeBox: TitleSafeBox
+): Promise<BackgroundHardFailStats | null> {
+  try {
+    const raster = await sharp(imageBuffer, { failOn: "none" })
+      .resize({
+        width: TONE_STATS_SAMPLE_SIZE,
+        height: TONE_STATS_SAMPLE_SIZE,
+        fit: "fill"
+      })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const { data, info } = raster;
+    const width = Math.max(1, info.width || TONE_STATS_SAMPLE_SIZE);
+    const height = Math.max(1, info.height || TONE_STATS_SAMPLE_SIZE);
+    const channels = Math.max(4, info.channels || 4);
+    const totalPixels = width * height;
+    const luminanceByPixel = new Float32Array(totalPixels);
+    const opaqueMask = new Uint8Array(totalPixels);
+
+    const safeLeft = clampNumber(Math.round(width * clampNumber(titleSafeBox.left, 0, 0.95)), 0, Math.max(0, width - 1));
+    const safeTop = clampNumber(Math.round(height * clampNumber(titleSafeBox.top, 0, 0.95)), 0, Math.max(0, height - 1));
+    const safeWidth = clampNumber(Math.round(width * clampNumber(titleSafeBox.width, 0.05, 1)), 1, width);
+    const safeHeight = clampNumber(Math.round(height * clampNumber(titleSafeBox.height, 0.05, 1)), 1, height);
+    const safeRight = clampNumber(safeLeft + safeWidth, safeLeft + 1, width);
+    const safeBottom = clampNumber(safeTop + safeHeight, safeTop + 1, height);
+
+    let sampleCount = 0;
+    let luminanceSum = 0;
+    for (let index = 0; index < totalPixels; index += 1) {
+      const offset = index * channels;
+      const alpha = data[offset + 3];
+      const r = data[offset];
+      const g = data[offset + 1];
+      const b = data[offset + 2];
+      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      luminanceByPixel[index] = luminance;
+      if (alpha <= 10) {
+        continue;
+      }
+      opaqueMask[index] = 1;
+      sampleCount += 1;
+      luminanceSum += luminance;
+    }
+
+    if (sampleCount <= 0) {
+      return null;
+    }
+
+    const meanLuminance = luminanceSum / sampleCount;
+    let varianceSum = 0;
+    for (let index = 0; index < totalPixels; index += 1) {
+      if (!opaqueMask[index]) {
+        continue;
+      }
+      const delta = luminanceByPixel[index] - meanLuminance;
+      varianceSum += delta * delta;
+    }
+    const luminanceStdFull = Math.sqrt(varianceSum / sampleCount);
+
+    let fullEdgeCount = 0;
+    let fullEdgeSamples = 0;
+    let nonTitleEdgeCount = 0;
+    let nonTitleEdgeSamples = 0;
+
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const idx = y * width + x;
+        const leftIdx = idx - 1;
+        const rightIdx = idx + 1;
+        const upIdx = idx - width;
+        const downIdx = idx + width;
+        if (!opaqueMask[idx] || !opaqueMask[leftIdx] || !opaqueMask[rightIdx] || !opaqueMask[upIdx] || !opaqueMask[downIdx]) {
+          continue;
+        }
+
+        const gx = Math.abs(luminanceByPixel[rightIdx] - luminanceByPixel[leftIdx]);
+        const gy = Math.abs(luminanceByPixel[downIdx] - luminanceByPixel[upIdx]);
+        const isEdge = gx + gy >= DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD;
+        fullEdgeSamples += 1;
+        if (isEdge) {
+          fullEdgeCount += 1;
+        }
+
+        const insideSafe = x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom;
+        if (!insideSafe) {
+          nonTitleEdgeSamples += 1;
+          if (isEdge) {
+            nonTitleEdgeCount += 1;
+          }
+        }
+      }
+    }
+
+    const edgeDensityFull = fullEdgeSamples > 0 ? fullEdgeCount / fullEdgeSamples : 0;
+    const edgeDensityNonTitle = nonTitleEdgeSamples > 0 ? nonTitleEdgeCount / nonTitleEdgeSamples : 0;
+    const passes =
+      (edgeDensityFull >= ROUND1_RERANK_MIN_EDGES_FULL && luminanceStdFull >= ROUND1_RERANK_MIN_STD_FULL) &&
+      edgeDensityNonTitle >= ROUND1_RERANK_MIN_EDGES_NON_TITLE;
+
+    return {
+      edgeDensityFull,
+      luminanceStdFull,
+      edgeDensityNonTitle,
+      passes
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function scoreMidtoneRangeFromBuffer(imageBuffer: Buffer): Promise<MidtoneRangeScore | null> {
   try {
     const raster = await sharp(imageBuffer, { failOn: "none" })
@@ -1631,6 +1756,77 @@ function resolveDirectionStyleFamily(directionSpec?: PlannedDirectionSpec | null
     lockupRules: family.lockupRules,
     forbids: family.forbids
   };
+}
+
+function resolveDirectionStyleFields(directionSpec?: PlannedDirectionSpec | null): {
+  styleFamily: StyleFamilyKey | null;
+  styleBucket: StyleBucketKey | null;
+  styleTone: StyleToneKey | null;
+  styleMedium: StyleMediumKey | null;
+  explorationSetKey: string | null;
+  explorationLaneKey: string | null;
+} {
+  const styleFamily = isStyleFamilyKey(directionSpec?.styleFamily) ? directionSpec.styleFamily : null;
+  const familyRecord = styleFamily ? STYLE_FAMILY_BANK[styleFamily] : null;
+  const styleBucket = isStyleBucketKey(directionSpec?.styleBucket)
+    ? directionSpec.styleBucket
+    : familyRecord
+      ? familyRecord.bucket
+      : null;
+  const styleTone = isStyleToneKey(directionSpec?.styleTone)
+    ? directionSpec.styleTone
+    : familyRecord
+      ? familyRecord.tone
+      : null;
+  const styleMedium = isStyleMediumKey(directionSpec?.styleMedium)
+    ? directionSpec.styleMedium
+    : familyRecord
+      ? familyRecord.medium
+      : null;
+  const explorationSetKey =
+    typeof directionSpec?.explorationSetKey === "string" && directionSpec.explorationSetKey.trim()
+      ? directionSpec.explorationSetKey.trim()
+      : null;
+  const explorationLaneKey =
+    typeof directionSpec?.explorationLaneKey === "string" && directionSpec.explorationLaneKey.trim()
+      ? directionSpec.explorationLaneKey.trim()
+      : null;
+
+  return {
+    styleFamily,
+    styleBucket,
+    styleTone,
+    styleMedium,
+    explorationSetKey,
+    explorationLaneKey
+  };
+}
+
+function applyFallbackStyleFamilyToDirectionSpec(params: {
+  directionSpec?: PlannedDirectionSpec | null;
+  styleFamily: StyleFamilyKey;
+  explorationSetKey?: string;
+  explorationLaneKey?: string;
+}): PlannedDirectionSpec | null {
+  if (!params.directionSpec) {
+    return null;
+  }
+
+  const record = STYLE_FAMILY_BANK[params.styleFamily];
+  const nextDirectionSpec: PlannedDirectionSpec = {
+    ...params.directionSpec,
+    styleFamily: params.styleFamily,
+    styleBucket: record.bucket,
+    styleTone: record.tone,
+    styleMedium: record.medium
+  };
+  if (params.explorationSetKey) {
+    nextDirectionSpec.explorationSetKey = params.explorationSetKey;
+  }
+  if (params.explorationLaneKey) {
+    nextDirectionSpec.explorationLaneKey = params.explorationLaneKey;
+  }
+  return nextDirectionSpec;
 }
 
 function buildLockupGenerationPrompt(params: {
@@ -3290,11 +3486,16 @@ type BuildGenerationOutputParams = {
 
 type BackgroundRerankCandidateDebug = {
   url: string;
+  stage: "primary" | "fallback_family" | "fallback_set";
+  attempt: number;
+  styleFamily: StyleFamilyKey | null;
+  explorationSetKey: string | null;
   score: number;
   checks: {
     textFree: boolean;
     tonePass: boolean;
     designPresencePass: boolean;
+    hardFailBlankDesign: boolean;
   };
   stats: {
     textRetryCount: number;
@@ -3315,7 +3516,29 @@ type BackgroundRerankCandidateDebug = {
       highlightClippedRatio: number;
       score: number;
     } | null;
+    hardFail: {
+      edgeDensityFull: number;
+      luminanceStdFull: number;
+      edgeDensityNonTitle: number;
+      passes: boolean;
+    } | null;
   };
+};
+
+type BackgroundRerankWinnerDebug = {
+  index: number;
+  url: string;
+  stage: "primary" | "fallback_family" | "fallback_set";
+  attempt: number;
+  styleFamily: StyleFamilyKey | null;
+  explorationSetKey: string | null;
+  score: number;
+};
+
+type BackgroundRerankFallbackDebug = {
+  usedAltFamily: boolean;
+  usedAltSet: boolean;
+  attempts: number;
 };
 
 type LockupRerankCandidateDebug = {
@@ -3340,6 +3563,9 @@ type LockupRerankCandidateDebug = {
 
 type RerankDebugMeta = {
   backgroundCandidates?: BackgroundRerankCandidateDebug[];
+  backgroundWinner?: BackgroundRerankWinnerDebug;
+  laneFailed?: boolean;
+  fallback?: BackgroundRerankFallbackDebug;
   backgroundWinnerIndex?: number;
   lockupCandidates?: LockupRerankCandidateDebug[];
   lockupWinnerIndex?: number;
@@ -4312,6 +4538,7 @@ async function completeGenerationWithFallbackOutput(params: {
 }
 
 async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
+  organizationId: string;
   project: GenerationProjectContext & { id: string };
   plannedGenerations: PlannedGeneration[];
   bibleCreativeBrief?: BibleCreativeBrief | null;
@@ -4353,6 +4580,18 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
       ? params.project.brandKit.typographyDirection
       : null;
+  let cachedRecentStyleFamiliesForFallback: StyleFamilyKey[] | null = null;
+  const getRecentStyleFamiliesForFallback = async (): Promise<StyleFamilyKey[]> => {
+    if (cachedRecentStyleFamiliesForFallback) {
+      return cachedRecentStyleFamiliesForFallback;
+    }
+    cachedRecentStyleFamiliesForFallback = await loadRecentStyleFamilies({
+      organizationId: params.organizationId,
+      projectId: params.project.id,
+      limit: 24
+    });
+    return cachedRecentStyleFamiliesForFallback;
+  };
 
   for (const plannedGeneration of params.plannedGenerations) {
     const fallbackOutput = plannedGeneration.fallbackOutput;
@@ -4464,28 +4703,27 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const shouldReuseBackground =
         feedbackControls.regenerateBackground === false && Boolean(reusableAssets?.masterBackgroundPng);
       const shouldReuseLockup = feedbackControls.regenerateLockup === false && Boolean(reusableAssets?.lockupPng);
-      const effectiveDirectionStyleFamily =
+      const initialDirectionStyleFields = resolveDirectionStyleFields(directionSpec);
+      let effectiveDirectionStyleFamily =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleFamily
           ? reusableAssets.styleFamily
-          : directionSpec?.styleFamily;
-      const effectiveDirectionStyleBucket =
+          : initialDirectionStyleFields.styleFamily;
+      let effectiveDirectionStyleBucket =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleBucket
           ? reusableAssets.styleBucket
-          : directionSpec?.styleBucket ||
+          : initialDirectionStyleFields.styleBucket ||
             (effectiveDirectionStyleFamily ? STYLE_FAMILY_BANK[effectiveDirectionStyleFamily].bucket : null);
-      const effectiveDirectionStyleTone =
+      let effectiveDirectionStyleTone =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleTone
           ? reusableAssets.styleTone
-          : directionSpec?.styleTone ||
+          : initialDirectionStyleFields.styleTone ||
             (effectiveDirectionStyleFamily ? STYLE_FAMILY_BANK[effectiveDirectionStyleFamily].tone : null);
-      const effectiveDirectionStyleMedium =
+      let effectiveDirectionStyleMedium =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleMedium
           ? reusableAssets.styleMedium
-          : directionSpec?.styleMedium ||
+          : initialDirectionStyleFields.styleMedium ||
             (effectiveDirectionStyleFamily ? STYLE_FAMILY_BANK[effectiveDirectionStyleFamily].medium : null);
-      const toneTargetForCompliance = shouldCheckToneCompliance(effectiveDirectionStyleTone)
-        ? effectiveDirectionStyleTone
-        : null;
+      let backgroundDirectionSpec = directionSpec;
       const lockupRecipeForRender = shouldReuseLockup
         ? sourceLockupRecipe
         : applyLockupRecipeGuardrails({
@@ -4497,7 +4735,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const titleSafeBox: TitleSafeBox = LOCKUP_SAFE_REGION_RATIOS[OPTION_MASTER_BACKGROUND_SHAPE];
       let rerankMeta: RerankDebugMeta = {};
 
-      const renderMasterAttempt = async (originalityBoost?: string, candidateSuffix = "") => {
+      const resolveToneTargetFromDirectionSpec = (targetDirectionSpec?: PlannedDirectionSpec | null) => {
+        const styleTone = resolveDirectionStyleFields(targetDirectionSpec).styleTone;
+        return shouldCheckToneCompliance(styleTone) ? styleTone : null;
+      };
+
+      const renderMasterAttempt = async (attemptParams: {
+        directionSpecOverride?: PlannedDirectionSpec | null;
+        originalityBoost?: string;
+        candidateSuffix?: string;
+      } = {}) => {
         if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
           const backgroundPng = await normalizePngToShape(
             reusableAssets.masterBackgroundPng,
@@ -4520,20 +4767,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           };
         }
 
-        const generationSeedPrefix = `${runSeed}|${plannedGeneration.optionIndex}${candidateSuffix}`;
+        const activeDirectionSpec =
+          attemptParams.directionSpecOverride === undefined ? backgroundDirectionSpec : attemptParams.directionSpecOverride;
+        const toneTargetForCompliance = shouldRunExplorationToneCheck
+          ? resolveToneTargetFromDirectionSpec(activeDirectionSpec)
+          : null;
+        const generationSeedPrefix = `${runSeed}|${plannedGeneration.optionIndex}${attemptParams.candidateSuffix || ""}`;
         const initialBackground = await generateValidatedBackgroundPng({
           brief: templateBrief,
           styleFamily: optionStyleFamily,
           shape: OPTION_MASTER_BACKGROUND_SHAPE,
           generationId: generationSeedPrefix,
-          directionSpec,
+          directionSpec: activeDirectionSpec,
           brandMode: params.project.brandMode,
           explorationMode: shouldRunExplorationToneCheck,
           seriesPreferenceGuidance,
           bibleCreativeBrief,
           referenceDataUrls,
           focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
-          originalityBoost,
+          originalityBoost: attemptParams.originalityBoost,
           brandPaletteHardConstraint: brandPaletteHardConstraintPrompt
         });
 
@@ -4578,14 +4830,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 styleFamily: optionStyleFamily,
                 shape: OPTION_MASTER_BACKGROUND_SHAPE,
                 generationId: `${generationSeedPrefix}|palette-retry`,
-                directionSpec,
+                directionSpec: activeDirectionSpec,
                 brandMode: params.project.brandMode,
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
                 referenceDataUrls,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
-                originalityBoost,
+                originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: BRAND_PALETTE_STRICT_RETRY_BOOST
               });
@@ -4629,21 +4881,21 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             toneCheck.retried = true;
 
             validatedBackground = await generateValidatedBackgroundPng({
-              brief: templateBrief,
-              styleFamily: optionStyleFamily,
-              shape: OPTION_MASTER_BACKGROUND_SHAPE,
-              generationId: `${generationSeedPrefix}|tone-retry`,
-              directionSpec,
-              brandMode: params.project.brandMode,
-              explorationMode: shouldRunExplorationToneCheck,
-              seriesPreferenceGuidance,
-              bibleCreativeBrief,
-              referenceDataUrls,
-              focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
-              originalityBoost,
-              brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
-              paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
-              toneComplianceBoost: toneOverrideRetryBoost(toneTargetForCompliance)
+                brief: templateBrief,
+                styleFamily: optionStyleFamily,
+                shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                generationId: `${generationSeedPrefix}|tone-retry`,
+                directionSpec: activeDirectionSpec,
+                brandMode: params.project.brandMode,
+                explorationMode: shouldRunExplorationToneCheck,
+                seriesPreferenceGuidance,
+                bibleCreativeBrief,
+                referenceDataUrls,
+                focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
+                originalityBoost: attemptParams.originalityBoost,
+                brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
+                paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
+                toneComplianceBoost: toneOverrideRetryBoost(toneTargetForCompliance)
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -4686,22 +4938,22 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundTextCheck.retried = true;
 
             validatedBackground = await generateValidatedBackgroundPng({
-              brief: templateBrief,
-              styleFamily: optionStyleFamily,
-              shape: OPTION_MASTER_BACKGROUND_SHAPE,
-              generationId: `${generationSeedPrefix}|text-artifact-retry`,
-              directionSpec,
-              brandMode: params.project.brandMode,
-              explorationMode: shouldRunExplorationToneCheck,
-              seriesPreferenceGuidance,
-              bibleCreativeBrief,
-              referenceDataUrls,
-              focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
-              originalityBoost,
-              brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
-              paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
-              toneComplianceBoost: toneTargetForCompliance ? toneOverrideRetryBoost(toneTargetForCompliance) : undefined,
-              textArtifactRetryBoost: TEXT_ARTIFACT_RETRY_OVERRIDE
+                brief: templateBrief,
+                styleFamily: optionStyleFamily,
+                shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                generationId: `${generationSeedPrefix}|text-artifact-retry`,
+                directionSpec: activeDirectionSpec,
+                brandMode: params.project.brandMode,
+                explorationMode: shouldRunExplorationToneCheck,
+                seriesPreferenceGuidance,
+                bibleCreativeBrief,
+                referenceDataUrls,
+                focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
+                originalityBoost: attemptParams.originalityBoost,
+                brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
+                paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
+                toneComplianceBoost: toneTargetForCompliance ? toneOverrideRetryBoost(toneTargetForCompliance) : undefined,
+                textArtifactRetryBoost: TEXT_ARTIFACT_RETRY_OVERRIDE
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -4748,15 +5000,32 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         };
       };
 
-      const selectBackgroundWinner = async (originalityBoost?: string) => {
+      const runBackgroundRerankAttempt = async (params: {
+        stage: "primary" | "fallback_family" | "fallback_set";
+        attemptNumber: number;
+        directionSpecOverride?: PlannedDirectionSpec | null;
+        originalityBoost?: string;
+      }) => {
         if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
+          const attempt = await renderMasterAttempt({
+            directionSpecOverride: params.directionSpecOverride,
+            originalityBoost: params.originalityBoost
+          });
           return {
-            attempt: await renderMasterAttempt(originalityBoost),
-            winnerIndex: 0
+            attempt,
+            winnerIndex: 0,
+            bestScore: Number.POSITIVE_INFINITY,
+            laneFailed: false,
+            candidates: [] as BackgroundRerankCandidateDebug[],
+            winner: null as BackgroundRerankWinnerDebug | null
           };
         }
 
-        const candidateTag = originalityBoost ? "orig" : "base";
+        const activeDirectionSpec =
+          params.directionSpecOverride === undefined ? backgroundDirectionSpec : params.directionSpecOverride;
+        const candidateTag = params.originalityBoost ? `${params.stage}-orig` : `${params.stage}-base`;
+        const toneTargetForCompliance = resolveToneTargetFromDirectionSpec(activeDirectionSpec);
+        const styleFields = resolveDirectionStyleFields(activeDirectionSpec);
         const candidates: Array<{
           attempt: Awaited<ReturnType<typeof renderMasterAttempt>>;
           score: number;
@@ -4764,20 +5033,23 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             textFree: boolean;
             tonePass: boolean;
             designPresencePass: boolean;
+            hardFailBlankDesign: boolean;
           };
           stats: {
             tone: ImageToneStats | null;
             titleSafe: TitleSafeRegionScore | null;
             midtoneRange: MidtoneRangeScore | null;
+            hardFail: BackgroundHardFailStats | null;
           };
           debugUrl: string;
         }> = [];
 
         for (let candidateIndex = 0; candidateIndex < ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT; candidateIndex += 1) {
-          const attempt = await renderMasterAttempt(
-            originalityBoost,
-            `|${candidateTag}-bg-candidate-${candidateIndex}`
-          );
+          const attempt = await renderMasterAttempt({
+            directionSpecOverride: activeDirectionSpec,
+            originalityBoost: params.originalityBoost,
+            candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
+          });
           const toneStats = attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(attempt.backgroundPng));
           const tonePass = toneTargetForCompliance
             ? toneStats
@@ -4787,12 +5059,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const textArtifactDetected = await detectTextArtifactsHeuristic(attempt.backgroundPng);
           const textFree = attempt.textCheckPassed && !textArtifactDetected;
           const designPresencePass = passesDesignPresence(toneStats);
+          const hardFail = await computeBackgroundHardFailStatsFromBuffer(attempt.backgroundPng, titleSafeBox);
+          const hardFailBlankDesign = !hardFail || !hardFail.passes;
           const titleSafe = await scoreTitleSafeRegion(pngBufferToDataUrl(attempt.backgroundPng), titleSafeBox);
           const midtoneRange = await scoreMidtoneRangeFromBuffer(attempt.backgroundPng);
           let score = 0;
           score += tonePass ? 140 : -140;
           score += textFree ? 140 : -140;
           score += designPresencePass ? 90 : -90;
+          score += hardFailBlankDesign ? -240 : 120;
           score += (titleSafe?.score || 0) * 30;
           score += (midtoneRange?.score || 0) * 35;
           score -= attempt.textRetryCount * 2;
@@ -4808,12 +5083,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             checks: {
               textFree,
               tonePass,
-              designPresencePass
+              designPresencePass,
+              hardFailBlankDesign
             },
             stats: {
               tone: toneStats,
               titleSafe,
-              midtoneRange
+              midtoneRange,
+              hardFail
             },
             debugUrl
           });
@@ -4821,14 +5098,29 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
         const eligible = candidates
           .map((candidate, index) => ({ candidate, index }))
-          .filter((entry) => entry.candidate.checks.textFree && entry.candidate.checks.tonePass && entry.candidate.checks.designPresencePass);
+          .filter(
+            (entry) =>
+              entry.candidate.checks.textFree &&
+              entry.candidate.checks.tonePass &&
+              entry.candidate.checks.designPresencePass &&
+              !entry.candidate.checks.hardFailBlankDesign
+          );
         const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
         const winner = pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0]);
+        const bestScore = winner.candidate.score;
+        const laneFailed = eligible.length <= 0 || bestScore < ROUND1_RERANK_MIN_ACCEPTABLE_SCORE;
 
-        rerankMeta = {
-          ...rerankMeta,
-          backgroundCandidates: candidates.map((candidate) => ({
+        return {
+          attempt: winner.candidate.attempt,
+          winnerIndex: winner.index,
+          bestScore,
+          laneFailed,
+          candidates: candidates.map((candidate) => ({
             url: candidate.debugUrl,
+            stage: params.stage,
+            attempt: params.attemptNumber,
+            styleFamily: styleFields.styleFamily,
+            explorationSetKey: styleFields.explorationSetKey,
             score: candidate.score,
             checks: candidate.checks,
             stats: {
@@ -4837,15 +5129,160 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               closestDistance: candidate.attempt.closestDistance,
               tone: candidate.stats.tone,
               titleSafe: candidate.stats.titleSafe,
-              midtoneRange: candidate.stats.midtoneRange
+              midtoneRange: candidate.stats.midtoneRange,
+              hardFail: candidate.stats.hardFail
             }
           })),
-          backgroundWinnerIndex: winner.index
+          winner: {
+            index: winner.index,
+            url: winner.candidate.debugUrl,
+            stage: params.stage,
+            attempt: params.attemptNumber,
+            styleFamily: styleFields.styleFamily,
+            explorationSetKey: styleFields.explorationSetKey,
+            score: winner.candidate.score
+          }
+        };
+      };
+
+      const selectBackgroundWinner = async (originalityBoost?: string) => {
+        if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
+          return {
+            attempt: await renderMasterAttempt({ originalityBoost }),
+            winnerIndex: 0,
+            laneFailed: false
+          };
+        }
+
+        const fallback: BackgroundRerankFallbackDebug = {
+          usedAltFamily: false,
+          usedAltSet: false,
+          attempts: 1
+        };
+        const aggregatedCandidates: BackgroundRerankCandidateDebug[] = [];
+        let globalWinnerIndex = 0;
+        let winner: BackgroundRerankWinnerDebug | null = null;
+
+        const appendAttempt = (result: Awaited<ReturnType<typeof runBackgroundRerankAttempt>>) => {
+          const startIndex = aggregatedCandidates.length;
+          aggregatedCandidates.push(...result.candidates);
+          globalWinnerIndex = startIndex + result.winnerIndex;
+          winner = result.winner
+            ? {
+                ...result.winner,
+                index: globalWinnerIndex
+              }
+            : null;
+        };
+
+        let activeDirectionSpec = backgroundDirectionSpec;
+        let selection = await runBackgroundRerankAttempt({
+          stage: "primary",
+          attemptNumber: fallback.attempts,
+          directionSpecOverride: activeDirectionSpec,
+          originalityBoost
+        });
+        appendAttempt(selection);
+
+        const laneFamily = directionSpec?.laneFamily;
+        const laneTone = initialDirectionStyleFields.styleTone;
+        const laneMedium = initialDirectionStyleFields.styleMedium;
+        const baseStyleFamily = initialDirectionStyleFields.styleFamily;
+        const baseSetKey = initialDirectionStyleFields.explorationSetKey;
+        const recentFamiliesForFallback = await getRecentStyleFamiliesForFallback();
+
+        if (selection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
+          const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
+          const currentFamilyForFallback = currentStyleFields.styleFamily || baseStyleFamily;
+          const currentSetForFallback = currentStyleFields.explorationSetKey || baseSetKey;
+          const altFamilyFallback = pickExplorationFallbackStyleFamily({
+            runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-family`,
+            laneFamily,
+            currentStyleFamily: currentFamilyForFallback,
+            currentExplorationSetKey: currentSetForFallback,
+            tone: laneTone,
+            medium: laneMedium,
+            recentStyleFamilies: recentFamiliesForFallback,
+            setConstraint: "same"
+          });
+          if (altFamilyFallback && altFamilyFallback.family !== currentFamilyForFallback) {
+            activeDirectionSpec = applyFallbackStyleFamilyToDirectionSpec({
+              directionSpec: activeDirectionSpec,
+              styleFamily: altFamilyFallback.family,
+              explorationSetKey: altFamilyFallback.explorationSetKey,
+              explorationLaneKey: altFamilyFallback.explorationLaneKey
+            });
+            fallback.usedAltFamily = true;
+            fallback.attempts += 1;
+            selection = await runBackgroundRerankAttempt({
+              stage: "fallback_family",
+              attemptNumber: fallback.attempts,
+              directionSpecOverride: activeDirectionSpec,
+              originalityBoost
+            });
+            appendAttempt(selection);
+          }
+        }
+
+        if (selection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
+          const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
+          const currentSetKey = currentStyleFields.explorationSetKey || baseSetKey;
+          const currentFamily = currentStyleFields.styleFamily || baseStyleFamily;
+          const altSetFallback = pickExplorationFallbackStyleFamily({
+            runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-set`,
+            laneFamily,
+            currentStyleFamily: currentFamily,
+            currentExplorationSetKey: currentSetKey,
+            tone: laneTone,
+            medium: laneMedium,
+            recentStyleFamilies: recentFamiliesForFallback,
+            avoidFamilies: [currentFamily],
+            setConstraint: "different"
+          });
+          const switchedSet = altSetFallback
+            ? !currentSetKey || altSetFallback.explorationSetKey !== currentSetKey
+            : false;
+          if (altSetFallback && switchedSet) {
+            activeDirectionSpec = applyFallbackStyleFamilyToDirectionSpec({
+              directionSpec: activeDirectionSpec,
+              styleFamily: altSetFallback.family,
+              explorationSetKey: altSetFallback.explorationSetKey,
+              explorationLaneKey: altSetFallback.explorationLaneKey
+            });
+            fallback.usedAltSet = true;
+            fallback.attempts += 1;
+            selection = await runBackgroundRerankAttempt({
+              stage: "fallback_set",
+              attemptNumber: fallback.attempts,
+              directionSpecOverride: activeDirectionSpec,
+              originalityBoost
+            });
+            appendAttempt(selection);
+          }
+        }
+
+        backgroundDirectionSpec = activeDirectionSpec;
+        if (!shouldReuseBackground) {
+          const finalStyleFields = resolveDirectionStyleFields(backgroundDirectionSpec);
+          effectiveDirectionStyleFamily = finalStyleFields.styleFamily;
+          effectiveDirectionStyleBucket = finalStyleFields.styleBucket;
+          effectiveDirectionStyleTone = finalStyleFields.styleTone;
+          effectiveDirectionStyleMedium = finalStyleFields.styleMedium;
+        }
+
+        rerankMeta = {
+          ...rerankMeta,
+          backgroundCandidates: aggregatedCandidates,
+          backgroundWinner: winner || undefined,
+          laneFailed: selection.laneFailed,
+          fallback,
+          backgroundWinnerIndex: globalWinnerIndex
         };
 
         return {
-          attempt: winner.candidate.attempt,
-          winnerIndex: winner.index
+          attempt: selection.attempt,
+          winnerIndex: selection.winnerIndex,
+          laneFailed: selection.laneFailed
         };
       };
 
@@ -5606,6 +6043,7 @@ export async function generateRoundOneAction(
   );
 
   await createOpenAiPreviewAssetsForPlannedGenerations({
+    organizationId: session.organizationId,
     project,
     plannedGenerations,
     bibleCreativeBrief,
@@ -5845,6 +6283,7 @@ export async function generateRoundTwoAction(
   );
 
   await createOpenAiPreviewAssetsForPlannedGenerations({
+    organizationId: session.organizationId,
     project,
     plannedGenerations,
     bibleCreativeBrief,
