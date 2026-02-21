@@ -232,8 +232,10 @@ type LockupTypographicRecipe = {
   dividerRule: "none" | "optional" | "required";
   titleTreatment: LockupRecipe["titleTreatment"];
 };
-const LOCKUP_TEXT_OVERRIDE_PROMPT =
-  "LOCKUP TEXT OVERRIDE: Use EXACT text only. Do not add any other words, letters, or decorative type.";
+const LOCKUP_TEXT_OVERRIDE_PROMPT = [
+  "LOCKUP TEXT OVERRIDE: Use EXACT text only. Do not add any other words, letters, or decorative type.",
+  "LOCKUP OVERRIDE: no shadows, no glows, no blur, no duplicate text layers. Clean, flat typography only."
+].join("\n");
 const LOCKUP_TYPOGRAPHIC_RECIPE_BY_LAYOUT: Record<LockupLayoutArchetype, LockupTypographicRecipe> = {
   editorial_stack: {
     id: "classic_stack",
@@ -2059,6 +2061,9 @@ type LockupSvgTextValidation = {
   extracted: string[];
   unexpected: string[];
   missing: string[];
+  titleOccurrences: number;
+  subtitleOccurrences: number;
+  reasons: string[];
 };
 
 function decodeXmlEntity(entity: string): string {
@@ -2095,14 +2100,117 @@ function decodeXmlEntities(value: string): string {
   return value.replace(/&(amp|lt|gt|quot|apos|#x[0-9a-fA-F]+|#[0-9]+);/g, (entity) => decodeXmlEntity(entity));
 }
 
-function extractSvgTextNodes(svg: string): string[] {
+type SvgTextNode = {
+  openingTag: string;
+  normalizedText: string;
+};
+
+function extractSvgAttribute(tag: string, attributeName: string): string | null {
+  const escapedName = attributeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\b${escapedName}\\s*=\\s*(\"([^\"]*)\"|'([^']*)')`, "i");
+  const match = tag.match(pattern);
+  if (!match) {
+    return null;
+  }
+  return (match[2] ?? match[3] ?? "").trim();
+}
+
+function parseCssValue(style: string, propertyName: string): string | null {
+  const segments = style.split(";");
+  for (const segment of segments) {
+    const [rawKey, rawValue] = segment.split(":");
+    if (!rawKey || !rawValue) {
+      continue;
+    }
+    if (rawKey.trim().toLowerCase() === propertyName.toLowerCase()) {
+      return rawValue.trim();
+    }
+  }
+  return null;
+}
+
+function parseOpacityValue(rawValue: string | null): number | null {
+  if (!rawValue) {
+    return null;
+  }
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.endsWith("%")) {
+    const percentage = Number.parseFloat(trimmed.slice(0, -1));
+    return Number.isFinite(percentage) ? percentage / 100 : null;
+  }
+  const numeric = Number.parseFloat(trimmed);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function resolveTextNodeOpacity(openingTag: string): number | null {
+  const directOpacity = parseOpacityValue(extractSvgAttribute(openingTag, "opacity"));
+  if (typeof directOpacity === "number") {
+    return directOpacity;
+  }
+
+  const fillOpacity = parseOpacityValue(extractSvgAttribute(openingTag, "fill-opacity"));
+  if (typeof fillOpacity === "number") {
+    return fillOpacity;
+  }
+
+  const styleAttr = extractSvgAttribute(openingTag, "style");
+  if (!styleAttr) {
+    return null;
+  }
+
+  const styleOpacity = parseOpacityValue(parseCssValue(styleAttr, "opacity"));
+  if (typeof styleOpacity === "number") {
+    return styleOpacity;
+  }
+
+  return parseOpacityValue(parseCssValue(styleAttr, "fill-opacity"));
+}
+
+function extractSvgTextNodes(svg: string): SvgTextNode[] {
   const textMatches = svg.match(/<text\b[\s\S]*?<\/text>/gi) || [];
-  const extracted = textMatches
-    .map((node) => node.replace(/<[^>]+>/g, " "))
-    .map((text) => decodeXmlEntities(text))
-    .map((text) => text.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  return [...new Set(extracted)];
+  return textMatches
+    .map((node) => {
+      const openingTag = node.match(/^<text\b[^>]*>/i)?.[0] || "";
+      const text = decodeXmlEntities(node.replace(/<[^>]+>/g, " "));
+      return {
+        openingTag,
+        normalizedText: normalizeLine(text)
+      };
+    })
+    .filter((node) => Boolean(node.normalizedText));
+}
+
+function makeFlatLockupRetryRecipe(lockupRecipe: LockupRecipe): LockupRecipe {
+  return {
+    ...lockupRecipe,
+    titleTreatment: lockupRecipe.titleTreatment === "outline" || lockupRecipe.titleTreatment === "overprint"
+      ? "stacked"
+      : lockupRecipe.titleTreatment,
+    titleEcho: lockupRecipe.titleEcho
+      ? {
+          ...lockupRecipe.titleEcho,
+          enabled: false,
+          opacity: 0,
+          dxPct: 0,
+          dyPct: 0,
+          blur: 0
+        }
+      : undefined
+  };
+}
+
+function makeFlatLockupRetryPalette(
+  palette: Awaited<ReturnType<typeof chooseTextPaletteForBackground>>
+): Awaited<ReturnType<typeof chooseTextPaletteForBackground>> {
+  return {
+    ...palette,
+    forceTitleShadow: false,
+    forceSubtitleShadow: false,
+    forceTitleOutline: false
+  };
 }
 
 function validateLockupSvgTextIntegrity(params: {
@@ -2110,18 +2218,80 @@ function validateLockupSvgTextIntegrity(params: {
   seriesTitle: string;
   subtitle?: string | null;
 }): LockupSvgTextValidation {
-  const expected = [params.seriesTitle, params.subtitle || ""].map((value) => normalizeLine(value)).filter(Boolean);
+  const expectedTitle = normalizeLine(params.seriesTitle);
+  const expectedSubtitle = normalizeLine(params.subtitle || "");
+  const expected = [expectedTitle, expectedSubtitle].filter(Boolean);
   const expectedSet = new Set(expected);
-  const extracted = extractSvgTextNodes(params.svg).map((value) => normalizeLine(value)).filter(Boolean);
-  const unexpected = [...new Set(extracted.filter((value) => !expectedSet.has(value)))];
+  const textNodes = extractSvgTextNodes(params.svg);
+  const extracted = textNodes.map((node) => node.normalizedText).filter(Boolean);
+  const uniqueExtracted = [...new Set(extracted)];
+  const unexpected = [...new Set(uniqueExtracted.filter((value) => !expectedSet.has(value)))];
   const missing = expected.filter((value) => !extracted.includes(value));
+  const titleOccurrences = expectedTitle ? extracted.filter((value) => value === expectedTitle).length : 0;
+  const subtitleOccurrences = expectedSubtitle ? extracted.filter((value) => value === expectedSubtitle).length : 0;
+  const reasons: string[] = [];
+
+  if (unexpected.length > 0) {
+    reasons.push(`unexpected text: ${unexpected.join(", ")}`);
+  }
+  if (missing.length > 0) {
+    reasons.push(`missing expected text: ${missing.join(", ")}`);
+  }
+  if (expectedTitle && titleOccurrences > 1) {
+    reasons.push(`title appears ${titleOccurrences} times (max 1)`);
+  }
+  if (expectedSubtitle && subtitleOccurrences > 1) {
+    reasons.push(`subtitle appears ${subtitleOccurrences} times (max 1)`);
+  }
+  if (/<\s*filter\b/i.test(params.svg)) {
+    reasons.push("svg contains <filter> node");
+  }
+  if (/\bfilter\s*=\s*["'][^"']*url\(#/i.test(params.svg)) {
+    reasons.push("svg contains filter reference url(#...)");
+  }
+  if (/<\s*feGaussianBlur\b/i.test(params.svg)) {
+    reasons.push("svg contains feGaussianBlur");
+  }
+  if (/<\s*feDropShadow\b/i.test(params.svg)) {
+    reasons.push("svg contains feDropShadow");
+  }
+  if (/<\s*feColorMatrix\b/i.test(params.svg)) {
+    reasons.push("svg contains feColorMatrix");
+  }
+
+  const transformedDuplicateText = new Set<string>();
+  const textCountByContent = new Map<string, number>();
+  for (const node of textNodes) {
+    textCountByContent.set(node.normalizedText, (textCountByContent.get(node.normalizedText) || 0) + 1);
+  }
+
+  textNodes.forEach((node, index) => {
+    const opacity = resolveTextNodeOpacity(node.openingTag);
+    if (typeof opacity === "number" && opacity < 0.999) {
+      reasons.push(`text node ${index + 1} has opacity ${opacity.toFixed(3)} (< 1)`);
+    }
+
+    const hasTransform = Boolean(extractSvgAttribute(node.openingTag, "transform"));
+    if (hasTransform && (textCountByContent.get(node.normalizedText) || 0) > 1) {
+      transformedDuplicateText.add(node.normalizedText);
+    }
+  });
+
+  if (transformedDuplicateText.size > 0) {
+    reasons.push(`duplicated transformed text layers detected: ${[...transformedDuplicateText].join(", ")}`);
+  }
+
+  const dedupedReasons = [...new Set(reasons)];
 
   return {
-    valid: unexpected.length === 0 && missing.length === 0,
+    valid: dedupedReasons.length === 0,
     expected,
-    extracted: [...new Set(extracted)],
+    extracted: uniqueExtracted,
     unexpected,
-    missing
+    missing,
+    titleOccurrences,
+    subtitleOccurrences,
+    reasons: dedupedReasons
   };
 }
 
@@ -2150,11 +2320,15 @@ async function renderValidatedLockupPng(params: {
   let finalSvg = "";
 
   for (let attempt = 0; attempt <= 1; attempt += 1) {
+    const usesFlatOverride = attempt === 1;
     if (attempt === 1) {
       textOverrideRetried = true;
       effectivePrompt = `${params.lockupPrompt}\n${LOCKUP_TEXT_OVERRIDE_PROMPT}`;
     }
 
+    const lockupRecipeForAttempt = usesFlatOverride ? makeFlatLockupRetryRecipe(params.lockupRecipe) : params.lockupRecipe;
+    const lockupPaletteForAttempt = usesFlatOverride ? makeFlatLockupRetryPalette(params.palette) : params.palette;
+    const lockupPresetIdForAttempt = usesFlatOverride ? undefined : params.lockupPresetId;
     const svg = buildCleanMinimalOverlaySvg({
       width: params.width,
       height: params.height,
@@ -2162,9 +2336,9 @@ async function renderValidatedLockupPng(params: {
         title: params.content.title,
         subtitle: params.content.subtitle
       },
-      palette: params.palette,
-      lockupRecipe: params.lockupRecipe,
-      lockupPresetId: params.lockupPresetId,
+      palette: lockupPaletteForAttempt,
+      lockupRecipe: lockupRecipeForAttempt,
+      lockupPresetId: lockupPresetIdForAttempt,
       styleFamily: params.styleFamily,
       fontSeed: params.fontSeed
     });
@@ -2182,9 +2356,9 @@ async function renderValidatedLockupPng(params: {
 
   if (finalValidation && !finalValidation.valid) {
     console.warn(
-      `[lockup-text-validation] failed after override retry unexpected=${finalValidation.unexpected.join(",") || "none"} missing=${
-        finalValidation.missing.join(",") || "none"
-      }`
+      `[lockup-text-validation] failed after override retry reasons=${finalValidation.reasons.join(" | ") || "none"} unexpected=${
+        finalValidation.unexpected.join(",") || "none"
+      } missing=${finalValidation.missing.join(",") || "none"}`
     );
   }
 
@@ -2197,7 +2371,10 @@ async function renderValidatedLockupPng(params: {
       expected: [],
       extracted: [],
       unexpected: [],
-      missing: []
+      missing: [],
+      titleOccurrences: 0,
+      subtitleOccurrences: 0,
+      reasons: []
     },
     textOverrideRetried
   };
@@ -3582,6 +3759,11 @@ type GenerationOutputPayload = {
     revisedPrompt?: string;
     toneCheck?: ToneCheckSummary;
     backgroundTextCheck?: BackgroundTextCheckSummary;
+    lockupValidation?: {
+      ok: boolean;
+      reasons: string[];
+      retried: boolean;
+    };
     rerank?: RerankDebugMeta;
     designSpec?: Record<string, unknown>;
   };
@@ -5521,7 +5703,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         `[lockup-prompt: ${effectiveLockupPrompt}]`,
         lockupTextOverrideRetried ? "[retry: lockup-text-override x1]" : "",
         lockupTextValidation && !lockupTextValidation.valid
-          ? `[lockup-text-validation: failed unexpected=${lockupTextValidation.unexpected.join(",") || "none"} missing=${lockupTextValidation.missing.join(",") || "none"}]`
+          ? `[lockup-text-validation: failed reasons=${lockupTextValidation.reasons.join("|") || "none"} unexpected=${
+              lockupTextValidation.unexpected.join(",") || "none"
+            } missing=${lockupTextValidation.missing.join(",") || "none"}]`
           : lockupTextValidation
             ? "[lockup-text-validation: passed]"
             : "",
@@ -5590,6 +5774,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         meta: {
           styleRefCount: references.length,
           usedStylePaths: references.map((reference) => reference.path || reference.thumbPath),
+          lockupValidation: {
+            ok: lockupTextValidation?.valid ?? true,
+            reasons: lockupTextValidation?.reasons || [],
+            retried: lockupTextOverrideRetried
+          },
           ...(shouldRunExplorationToneCheck
             ? {
                 toneCheck: masterAttempt.toneCheck || {
