@@ -1660,21 +1660,34 @@ function resolvePlannedLockupLayouts(params: {
   recentRecipeIds?: readonly string[];
   brandMode?: ProjectBrandMode;
   typographyDirection?: "match_site" | "graceled_defaults" | null;
+  round?: number;
+  hasDesignNotes?: boolean;
 }): [LockupLayoutArchetype, LockupLayoutArchetype, LockupLayoutArchetype] {
   if (params.keepLayout && !params.forceNewLayout) {
     return [params.keepLayout, params.keepLayout, params.keepLayout];
   }
 
-  const styleModes = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) =>
-    resolveLockupStyleMode({
+  const styleModes = Array.from({ length: ROUND_OPTION_COUNT }, (_, index) => {
+    const explicitStyleFamily = (params.styleFamilies[index] || params.styleFamilies[0] || null) as StyleFamily | null;
+    const resolvedStyleFamily = (explicitStyleFamily || "clean-min") as StyleFamily;
+    const usedCleanMinFallback = resolvedStyleFamily === "clean-min" && !explicitStyleFamily;
+    console.warn("[STYLEFAMILY FALLBACK]", {
+      resolvedStyleFamily,
+      usedCleanMinFallback,
+      optionIndex: index,
+      hasDesignNotes: params.hasDesignNotes ?? null,
+      round: params.round ?? null
+    });
+
+    return resolveLockupStyleMode({
       directionSpec: params.directionPlan[index] || null,
-      styleFamily: (params.styleFamilies[index] || params.styleFamilies[0] || "clean-min") as StyleFamily,
+      styleFamily: resolvedStyleFamily,
       lockupPresetId: params.lockupPresetIds[index] || null,
       references: params.referencesByOption[index] || [],
       brandMode: params.brandMode,
       typographyDirection: params.typographyDirection
-    })
-  );
+    });
+  });
 
   const recentRecipeRanks = new Map(
     (params.recentRecipeIds || [])
@@ -3757,6 +3770,12 @@ type GenerationOutputPayload = {
     styleRefCount: number;
     usedStylePaths: string[];
     revisedPrompt?: string;
+    debug?: {
+      styleFamilyFallback?: {
+        usedCleanMinFallback: boolean;
+        resolvedStyleFamily: StyleFamily;
+      };
+    };
     toneCheck?: ToneCheckSummary;
     backgroundTextCheck?: BackgroundTextCheckSummary;
     lockupValidation?: {
@@ -3829,10 +3848,24 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
   const designBrief = validatedDesignBrief.ok ? validatedDesignBrief.data : null;
   const lockupLayout = readLockupLayoutFromInput(params.input);
   const directionSpec = readDirectionSpecFromInput(params.input, params.optionIndex);
+  const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(params.input);
+  const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
   const wantsTitleStage = directionSpec?.wantsTitleStage === true;
   const lockupRecipe = designBrief?.lockupRecipe;
   const lockupPresetId = designBrief?.lockupPresetId;
-  const optionStyleFamily = (designBrief?.styleFamilies[params.optionIndex] || designBrief?.styleFamilies[0] || "clean-min") as StyleFamily;
+  const explicitStyleFamily = (designBrief?.styleFamilies[params.optionIndex] || designBrief?.styleFamilies[0] || null) as
+    | StyleFamily
+    | null;
+  const resolvedStyleFamily = (explicitStyleFamily || "clean-min") as StyleFamily;
+  const usedCleanMinFallback = resolvedStyleFamily === "clean-min" && !explicitStyleFamily;
+  console.warn("[STYLEFAMILY FALLBACK]", {
+    resolvedStyleFamily,
+    usedCleanMinFallback,
+    optionIndex: params.optionIndex,
+    hasDesignNotes,
+    round: params.round
+  });
+  const optionStyleFamily = resolvedStyleFamily;
   const displayContent = buildOverlayDisplayContent({
     title: params.project.series_title,
     subtitle: params.project.series_subtitle,
@@ -3883,6 +3916,16 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
       styleRefCount: params.referenceItems?.length || 0,
       usedStylePaths: (params.referenceItems || []).map((ref) => ref.path || ref.thumbPath),
       revisedPrompt: params.revisedPrompt,
+      ...(!hasDesignNotes
+        ? {
+            debug: {
+              styleFamilyFallback: {
+                usedCleanMinFallback,
+                resolvedStyleFamily
+              }
+            }
+          }
+        : {}),
       designSpec: fallbackDesignSpec
     }
   };
@@ -4235,6 +4278,8 @@ async function createStyleBrief(params: {
   directionSpec?: PlannedDirectionSpec | null;
   styleFamily?: StyleFamily;
   lockupPresetId?: string | null;
+  round?: number | null;
+  hasDesignNotes?: boolean;
 }): Promise<StyleBrief> {
   const fallback = fallbackStyleBrief(params.optionIndex, params.palette);
   const apiKey = process.env.OPENAI_API_KEY?.trim();
@@ -4250,9 +4295,20 @@ async function createStyleBrief(params: {
     params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
       ? params.project.brandKit.typographyDirection
       : null;
+  const explicitStyleFamily = (params.styleFamily || null) as StyleFamily | null;
+  const resolvedStyleFamily = (explicitStyleFamily || "clean-min") as StyleFamily;
+  const usedCleanMinFallback = resolvedStyleFamily === "clean-min" && !explicitStyleFamily;
+  const hasDesignNotes = params.hasDesignNotes ?? hasDesignDirection(params.project.designNotes, null);
+  console.warn("[STYLEFAMILY FALLBACK]", {
+    resolvedStyleFamily,
+    usedCleanMinFallback,
+    optionIndex: params.optionIndex,
+    hasDesignNotes,
+    round: params.round ?? null
+  });
   const lockupStyleMode = resolveLockupStyleMode({
     directionSpec: params.directionSpec,
-    styleFamily: params.styleFamily || "clean-min",
+    styleFamily: resolvedStyleFamily,
     lockupPresetId: params.lockupPresetId,
     references: params.references,
     brandMode: params.project.brandMode,
@@ -4777,6 +4833,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
   for (const plannedGeneration of params.plannedGenerations) {
     const fallbackOutput = plannedGeneration.fallbackOutput;
+    const fallbackStyleFamilyDebug = fallbackOutput.meta.debug?.styleFamilyFallback;
 
     if (!openAiEnabled) {
       await completeGenerationWithFallbackOutput({
@@ -5779,6 +5836,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             reasons: lockupTextValidation?.reasons || [],
             retried: lockupTextOverrideRetried
           },
+          ...(!hasDesignNotes && fallbackStyleFamilyDebug
+            ? {
+                debug: {
+                  styleFamilyFallback: fallbackStyleFamilyDebug
+                }
+              }
+            : {}),
           ...(shouldRunExplorationToneCheck
             ? {
                 toneCheck: masterAttempt.toneCheck || {
@@ -6165,7 +6229,9 @@ export async function generateRoundOneAction(
     forceDistinctRecipes: explorationMode,
     recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
     brandMode: project.brandMode,
-    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
+    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null,
+    round: 1,
+    hasDesignNotes
   });
   const inputsByOption = selectedPresetKeys.map((_, index) =>
     buildGenerationInput(
@@ -6392,7 +6458,9 @@ export async function generateRoundTwoAction(
     forceDistinctRecipes: explorationMode,
     recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
     brandMode: project.brandMode,
-    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null
+    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null,
+    round,
+    hasDesignNotes
   });
 
   const inputsByOption = selectedPresetKeys.map((_, index) => ({
