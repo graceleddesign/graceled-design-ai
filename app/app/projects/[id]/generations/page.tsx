@@ -160,12 +160,14 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
       : null;
   const debugBackgroundAnchorSrcCandidate =
     debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
-      ? ((debugReferenceAnchor as { backgroundAnchorSrc?: unknown }).backgroundAnchorSrc ??
+      ? ((debugReferenceAnchor as { visualAnchorSrc?: unknown }).visualAnchorSrc ??
+        (debugReferenceAnchor as { backgroundAnchorSrc?: unknown }).backgroundAnchorSrc ??
         (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc)
       : null;
   const debugLockupAnchorSrcCandidate =
     debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
-      ? ((debugReferenceAnchor as { lockupAnchorSrc?: unknown }).lockupAnchorSrc ??
+      ? ((debugReferenceAnchor as { typographyAnchorSrc?: unknown }).typographyAnchorSrc ??
+        (debugReferenceAnchor as { lockupAnchorSrc?: unknown }).lockupAnchorSrc ??
         (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc)
       : null;
   const debugBackgroundAnchorSrc =

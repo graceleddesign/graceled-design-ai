@@ -193,7 +193,7 @@ export function DirectionOptionCard({
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Reference Anchors</p>
           {debugBackgroundAnchorSrc ? (
             <div className="space-y-1">
-              <p className="text-[11px] font-medium text-slate-600">Background anchor src</p>
+              <p className="text-[11px] font-medium text-slate-600">Visual anchor src</p>
               <a
                 href={debugBackgroundAnchorSrc}
                 target="_blank"
@@ -206,7 +206,7 @@ export function DirectionOptionCard({
           ) : null}
           {debugLockupAnchorSrc ? (
             <div className="space-y-1">
-              <p className="text-[11px] font-medium text-slate-600">Lockup anchor src</p>
+              <p className="text-[11px] font-medium text-slate-600">Typography anchor src</p>
               <a
                 href={debugLockupAnchorSrc}
                 target="_blank"

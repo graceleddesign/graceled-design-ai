@@ -2524,6 +2524,9 @@ function buildLockupGenerationPrompt(params: {
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
     : "";
+  const referenceTypographyGuardLine = params.directionSpec?.referenceId
+    ? "Match typographic energy and hierarchy from the reference, but use ONLY the provided title/subtitle text. Do not introduce any other words."
+    : "";
   const referenceAnchorPriorityLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
     : "";
@@ -2635,6 +2638,7 @@ function buildLockupGenerationPrompt(params: {
     styleAuthorityOverrideLine,
     referenceAnchorContextLine,
     referenceAnchorDirectiveLine,
+    referenceTypographyGuardLine,
     referenceAnchorPriorityLine,
     referenceSecondaryGuardrailLine,
     ...profileSoftGuidanceLines,
@@ -4572,8 +4576,10 @@ type GenerationOutputPayload = {
         referenceId: string;
         referenceCluster: string | null;
         referenceTier: string | null;
-        backgroundAnchorSrc: string;
-        lockupAnchorSrc: string;
+        visualAnchorSrc: string;
+        typographyAnchorSrc: string;
+        backgroundAnchorSrc?: string;
+        lockupAnchorSrc?: string;
       };
     };
     toneCheck?: ToneCheckSummary;
@@ -4721,14 +4727,17 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     normalizedAnchorReferenceId.length > 0
       ? dedupedReferenceItems.find((reference) => normalizeReferenceId(reference.id) === normalizedAnchorReferenceId) || null
       : dedupedReferenceItems[0] || null;
-  const fallbackOriginalSrc = resolveReferenceOriginalSrc(fallbackAnchorReference);
-  const fallbackStyleAnchorSrc = resolveReferenceStyleAnchorSrc(fallbackAnchorReference);
+  const fallbackVisualAnchorSrc = resolveReferenceVisualAnchorSrc({
+    reference: fallbackAnchorReference,
+    referenceCluster: directionSpec?.referenceCluster || null
+  });
+  const fallbackTypographyAnchorSrc = resolveReferenceTypographyAnchorSrc(fallbackAnchorReference);
   const referenceAnchorDebugMeta = buildReferenceAnchorDebugMeta({
     referenceId: fallbackAnchorReference?.id || directionSpec?.referenceId || null,
     referenceCluster: directionSpec?.referenceCluster || null,
     referenceTier: directionSpec?.referenceTier || null,
-    backgroundAnchorSrc: fallbackStyleAnchorSrc || fallbackOriginalSrc,
-    lockupAnchorSrc: fallbackOriginalSrc || fallbackStyleAnchorSrc,
+    visualAnchorSrc: fallbackVisualAnchorSrc,
+    typographyAnchorSrc: fallbackTypographyAnchorSrc,
     optionIndex: params.optionIndex
   });
   const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(
@@ -5353,25 +5362,48 @@ function resolveReferenceStyleAnchorSrc(reference: ReferenceLibraryItem | null |
   return normalizeReferencePublicUrl(reference.styleAnchorPath, "style-anchor");
 }
 
+const VISUAL_STYLE_ANCHOR_CLUSTERS = new Set<ReferenceCluster>([
+  "editorial_photo",
+  "cinematic",
+  "illustration",
+  "modern_abstract"
+]);
+
+function resolveReferenceVisualAnchorSrc(params: {
+  reference: ReferenceLibraryItem | null | undefined;
+  referenceCluster?: string | null;
+}): string | null {
+  const originalSrc = resolveReferenceOriginalSrc(params.reference);
+  const styleAnchorSrc = resolveReferenceStyleAnchorSrc(params.reference);
+  if (params.referenceCluster && VISUAL_STYLE_ANCHOR_CLUSTERS.has(params.referenceCluster as ReferenceCluster)) {
+    return styleAnchorSrc || originalSrc;
+  }
+  return originalSrc || styleAnchorSrc;
+}
+
+function resolveReferenceTypographyAnchorSrc(reference: ReferenceLibraryItem | null | undefined): string | null {
+  return resolveReferenceOriginalSrc(reference) || resolveReferenceStyleAnchorSrc(reference);
+}
+
 function buildReferenceAnchorDebugMeta(params: {
   referenceId: string | null | undefined;
   referenceCluster: string | null;
   referenceTier: string | null;
-  backgroundAnchorSrc: string | null | undefined;
-  lockupAnchorSrc: string | null | undefined;
+  visualAnchorSrc: string | null | undefined;
+  typographyAnchorSrc: string | null | undefined;
   optionIndex: number;
 }): ReferenceAnchorDebugMeta | null {
   const referenceId = typeof params.referenceId === "string" ? params.referenceId.trim() : "";
   if (!referenceId) {
     return null;
   }
-  const backgroundAnchorSrc =
-    normalizeReferencePublicUrl(params.backgroundAnchorSrc, "style-anchor") ||
-    normalizeReferencePublicUrl(params.backgroundAnchorSrc, "original");
-  const lockupAnchorSrc =
-    normalizeReferencePublicUrl(params.lockupAnchorSrc, "original") ||
-    normalizeReferencePublicUrl(params.lockupAnchorSrc, "style-anchor");
-  if (!backgroundAnchorSrc || !lockupAnchorSrc) {
+  const visualAnchorSrc =
+    normalizeReferencePublicUrl(params.visualAnchorSrc, "style-anchor") ||
+    normalizeReferencePublicUrl(params.visualAnchorSrc, "original");
+  const typographyAnchorSrc =
+    normalizeReferencePublicUrl(params.typographyAnchorSrc, "original") ||
+    normalizeReferencePublicUrl(params.typographyAnchorSrc, "style-anchor");
+  if (!visualAnchorSrc || !typographyAnchorSrc) {
     if (process.env.NODE_ENV === "development") {
       console.warn("[MISSING REFERENCE ANCHOR SOURCES]", {
         referenceId,
@@ -5384,8 +5416,10 @@ function buildReferenceAnchorDebugMeta(params: {
     referenceId,
     referenceCluster: params.referenceCluster,
     referenceTier: params.referenceTier,
-    backgroundAnchorSrc,
-    lockupAnchorSrc
+    visualAnchorSrc,
+    typographyAnchorSrc,
+    backgroundAnchorSrc: visualAnchorSrc,
+    lockupAnchorSrc: typographyAnchorSrc
   };
 }
 
@@ -5694,6 +5728,9 @@ function buildTemplateBackgroundPrompt(params: {
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
     : "";
+  const referenceTypographyStageLine = params.directionSpec?.referenceId
+    ? "Reserve a strong typographic stage (clear negative space + contrast) in the same region/scale as the reference's type."
+    : "";
   const referenceAnchorPriorityLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
     : "";
@@ -5832,6 +5869,7 @@ function buildTemplateBackgroundPrompt(params: {
     styleFamilyBackgroundRulesLine,
     referenceAnchorContextLine,
     referenceAnchorDirectiveLine,
+    referenceTypographyStageLine,
     referenceAnchorPriorityLine,
     referenceSecondaryGuardrailLine,
     ...profileSoftGuidanceLines,
@@ -6300,16 +6338,19 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               })
             : sampledAnchorReference || indexedAnchorReference
           : null;
+      const resolvedReferenceCluster = curatedAnchorReference?.cluster || directionSpec?.referenceCluster || null;
+      const resolvedReferenceTier = curatedAnchorReference?.tier || directionSpec?.referenceTier || null;
       const references = anchorReference
         ? dedupeReferencesById([anchorReference, ...sampledReferences]).slice(0, 3)
         : sampledReferences;
-      const anchorOriginalSrc = resolveReferenceOriginalSrc(anchorReference);
-      const anchorStyleAnchorSrc = resolveReferenceStyleAnchorSrc(anchorReference);
-      const backgroundAnchorSrc = anchorStyleAnchorSrc || anchorOriginalSrc;
-      const lockupAnchorSrc = anchorOriginalSrc || anchorStyleAnchorSrc;
+      const anchorVisualAnchorSrc = resolveReferenceVisualAnchorSrc({
+        reference: anchorReference,
+        referenceCluster: resolvedReferenceCluster
+      });
+      const anchorTypographyAnchorSrc = resolveReferenceTypographyAnchorSrc(anchorReference);
       const backgroundPreferredSourcePathsByReferenceId = new Map<string, ReadonlyArray<string | null | undefined>>();
-      if (anchorReferenceId && backgroundAnchorSrc) {
-        backgroundPreferredSourcePathsByReferenceId.set(anchorReferenceId, [backgroundAnchorSrc]);
+      if (anchorReferenceId && anchorVisualAnchorSrc) {
+        backgroundPreferredSourcePathsByReferenceId.set(anchorReferenceId, [anchorVisualAnchorSrc]);
       }
       const backgroundStyleRefs = await buildReferenceDataUrls(references, {
         preferredSourcePathsByReferenceId: backgroundPreferredSourcePathsByReferenceId
@@ -6320,8 +6361,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               string,
               ReadonlyArray<string | null | undefined>
             >();
-            if (anchorReferenceId && lockupAnchorSrc) {
-              lockupPreferredSourcePathsByReferenceId.set(anchorReferenceId, [lockupAnchorSrc, anchorStyleAnchorSrc]);
+            if (anchorReferenceId && anchorTypographyAnchorSrc) {
+              lockupPreferredSourcePathsByReferenceId.set(anchorReferenceId, [anchorTypographyAnchorSrc]);
             }
             return buildReferenceDataUrls(references, {
               preferredSourcePathsByReferenceId: lockupPreferredSourcePathsByReferenceId
@@ -6336,18 +6377,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       }
       const anchorBackgroundStyleRef = anchorReference ? backgroundStyleRefs[0] || null : null;
       const anchorLockupStyleRef = anchorReference ? lockupStyleRefs[0] || null : null;
-      const resolvedReferenceCluster = curatedAnchorReference?.cluster || directionSpec?.referenceCluster || null;
-      const resolvedReferenceTier = curatedAnchorReference?.tier || directionSpec?.referenceTier || null;
       const referenceAnchorDebug = buildReferenceAnchorDebugMeta({
         referenceId: anchorReference?.id || directionSpec?.referenceId || null,
         referenceCluster: resolvedReferenceCluster,
         referenceTier: resolvedReferenceTier,
-        backgroundAnchorSrc:
-          backgroundAnchorSrc ||
+        visualAnchorSrc:
+          anchorVisualAnchorSrc ||
           normalizeReferencePublicUrl(anchorBackgroundStyleRef?.sourcePath, "style-anchor") ||
           normalizeReferencePublicUrl(anchorBackgroundStyleRef?.sourcePath, "original"),
-        lockupAnchorSrc:
-          lockupAnchorSrc ||
+        typographyAnchorSrc:
+          anchorTypographyAnchorSrc ||
           normalizeReferencePublicUrl(anchorLockupStyleRef?.sourcePath, "original") ||
           normalizeReferencePublicUrl(anchorLockupStyleRef?.sourcePath, "style-anchor"),
         optionIndex: plannedGeneration.optionIndex
@@ -7431,8 +7470,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         console.log("[REFERENCE ANCHOR DEBUG META]", {
           optionIndex: plannedGeneration.optionIndex,
           referenceId: directionSpec?.referenceId,
-          backgroundAnchorSrc: referenceAnchorDebug?.backgroundAnchorSrc || null,
-          lockupAnchorSrc: referenceAnchorDebug?.lockupAnchorSrc || null,
+          visualAnchorSrc: referenceAnchorDebug?.visualAnchorSrc || referenceAnchorDebug?.backgroundAnchorSrc || null,
+          typographyAnchorSrc: referenceAnchorDebug?.typographyAnchorSrc || referenceAnchorDebug?.lockupAnchorSrc || null,
           referenceAnchorDebug
         });
       }
