@@ -194,6 +194,11 @@ const ROUND1_RERANK_MIN_LONG_BORDER_LINES_FOR_SCAFFOLD = 2;
 const ROUND1_RERANK_BORDER_EDGE_DOMINANCE_THRESHOLD = 0.58;
 const ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY = 220;
 const ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY = 90;
+const ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS = 120;
+const ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY = 180;
+const ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT = 110;
+const ROUND1_RERANK_TITLE_SAFE_WEIGHT = 12;
+const ROUND1_RERANK_MIDTONE_RANGE_WEIGHT = 14;
 const LIGHT_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must satisfy tone targets. LIGHT must be high-key bright/clean (white or near-white background), NOT parchment/sepia/vintage. Avoid filmic grading, avoid desaturation, avoid heavy grain. Prioritize tone compliance over atmosphere.";
 const VIVID_TONE_OVERRIDE_RETRY_BOOST =
@@ -6673,6 +6678,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             bestScore: Number.POSITIVE_INFINITY,
             laneFailed: false,
             hardFailReadableText: false,
+            eligiblePoolEmpty: false,
             candidates: [] as BackgroundRerankCandidateDebug[],
             winner: null as BackgroundRerankWinnerDebug | null,
             winnerDirectionSpec:
@@ -6718,6 +6724,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 candidateDirectionSpec?.referenceCluster || null
               );
               const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
+              const meaningfulStructureScore = Math.max(0, hardFail?.meaningfulStructureScore || 0);
               const frameScaffoldTriggered =
                 hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
               const frameScaffoldPenalty = frameScaffoldTriggered
@@ -6732,10 +6739,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               score += tonePass ? 140 : -140;
               score += textFree ? 140 : -140;
               score += designPresencePass ? 90 : -90;
-              score += meaningfulStructurePass ? 70 : -140;
+              score += meaningfulStructurePass
+                ? ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS
+                : -ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY;
+              score += meaningfulStructureScore * ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT;
               score += hardFailBlankDesign ? -240 : 120;
-              score += (titleSafe?.score || 0) * 30;
-              score += (midtoneRange?.score || 0) * 35;
+              score += (titleSafe?.score || 0) * ROUND1_RERANK_TITLE_SAFE_WEIGHT;
+              score += (midtoneRange?.score || 0) * ROUND1_RERANK_MIDTONE_RANGE_WEIGHT;
               score -= attempt.textRetryCount * 2;
               score -= attempt.textArtifactRetryCount * 4;
               score -= frameScaffoldPenalty;
@@ -6787,20 +6797,21 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               entry.candidate.checks.meaningfulStructurePass &&
               !entry.candidate.checks.hardFailBlankDesign
           );
-        const pool = eligible.length > 0 ? eligible : noReadableTextCandidates;
-        const winner = pool.length
-          ? pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0])
+        const winner = eligible.length > 0
+          ? eligible.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), eligible[0])
           : null;
         const bestScore = winner?.candidate.score ?? Number.NEGATIVE_INFINITY;
-        const hardFailReadableText = pool.length <= 0;
+        const hardFailReadableText = noReadableTextCandidates.length <= 0;
+        const eligiblePoolEmpty = eligible.length <= 0;
         const laneFailed = hardFailReadableText || eligible.length <= 0 || bestScore < ROUND1_RERANK_MIN_ACCEPTABLE_SCORE;
 
         return {
-          attempt: winner?.candidate.attempt || candidates[0].attempt,
+          attempt: winner?.candidate.attempt || noReadableTextCandidates[0]?.candidate.attempt || candidates[0].attempt,
           winnerIndex: winner?.index || 0,
           bestScore,
           laneFailed,
           hardFailReadableText,
+          eligiblePoolEmpty,
           candidates: candidates.map((candidate) => ({
             url: candidate.debugUrl,
             stage: params.stage,
@@ -6848,6 +6859,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             attempt: await renderMasterAttempt({ originalityBoost }),
             winnerIndex: 0,
             laneFailed: false,
+            eligiblePoolEmpty: false,
             winnerDirectionSpec: backgroundDirectionSpec
           };
         }
@@ -6874,14 +6886,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         };
 
         let activeDirectionSpec = backgroundDirectionSpec;
-        let selection = await runBackgroundRerankAttempt({
+        let latestSelection = await runBackgroundRerankAttempt({
           stage: "primary",
           attemptNumber: fallback.attempts,
           directionSpecOverride: activeDirectionSpec,
           originalityBoost
         });
-        appendAttempt(selection);
-        activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
+        appendAttempt(latestSelection);
+        let bestEligibleSelection = latestSelection.winner ? latestSelection : null;
+        activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
 
         const laneFamily = directionSpec?.laneFamily;
         const laneTone = initialDirectionStyleFields.styleTone;
@@ -6890,7 +6903,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const baseSetKey = initialDirectionStyleFields.explorationSetKey;
         const recentFamiliesForFallback = await getRecentStyleFamiliesForFallback();
 
-        if (selection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
+        if (latestSelection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
           const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
           const currentFamilyForFallback = currentStyleFields.styleFamily || baseStyleFamily;
           const currentSetForFallback = currentStyleFields.explorationSetKey || baseSetKey;
@@ -6918,18 +6931,21 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             });
             fallback.usedAltFamily = true;
             fallback.attempts += 1;
-            selection = await runBackgroundRerankAttempt({
+            latestSelection = await runBackgroundRerankAttempt({
               stage: "fallback_family",
               attemptNumber: fallback.attempts,
               directionSpecOverride: activeDirectionSpec,
               originalityBoost
             });
-            appendAttempt(selection);
-            activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
+            appendAttempt(latestSelection);
+            if (latestSelection.winner) {
+              bestEligibleSelection = latestSelection;
+            }
+            activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
           }
         }
 
-        if (selection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
+        if (latestSelection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
           const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
           const currentSetKey = currentStyleFields.explorationSetKey || baseSetKey;
           const currentFamily = currentStyleFields.styleFamily || baseStyleFamily;
@@ -6961,24 +6977,34 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             });
             fallback.usedAltSet = true;
             fallback.attempts += 1;
-            selection = await runBackgroundRerankAttempt({
+            latestSelection = await runBackgroundRerankAttempt({
               stage: "fallback_set",
               attemptNumber: fallback.attempts,
               directionSpecOverride: activeDirectionSpec,
               originalityBoost
             });
-            appendAttempt(selection);
-            activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
+            appendAttempt(latestSelection);
+            if (latestSelection.winner) {
+              bestEligibleSelection = latestSelection;
+            }
+            activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
           }
         }
 
-        if (selection.hardFailReadableText || !selection.attempt.textCheckPassed) {
+        const finalSelection = bestEligibleSelection || latestSelection;
+
+        if (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed) {
           throw new Error(
             `Strict text rejection: all rerank candidates contained readable text for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}.`
           );
         }
+        if (!bestEligibleSelection) {
+          throw new Error(
+            `Strict rerank rejection: no eligible background candidates for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}; alternate family/set attempts exhausted.`
+          );
+        }
 
-        backgroundDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
+        backgroundDirectionSpec = finalSelection.winnerDirectionSpec || activeDirectionSpec;
         if (!shouldReuseBackground) {
           const finalStyleFields = resolveDirectionStyleFields(backgroundDirectionSpec);
           effectiveDirectionStyleFamily = finalStyleFields.styleFamily;
@@ -6991,16 +7017,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           ...rerankMeta,
           backgroundCandidates: aggregatedCandidates,
           backgroundWinner: winner || undefined,
-          laneFailed: selection.laneFailed,
+          laneFailed: finalSelection.laneFailed,
           fallback,
           backgroundWinnerIndex: globalWinnerIndex
         };
 
         return {
-          attempt: selection.attempt,
-          winnerIndex: selection.winnerIndex,
-          laneFailed: selection.laneFailed,
-          winnerDirectionSpec: selection.winnerDirectionSpec || activeDirectionSpec
+          attempt: finalSelection.attempt,
+          winnerIndex: finalSelection.winnerIndex,
+          laneFailed: finalSelection.laneFailed,
+          winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec
         };
       };
 
