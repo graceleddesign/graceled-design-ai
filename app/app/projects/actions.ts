@@ -20,8 +20,10 @@ import {
 } from "@/lib/design-brief";
 import {
   planDirectionSet,
+  planRoundTwoRefinementSet,
   pickExplorationFallbackStyleFamily,
   type PlannedDirectionSpec,
+  type TitleIntegrationMode,
   type StyleFamily as DirectionStyleFamily
 } from "@/lib/direction-planner";
 import { extractBibleCreativeBrief, type BibleCreativeBrief } from "@/lib/bible-creative-brief";
@@ -44,11 +46,13 @@ import {
   type ReferenceLibraryItem,
   type ReferenceLibraryStyleTag
 } from "@/lib/referenceLibrary";
-import { getCuratedReferences, type CuratedReference } from "@/lib/referenceCuration";
+import { getCuratedReferences, type CuratedReference, type ReferenceCluster } from "@/lib/referenceCuration";
 import {
   deriveRecentReferenceIds,
   getRound1ClusterProfile,
-  getRound1VariationTemplateByKey
+  getRound1VariationTemplateByKey,
+  isRound1DefaultBiasTemplateKey,
+  listRound1VariationTemplates
 } from "@/lib/referenceSelector";
 import { normalizeStyleDirection, type StyleDirection } from "@/lib/style-direction";
 import {
@@ -73,6 +77,7 @@ import {
   composeLockupOnBackground,
   LOCKUP_SAFE_REGION_RATIOS,
   type LockupIntegrationMode,
+  type LockupSafeRegionRatio,
   PREVIEW_DIMENSIONS,
   PREVIEW_SHAPES,
   renderTrimmedLockupPngFromSvg,
@@ -182,6 +187,12 @@ const ROUND1_RERANK_MIN_EDGES_FULL = 0.01;
 const ROUND1_RERANK_MIN_STD_FULL = 20;
 const ROUND1_RERANK_MIN_EDGES_NON_TITLE = 0.008;
 const ROUND1_RERANK_MIN_ACCEPTABLE_SCORE = 180;
+const ROUND1_RERANK_BORDER_BAND_RATIO = 0.08;
+const ROUND1_RERANK_LONG_BORDER_RUN_RATIO = 0.62;
+const ROUND1_RERANK_MIN_LONG_BORDER_LINES_FOR_SCAFFOLD = 2;
+const ROUND1_RERANK_BORDER_EDGE_DOMINANCE_THRESHOLD = 0.58;
+const ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY = 220;
+const ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY = 90;
 const LIGHT_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must satisfy tone targets. LIGHT must be high-key bright/clean (white or near-white background), NOT parchment/sepia/vintage. Avoid filmic grading, avoid desaturation, avoid heavy grain. Prioritize tone compliance over atmosphere.";
 const VIVID_TONE_OVERRIDE_RETRY_BOOST =
@@ -193,8 +204,13 @@ const DARK_TONE_OVERRIDE_RETRY_BOOST =
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
 const ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT = 4;
 const ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT = 2;
+const ROUND1_OPTION_PARALLEL_CONCURRENCY = 3;
+const ROUND1_CANDIDATE_PARALLEL_CONCURRENCY = 4;
+const ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY = 4;
 const ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO = 0.06;
 const ROUND1_EXPLORATION_LOCKUP_MIN_HEIGHT_RATIO = 0.28;
+const ROUND1_LAYOUT_TEMPLATE_REPEAT_PENALTY = 28;
+const ROUND1_LAYOUT_DEFAULT_BIAS_REPEAT_PENALTY = 84;
 const TITLE_SAFE_EDGE_SOFT_MAX = 0.085;
 const TITLE_SAFE_VARIANCE_TARGET = 24;
 const TITLE_SAFE_VARIANCE_TOLERANCE = 22;
@@ -215,6 +231,47 @@ const LOCKUP_LAYOUT_ARCHETYPES = [
 ] as const;
 type LockupLayoutArchetype = (typeof LOCKUP_LAYOUT_ARCHETYPES)[number];
 const LOCKUP_LAYOUT_ARCHETYPE_SET = new Set<string>(LOCKUP_LAYOUT_ARCHETYPES);
+type ConcurrencyLimiter = <T>(task: () => Promise<T>) => Promise<T>;
+const passthroughConcurrencyLimiter: ConcurrencyLimiter = async <T>(task: () => Promise<T>) => task();
+
+function createConcurrencyLimiter(maxConcurrency: number): ConcurrencyLimiter {
+  const concurrency = Math.max(1, Math.floor(maxConcurrency));
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  const runNext = () => {
+    if (active >= concurrency) {
+      return;
+    }
+    const next = queue.shift();
+    if (!next) {
+      return;
+    }
+    active += 1;
+    next();
+  };
+
+  return <T>(task: () => Promise<T>) =>
+    new Promise<T>((resolve, reject) => {
+      const execute = () => {
+        task()
+          .then(resolve, reject)
+          .finally(() => {
+            active -= 1;
+            runNext();
+          });
+      };
+
+      if (active < concurrency) {
+        active += 1;
+        execute();
+        return;
+      }
+
+      queue.push(execute);
+    });
+}
+
 type LockupTypographicRecipe = {
   id: string;
   label: string;
@@ -1057,16 +1114,80 @@ type MidtoneRangeScore = {
   score: number;
 };
 
+type NonTitleStructureThresholds = {
+  minEdgeDensity: number;
+  minLuminanceStd: number;
+  minCombinedScore: number;
+};
+
 type BackgroundHardFailStats = {
   edgeDensityFull: number;
   luminanceStdFull: number;
   edgeDensityNonTitle: number;
+  luminanceStdNonTitle: number;
+  requiredNonTitleEdgeDensity: number;
+  requiredNonTitleLuminanceStd: number;
+  meaningfulStructureScore: number;
+  meaningfulStructureMinScore: number;
+  meaningfulStructurePass: boolean;
+  nonTitleLowDetail: boolean;
+  borderEdgeRatio: number;
+  borderLineEdgeDominance: number;
+  longStraightBorderLineCount: number;
+  mostEdgesAreLongStraightBorders: boolean;
   passes: boolean;
 };
 
+function resolveNonTitleStructureThresholds(referenceCluster?: ReferenceCluster | null): NonTitleStructureThresholds {
+  switch (referenceCluster) {
+    case "minimal":
+      return {
+        minEdgeDensity: 0.006,
+        minLuminanceStd: 14,
+        minCombinedScore: 0.068
+      };
+    case "texture":
+      return {
+        minEdgeDensity: 0.007,
+        minLuminanceStd: 15,
+        minCombinedScore: 0.076
+      };
+    case "cinematic":
+    case "retro_print":
+      return {
+        minEdgeDensity: 0.008,
+        minLuminanceStd: 16,
+        minCombinedScore: 0.082
+      };
+    case "editorial_photo":
+      return {
+        minEdgeDensity: 0.0085,
+        minLuminanceStd: 17,
+        minCombinedScore: 0.085
+      };
+    case "modern_abstract":
+    case "bold_type":
+    case "illustration":
+    case "architectural":
+      return {
+        minEdgeDensity: 0.0095,
+        minLuminanceStd: 18,
+        minCombinedScore: 0.09
+      };
+    case "other":
+    default:
+      return {
+        minEdgeDensity: 0.008,
+        minLuminanceStd: 16,
+        minCombinedScore: 0.082
+      };
+  }
+}
+
 async function computeBackgroundHardFailStatsFromBuffer(
   imageBuffer: Buffer,
-  titleSafeBox: TitleSafeBox
+  titleSafeBox: TitleSafeBox,
+  referenceCluster?: ReferenceCluster | null
 ): Promise<BackgroundHardFailStats | null> {
   try {
     const raster = await sharp(imageBuffer, { failOn: "none" })
@@ -1092,9 +1213,14 @@ async function computeBackgroundHardFailStatsFromBuffer(
     const safeHeight = clampNumber(Math.round(height * clampNumber(titleSafeBox.height, 0.05, 1)), 1, height);
     const safeRight = clampNumber(safeLeft + safeWidth, safeLeft + 1, width);
     const safeBottom = clampNumber(safeTop + safeHeight, safeTop + 1, height);
+    const structureThresholds = resolveNonTitleStructureThresholds(referenceCluster);
+    const requiredNonTitleEdgeDensity = Math.max(ROUND1_RERANK_MIN_EDGES_NON_TITLE, structureThresholds.minEdgeDensity);
+    const requiredNonTitleLuminanceStd = Math.max(1, structureThresholds.minLuminanceStd);
 
     let sampleCount = 0;
     let luminanceSum = 0;
+    let nonTitleSampleCount = 0;
+    let nonTitleLuminanceSum = 0;
     for (let index = 0; index < totalPixels; index += 1) {
       const offset = index * channels;
       const alpha = data[offset + 3];
@@ -1109,6 +1235,13 @@ async function computeBackgroundHardFailStatsFromBuffer(
       opaqueMask[index] = 1;
       sampleCount += 1;
       luminanceSum += luminance;
+      const x = index % width;
+      const y = (index - x) / width;
+      const insideSafe = x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom;
+      if (!insideSafe) {
+        nonTitleSampleCount += 1;
+        nonTitleLuminanceSum += luminance;
+      }
     }
 
     if (sampleCount <= 0) {
@@ -1125,11 +1258,47 @@ async function computeBackgroundHardFailStatsFromBuffer(
       varianceSum += delta * delta;
     }
     const luminanceStdFull = Math.sqrt(varianceSum / sampleCount);
+    const meanLuminanceNonTitle = nonTitleSampleCount > 0 ? nonTitleLuminanceSum / nonTitleSampleCount : meanLuminance;
+    let varianceNonTitleSum = 0;
+    for (let index = 0; index < totalPixels; index += 1) {
+      if (!opaqueMask[index]) {
+        continue;
+      }
+      const x = index % width;
+      const y = (index - x) / width;
+      const insideSafe = x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom;
+      if (insideSafe) {
+        continue;
+      }
+      const delta = luminanceByPixel[index] - meanLuminanceNonTitle;
+      varianceNonTitleSum += delta * delta;
+    }
+    const luminanceStdNonTitle =
+      nonTitleSampleCount > 0 ? Math.sqrt(varianceNonTitleSum / Math.max(1, nonTitleSampleCount)) : 0;
 
     let fullEdgeCount = 0;
     let fullEdgeSamples = 0;
     let nonTitleEdgeCount = 0;
     let nonTitleEdgeSamples = 0;
+    let borderEdgeCount = 0;
+    const borderBandX = clampNumber(
+      Math.round(width * ROUND1_RERANK_BORDER_BAND_RATIO),
+      1,
+      Math.max(1, Math.floor(width / 4))
+    );
+    const borderBandY = clampNumber(
+      Math.round(height * ROUND1_RERANK_BORDER_BAND_RATIO),
+      1,
+      Math.max(1, Math.floor(height / 4))
+    );
+    const topBorderRows = new Uint16Array(borderBandY);
+    const bottomBorderRows = new Uint16Array(borderBandY);
+    const leftBorderCols = new Uint16Array(borderBandX);
+    const rightBorderCols = new Uint16Array(borderBandX);
+    let topBorderMaxRun = 0;
+    let bottomBorderMaxRun = 0;
+    let leftBorderMaxRun = 0;
+    let rightBorderMaxRun = 0;
 
     for (let y = 1; y < height - 1; y += 1) {
       for (let x = 1; x < width - 1; x += 1) {
@@ -1157,19 +1326,95 @@ async function computeBackgroundHardFailStatsFromBuffer(
             nonTitleEdgeCount += 1;
           }
         }
+
+        if (!isEdge) {
+          continue;
+        }
+
+        const inTopBand = y < borderBandY;
+        const inBottomBand = y >= height - borderBandY;
+        const inLeftBand = x < borderBandX;
+        const inRightBand = x >= width - borderBandX;
+        if (inTopBand || inBottomBand || inLeftBand || inRightBand) {
+          borderEdgeCount += 1;
+        }
+        if (inTopBand) {
+          const next = topBorderRows[y] + 1;
+          topBorderRows[y] = next;
+          if (next > topBorderMaxRun) {
+            topBorderMaxRun = next;
+          }
+        }
+        if (inBottomBand) {
+          const bottomIndex = y - (height - borderBandY);
+          const next = bottomBorderRows[bottomIndex] + 1;
+          bottomBorderRows[bottomIndex] = next;
+          if (next > bottomBorderMaxRun) {
+            bottomBorderMaxRun = next;
+          }
+        }
+        if (inLeftBand) {
+          const next = leftBorderCols[x] + 1;
+          leftBorderCols[x] = next;
+          if (next > leftBorderMaxRun) {
+            leftBorderMaxRun = next;
+          }
+        }
+        if (inRightBand) {
+          const rightIndex = x - (width - borderBandX);
+          const next = rightBorderCols[rightIndex] + 1;
+          rightBorderCols[rightIndex] = next;
+          if (next > rightBorderMaxRun) {
+            rightBorderMaxRun = next;
+          }
+        }
       }
     }
 
     const edgeDensityFull = fullEdgeSamples > 0 ? fullEdgeCount / fullEdgeSamples : 0;
     const edgeDensityNonTitle = nonTitleEdgeSamples > 0 ? nonTitleEdgeCount / nonTitleEdgeSamples : 0;
+    const longHorizontalRunThreshold = Math.max(4, Math.round(width * ROUND1_RERANK_LONG_BORDER_RUN_RATIO));
+    const longVerticalRunThreshold = Math.max(4, Math.round(height * ROUND1_RERANK_LONG_BORDER_RUN_RATIO));
+    const hasTopBorderLine = topBorderMaxRun >= longHorizontalRunThreshold;
+    const hasBottomBorderLine = bottomBorderMaxRun >= longHorizontalRunThreshold;
+    const hasLeftBorderLine = leftBorderMaxRun >= longVerticalRunThreshold;
+    const hasRightBorderLine = rightBorderMaxRun >= longVerticalRunThreshold;
+    const longStraightBorderLineCount =
+      (hasTopBorderLine ? 1 : 0) +
+      (hasBottomBorderLine ? 1 : 0) +
+      (hasLeftBorderLine ? 1 : 0) +
+      (hasRightBorderLine ? 1 : 0);
+    const borderEdgeRatio = fullEdgeCount > 0 ? borderEdgeCount / fullEdgeCount : 0;
+    const borderLineEdgeDominance = clampNumber(borderEdgeRatio * 0.72 + (longStraightBorderLineCount / 4) * 0.28, 0, 1);
+    const mostEdgesAreLongStraightBorders =
+      borderEdgeRatio >= ROUND1_RERANK_BORDER_EDGE_DOMINANCE_THRESHOLD &&
+      longStraightBorderLineCount >= ROUND1_RERANK_MIN_LONG_BORDER_LINES_FOR_SCAFFOLD;
+    const meaningfulStructureScore = edgeDensityNonTitle + luminanceStdNonTitle / 255;
+    const meaningfulStructurePass =
+      edgeDensityNonTitle >= requiredNonTitleEdgeDensity &&
+      luminanceStdNonTitle >= requiredNonTitleLuminanceStd &&
+      meaningfulStructureScore >= structureThresholds.minCombinedScore;
+    const nonTitleLowDetail = !meaningfulStructurePass;
     const passes =
       (edgeDensityFull >= ROUND1_RERANK_MIN_EDGES_FULL && luminanceStdFull >= ROUND1_RERANK_MIN_STD_FULL) &&
-      edgeDensityNonTitle >= ROUND1_RERANK_MIN_EDGES_NON_TITLE;
+      edgeDensityNonTitle >= requiredNonTitleEdgeDensity &&
+      meaningfulStructurePass;
 
     return {
       edgeDensityFull,
       luminanceStdFull,
       edgeDensityNonTitle,
+      luminanceStdNonTitle,
+      requiredNonTitleEdgeDensity,
+      requiredNonTitleLuminanceStd,
+      meaningfulStructureScore,
+      meaningfulStructureMinScore: structureThresholds.minCombinedScore,
+      meaningfulStructurePass,
+      nonTitleLowDetail,
+      borderEdgeRatio,
+      borderLineEdgeDominance,
+      longStraightBorderLineCount,
+      mostEdgesAreLongStraightBorders,
       passes
     };
   } catch {
@@ -1260,8 +1505,9 @@ function evaluateLockupFit(params: {
   canvasWidth: number;
   canvasHeight: number;
   marginRatio: number;
+  titleSafeBox?: TitleSafeBox;
 }): LockupFitCheck {
-  const safeRatio = LOCKUP_SAFE_REGION_RATIOS[params.shape];
+  const safeRatio = params.titleSafeBox || LOCKUP_SAFE_REGION_RATIOS[params.shape];
   const safeWidth = Math.max(1, Math.round(params.canvasWidth * safeRatio.width));
   const safeHeight = Math.max(1, Math.round(params.canvasHeight * safeRatio.height));
   const marginX = Math.max(1, Math.round(safeWidth * clampNumber(params.marginRatio, 0, 0.2)));
@@ -1344,27 +1590,167 @@ function truncateForPrompt(value: string | null | undefined, maxLength: number):
   return `${text.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
-function shapeCompositionHint(shape: PreviewShape): string {
-  if (shape === "wide") {
-    return "Reserve at least the left 55% as clean negative space for typography; keep art interest mostly to the right.";
+function resolveVariationTemplateFromDirectionSpec(directionSpec?: PlannedDirectionSpec | null) {
+  if (typeof directionSpec?.variationTemplateKey !== "string" || !directionSpec.variationTemplateKey.trim()) {
+    return null;
   }
-  if (shape === "tall") {
-    return "Reserve upper-middle area as clean negative space for typography; keep heavier art in the lower third.";
-  }
-  return "Reserve large left-center negative space for typography and keep accents subtle near edges.";
+  return getRound1VariationTemplateByKey(directionSpec.variationTemplateKey);
 }
 
-type SafeAreaAnchor = "upper-left" | "upper-center";
+function isReferenceFirstDirection(directionSpec?: PlannedDirectionSpec | null): boolean {
+  return typeof directionSpec?.referenceId === "string" && directionSpec.referenceId.trim().length > 0;
+}
 
-function resolveSafeAreaAnchor(directionSpec?: PlannedDirectionSpec | null): SafeAreaAnchor {
-  if (!directionSpec) {
+function resolveTitleSafeBoxForDirection(
+  shape: PreviewShape,
+  directionSpec?: PlannedDirectionSpec | null,
+  variationTemplate = resolveVariationTemplateFromDirectionSpec(directionSpec)
+): LockupSafeRegionRatio {
+  const base = LOCKUP_SAFE_REGION_RATIOS[shape];
+  if (!variationTemplate) {
+    return base;
+  }
+
+  const clampBox = (box: LockupSafeRegionRatio): LockupSafeRegionRatio => {
+    const width = clampNumber(box.width, 0.2, 0.9);
+    const height = clampNumber(box.height, 0.14, 0.86);
+    const left = clampNumber(box.left, 0, 1 - width);
+    const top = clampNumber(box.top, 0, 1 - height);
+    return { left, top, width, height };
+  };
+
+  const centeredBox = clampBox({
+    left: (1 - (shape === "wide" ? 0.56 : shape === "tall" ? 0.74 : 0.66)) / 2,
+    top: (1 - (shape === "wide" ? 0.38 : shape === "tall" ? 0.26 : 0.42)) / 2,
+    width: shape === "wide" ? 0.56 : shape === "tall" ? 0.74 : 0.66,
+    height: shape === "wide" ? 0.38 : shape === "tall" ? 0.26 : 0.42
+  });
+
+  const topBandBox = clampBox({
+    left: (1 - (shape === "wide" ? 0.76 : shape === "tall" ? 0.84 : 0.82)) / 2,
+    top: shape === "tall" ? 0.09 : 0.08,
+    width: shape === "wide" ? 0.76 : shape === "tall" ? 0.84 : 0.82,
+    height: shape === "wide" ? 0.3 : shape === "tall" ? 0.18 : 0.26
+  });
+
+  const bottomBandHeight = shape === "wide" ? 0.3 : shape === "tall" ? 0.18 : 0.26;
+  const bottomBandTopPad = shape === "tall" ? 0.09 : 0.08;
+  const bottomBandBox = clampBox({
+    left: topBandBox.left,
+    top: 1 - bottomBandTopPad - bottomBandHeight,
+    width: topBandBox.width,
+    height: bottomBandHeight
+  });
+
+  const fullBleedTopLeftBox = clampBox({
+    left: base.left,
+    top: shape === "tall" ? 0.07 : 0.08,
+    width: shape === "wide" ? 0.44 : shape === "tall" ? 0.66 : 0.56,
+    height: shape === "wide" ? 0.26 : shape === "tall" ? 0.2 : 0.32
+  });
+  const fullBleedBottomLeftHeight = shape === "wide" ? 0.26 : shape === "tall" ? 0.2 : 0.32;
+  const fullBleedBottomLeftPad = shape === "tall" ? 0.1 : 0.09;
+  const fullBleedBottomLeftBox = clampBox({
+    left: fullBleedTopLeftBox.left,
+    top: 1 - fullBleedBottomLeftPad - fullBleedBottomLeftHeight,
+    width: fullBleedTopLeftBox.width,
+    height: fullBleedBottomLeftHeight
+  });
+
+  if (variationTemplate.overlapRule === "type_over_art" && variationTemplate.asymmetryRule === "full_bleed") {
+    if (variationTemplate.overlayAnchor === "center") {
+      return centeredBox;
+    }
+    if (variationTemplate.overlayAnchor === "bottom-left") {
+      return fullBleedBottomLeftBox;
+    }
+    return fullBleedTopLeftBox;
+  }
+
+  if (variationTemplate.typeRegion === "right") {
+    return clampBox({
+      ...base,
+      left: 1 - base.left - base.width
+    });
+  }
+  if (variationTemplate.typeRegion === "center") {
+    return centeredBox;
+  }
+  if (variationTemplate.typeRegion === "top") {
+    return topBandBox;
+  }
+  if (variationTemplate.typeRegion === "bottom") {
+    return bottomBandBox;
+  }
+
+  return base;
+}
+
+function shapeCompositionHint(params: {
+  shape: PreviewShape;
+  directionSpec?: PlannedDirectionSpec | null;
+  variationTemplate?: ReturnType<typeof resolveVariationTemplateFromDirectionSpec>;
+}): string {
+  const variationTemplate = params.variationTemplate || resolveVariationTemplateFromDirectionSpec(params.directionSpec);
+  if (!variationTemplate) {
+    if (params.shape === "wide") {
+      return "Reserve at least the left 55% as clean negative space for typography; keep art interest mostly to the right.";
+    }
+    if (params.shape === "tall") {
+      return "Reserve upper-middle area as clean negative space for typography; keep heavier art in the lower third.";
+    }
+    return "Reserve large left-center negative space for typography and keep accents subtle near edges.";
+  }
+
+  const safeBox = resolveTitleSafeBoxForDirection(params.shape, params.directionSpec, variationTemplate);
+  const leftPct = Math.round(safeBox.left * 100);
+  const topPct = Math.round(safeBox.top * 100);
+  const rightPct = Math.round((safeBox.left + safeBox.width) * 100);
+  const bottomPct = Math.round((safeBox.top + safeBox.height) * 100);
+  const overlapLine =
+    variationTemplate.overlapRule === "type_over_art"
+      ? "Type must overlay art with controlled local contrast."
+      : "Type and art must stay spatially separated.";
+
+  return `Template shape guidance (${variationTemplate.key}): keep type stage in x ${leftPct}-${rightPct}% and y ${topPct}-${bottomPct}% on ${params.shape.toUpperCase()}. ${overlapLine}`;
+}
+
+type SafeAreaAnchor = "upper-left" | "upper-center" | "upper-right" | "center" | "lower-left" | "lower-center";
+
+function resolveSafeAreaAnchor(
+  directionSpec?: PlannedDirectionSpec | null,
+  variationTemplate = resolveVariationTemplateFromDirectionSpec(directionSpec)
+): SafeAreaAnchor {
+  if (variationTemplate) {
+    if (variationTemplate.overlapRule === "type_over_art" && variationTemplate.asymmetryRule === "full_bleed") {
+      if (variationTemplate.overlayAnchor === "center") {
+        return "center";
+      }
+      if (variationTemplate.overlayAnchor === "bottom-left") {
+        return "lower-left";
+      }
+      return "upper-left";
+    }
+    if (variationTemplate.typeRegion === "right") {
+      return "upper-right";
+    }
+    if (variationTemplate.typeRegion === "center") {
+      return "center";
+    }
+    if (variationTemplate.typeRegion === "top") {
+      return "upper-center";
+    }
+    if (variationTemplate.typeRegion === "bottom") {
+      return "lower-center";
+    }
     return "upper-left";
   }
 
   if (
-    directionSpec.compositionType === "centered_stack" ||
-    directionSpec.compositionType === "badge_emblem" ||
-    directionSpec.compositionType === "monumental_overprint"
+    directionSpec &&
+    (directionSpec.compositionType === "centered_stack" ||
+      directionSpec.compositionType === "badge_emblem" ||
+      directionSpec.compositionType === "monumental_overprint")
   ) {
     return "upper-center";
   }
@@ -1372,53 +1758,81 @@ function resolveSafeAreaAnchor(directionSpec?: PlannedDirectionSpec | null): Saf
   return "upper-left";
 }
 
-function describeLockupSafeArea(shape: PreviewShape, anchor: SafeAreaAnchor): string {
-  const ratios = LOCKUP_SAFE_REGION_RATIOS[shape];
+function describeLockupSafeArea(
+  shape: PreviewShape,
+  directionSpec?: PlannedDirectionSpec | null,
+  variationTemplate = resolveVariationTemplateFromDirectionSpec(directionSpec)
+): string {
+  const ratios = resolveTitleSafeBoxForDirection(shape, directionSpec, variationTemplate);
+  const anchor = resolveSafeAreaAnchor(directionSpec, variationTemplate);
   const leftPct = Math.round(ratios.left * 100);
   const topPct = Math.round(ratios.top * 100);
   const widthPct = Math.round(ratios.width * 100);
   const heightPct = Math.round(ratios.height * 100);
   const rightPct = clampNumber(leftPct + widthPct, 0, 100);
   const bottomPct = clampNumber(topPct + heightPct, 0, 100);
-  const anchorHint =
-    anchor === "upper-center"
-      ? "Prioritize the upper-center of this safe area for the cleanest negative space."
-      : "Prioritize the upper-left of this safe area for the cleanest negative space.";
+  const anchorHintByAnchor: Record<SafeAreaAnchor, string> = {
+    "upper-left": "Prioritize the upper-left of this safe area for the cleanest negative space.",
+    "upper-center": "Prioritize the upper-center of this safe area for the cleanest negative space.",
+    "upper-right": "Prioritize the upper-right of this safe area for the cleanest negative space.",
+    center: "Prioritize the center of this safe area for the cleanest negative space.",
+    "lower-left": "Prioritize the lower-left of this safe area for the cleanest negative space.",
+    "lower-center": "Prioritize the lower-center of this safe area for the cleanest negative space."
+  };
+  const anchorHint = anchorHintByAnchor[anchor];
 
   return `${shape.toUpperCase()}: reserve lockup safe area at x ${leftPct}-${rightPct}% and y ${topPct}-${bottomPct}%. ${anchorHint} Keep this region clean, low texture, low contrast, no focal elements, no strong lines, no scanline/banding artifacts, no moire.`;
 }
 
 function buildLockupSafeAreaInstructions(directionSpec?: PlannedDirectionSpec | null): string {
-  const anchor = resolveSafeAreaAnchor(directionSpec);
+  const variationTemplate = resolveVariationTemplateFromDirectionSpec(directionSpec);
+  const anchor = resolveSafeAreaAnchor(directionSpec, variationTemplate);
   const directionLine = directionSpec
     ? `Direction-aware lockup reservation: ${directionSpec.compositionType} should protect the ${anchor} lockup lane.`
     : "Direction-aware lockup reservation: default to upper-left lockup lane.";
+  const templateLine = variationTemplate
+    ? `Layout template lane map (${variationTemplate.key}): focal=${variationTemplate.primaryFocalRegion || "auto"}, type=${variationTemplate.typeRegion || "auto"}, overlap=${variationTemplate.overlapRule || "separated"}, asymmetry=${variationTemplate.asymmetryRule || "split"}.`
+    : "";
 
   return [
     directionLine,
-    describeLockupSafeArea("wide", anchor),
-    describeLockupSafeArea("square", anchor),
-    describeLockupSafeArea("tall", anchor)
+    templateLine,
+    describeLockupSafeArea("wide", directionSpec, variationTemplate),
+    describeLockupSafeArea("square", directionSpec, variationTemplate),
+    describeLockupSafeArea("tall", directionSpec, variationTemplate)
   ].join(" ");
 }
 
-function describeTitleStageFocusBounds(shape: PreviewShape, placementHint: SafeAreaAnchor): string {
-  const ratios = LOCKUP_SAFE_REGION_RATIOS[shape];
+function describeTitleStageFocusBounds(
+  shape: PreviewShape,
+  placementHint: SafeAreaAnchor,
+  directionSpec?: PlannedDirectionSpec | null
+): string {
+  const ratios = resolveTitleSafeBoxForDirection(shape, directionSpec);
   const leftPct = Math.round(ratios.left * 100);
   const topPct = Math.round(ratios.top * 100);
   const widthPct = Math.round(ratios.width * 100);
   const heightPct = Math.round(ratios.height * 100);
   const rightPct = clampNumber(leftPct + widthPct, 0, 100);
   const bottomPct = clampNumber(topPct + heightPct, 0, 100);
-  const placementNote =
-    placementHint === "upper-center"
-      ? "bias the cleanest negative space to the upper-center."
-      : "bias the cleanest negative space to the upper-left.";
+  const placementNoteByAnchor: Record<SafeAreaAnchor, string> = {
+    "upper-left": "bias the cleanest negative space to the upper-left.",
+    "upper-center": "bias the cleanest negative space to the upper-center.",
+    "upper-right": "bias the cleanest negative space to the upper-right.",
+    center: "bias the cleanest negative space to center.",
+    "lower-left": "bias the cleanest negative space to the lower-left.",
+    "lower-center": "bias the cleanest negative space to the lower-center."
+  };
+  const placementNote = placementNoteByAnchor[placementHint];
   return `${shape.toUpperCase()} composition support zone (planning coordinates only, never a drawn frame): x ${leftPct}-${rightPct}% and y ${topPct}-${bottomPct}%; ${placementNote}`;
 }
 
-function describeFormatStagePlacement(shape: PreviewShape, placementHint: SafeAreaAnchor): string {
-  const stageArea = describeTitleStageFocusBounds(shape, placementHint);
+function describeFormatStagePlacement(
+  shape: PreviewShape,
+  placementHint: SafeAreaAnchor,
+  directionSpec?: PlannedDirectionSpec | null
+): string {
+  const stageArea = describeTitleStageFocusBounds(shape, placementHint, directionSpec);
   if (shape === "wide") {
     return `WIDE guidance: ${stageArea} Build this zone through negative-space gradients, lower texture density, and gentle tonal easing; let arcs, diagonals, or cropped forms taper toward it without drawing borders.`;
   }
@@ -1432,6 +1846,7 @@ function buildTitleStageInstructions(params: {
   format: PreviewShape;
   placementHint: SafeAreaAnchor;
   mode: ProjectBrandMode;
+  directionSpec?: PlannedDirectionSpec | null;
 }): string {
   const formatOrder = [params.format, ...PREVIEW_SHAPES].filter(
     (shape, index, items): shape is PreviewShape => items.indexOf(shape) === index
@@ -1446,7 +1861,7 @@ function buildTitleStageInstructions(params: {
     "Do NOT draw any visible rectangle/frame to indicate the stage.",
     "Do NOT add faint rectangles, frames, guide boxes, UI overlays, wireframes, or thin outline borders anywhere (even subtly).",
     "Do NOT use obvious spotlight cones, rays, or beam effects to fake stage lighting.",
-    ...formatOrder.map((shape) => describeFormatStagePlacement(shape, params.placementHint)),
+    ...formatOrder.map((shape) => describeFormatStagePlacement(shape, params.placementHint, params.directionSpec)),
     "Build the stage through composition: negative-space gradients, lower texture density, lower local contrast, controlled tonal transitions, and shape-led framing via arcs/diagonals/cropped forms.",
     "Use subtle surrounding composition to point toward the lockup area; composition should support the lockup zone rather than mark it with a container.",
     "Keep a clear foreground/background hierarchy with the title stage as the quietest area, and make it feel native to the artwork.",
@@ -1463,6 +1878,12 @@ function buildTitleStageInstructions(params: {
 }
 
 type LockupStyleMode = "engraved_stamp" | "modern_editorial";
+const TITLE_INTEGRATION_MODE_SET = new Set<TitleIntegrationMode>([
+  "OVERLAY_GLASS",
+  "CUTOUT_MASK",
+  "GRID_LOCKUP",
+  "TYPE_AS_TEXTURE"
+]);
 
 const LOCKUP_DISALLOWED_DECORATIONS =
   "random thin lines, corner brackets, label pills, text boxes or frames, white outline boxes, decorative underlines that are not part of one cohesive typographic system";
@@ -1525,6 +1946,48 @@ function chooseLockupIntegrationMode(styleMode: LockupStyleMode): LockupIntegrat
   return styleMode === "engraved_stamp" ? "stamp" : "clean";
 }
 
+function isTitleIntegrationMode(value: unknown): value is TitleIntegrationMode {
+  return typeof value === "string" && TITLE_INTEGRATION_MODE_SET.has(value as TitleIntegrationMode);
+}
+
+function resolveTitleIntegrationMode(directionSpec?: PlannedDirectionSpec | null): TitleIntegrationMode | null {
+  const candidate = directionSpec?.titleIntegrationMode;
+  return isTitleIntegrationMode(candidate) ? candidate : null;
+}
+
+function buildTitleIntegrationAuthorityInstruction(params: {
+  mode: TitleIntegrationMode;
+  target: "background" | "lockup";
+  variationTemplate?: ReturnType<typeof resolveVariationTemplateFromDirectionSpec>;
+}): string {
+  const template = params.variationTemplate;
+  const templateContext = template
+    ? `Template context: type region=${template.typeRegion || "auto"}, overlap=${template.overlapRule || "separated"}, asymmetry=${template.asymmetryRule || "split"}, overlay anchor=${template.overlayAnchor || "auto"}.`
+    : "Template context: follow the active title-safe lane and lockup anchor for this direction.";
+
+  if (params.mode === "OVERLAY_GLASS") {
+    return params.target === "background"
+      ? `HARD TITLE-INTEGRATION MODE: OVERLAY_GLASS. Build a translucent palette-echoing plate in the title lane. Plate silhouette must follow the template geometry instead of a generic box. ${templateContext} The plate must feel composition-native, not pasted.`
+      : `HARD TITLE-INTEGRATION MODE: OVERLAY_GLASS. Set title/subtitle inside the translucent plate geometry and match its contour/axis. ${templateContext} Use contrast/refraction cues subtly so type feels embedded, not floating.`;
+  }
+
+  if (params.mode === "CUTOUT_MASK") {
+    return params.target === "background"
+      ? `HARD TITLE-INTEGRATION MODE: CUTOUT_MASK. Build one solid shape or image-density region in the title lane specifically for knockout lettering. ${templateContext} Prepare clean negative-space edges so type can be carved out of the form.`
+      : `HARD TITLE-INTEGRATION MODE: CUTOUT_MASK. Render the title as true knockout/negative space carved from a host shape or image region. ${templateContext} This must read as integrated cutout, never normal text pasted on top.`;
+  }
+
+  if (params.mode === "GRID_LOCKUP") {
+    return params.target === "background"
+      ? `HARD TITLE-INTEGRATION MODE: GRID_LOCKUP. Establish a strict modular grid and align background masses, edges, and spacing to shared grid lines in the title lane. ${templateContext} Build the scene so type can lock to the same grid.`
+      : `HARD TITLE-INTEGRATION MODE: GRID_LOCKUP. Lock title/subtitle baselines, block edges, and spacing to a strict shared grid. ${templateContext} Alignment must visibly match the background grid structure.`;
+  }
+
+  return params.target === "background"
+    ? `HARD TITLE-INTEGRATION MODE: TYPE_AS_TEXTURE. Add subtle repeated microtype/letterform fragments as abstract texture only. ${templateContext} Never form readable extra words, logos, or signage; fragments must stay non-readable and atmospheric.`
+    : `HARD TITLE-INTEGRATION MODE: TYPE_AS_TEXTURE. Let the lockup borrow subtle fragment/texture rhythm from the background letterform system. ${templateContext} Never add readable extra words beyond the title and optional subtitle.`;
+}
+
 function isLockupLayoutArchetype(value: unknown): value is LockupLayoutArchetype {
   return typeof value === "string" && LOCKUP_LAYOUT_ARCHETYPE_SET.has(value);
 }
@@ -1541,6 +2004,100 @@ function hashForDeterministicOrdering(seed: string, value: string): string {
 
 function deterministicOrder<T extends string>(items: readonly T[], seed: string): T[] {
   return [...items].sort((a, b) => hashForDeterministicOrdering(seed, a).localeCompare(hashForDeterministicOrdering(seed, b)));
+}
+
+function buildVariationTemplateHardInstruction(params: {
+  variationTemplate: NonNullable<ReturnType<typeof resolveVariationTemplateFromDirectionSpec>>;
+  target: "background" | "lockup";
+}): string {
+  const region = (value: string | undefined) => value || "auto";
+  const overlayAnchor = params.variationTemplate.overlayAnchor ? `, overlay anchor=${params.variationTemplate.overlayAnchor}` : "";
+  const templateDefinitionLine = `HARD LAYOUT TEMPLATE (${params.variationTemplate.key}): focal region=${region(params.variationTemplate.primaryFocalRegion)}, type region=${region(params.variationTemplate.typeRegion)}, overlap=${params.variationTemplate.overlapRule || "separated"}, asymmetry=${params.variationTemplate.asymmetryRule || "split"}${overlayAnchor}.`;
+  const targetInstruction =
+    params.target === "background"
+      ? params.variationTemplate.backgroundLayoutInstruction
+      : params.variationTemplate.lockupLayoutInstruction;
+  return `${templateDefinitionLine} HARD TEMPLATE APPLICATION: ${targetInstruction}`;
+}
+
+function referenceFirstDefaultBiasGuardLine(directionSpec?: PlannedDirectionSpec | null): string {
+  return isReferenceFirstDirection(directionSpec)
+    ? "Do not use the default left-text/right-art layout unless the template says so."
+    : "";
+}
+
+function withVariationTemplateKey(
+  directionSpec: PlannedDirectionSpec | null | undefined,
+  variationTemplateKey: string | null
+): PlannedDirectionSpec | null {
+  if (!directionSpec) {
+    return null;
+  }
+  if (!variationTemplateKey) {
+    return {
+      ...directionSpec,
+      variationTemplateKey: undefined
+    };
+  }
+  return {
+    ...directionSpec,
+    variationTemplateKey
+  };
+}
+
+function buildBackgroundCandidateTemplateKeys(params: {
+  seed: string;
+  count: number;
+  directionSpec?: PlannedDirectionSpec | null;
+}): (string | null)[] {
+  const count = Math.max(1, params.count);
+  const baseKey =
+    typeof params.directionSpec?.variationTemplateKey === "string" && params.directionSpec.variationTemplateKey.trim()
+      ? params.directionSpec.variationTemplateKey.trim()
+      : null;
+  const isReferenceFirst = isReferenceFirstDirection(params.directionSpec);
+  if (!isReferenceFirst) {
+    return Array.from({ length: count }, () => baseKey);
+  }
+
+  const templates = listRound1VariationTemplates();
+  if (templates.length <= 0) {
+    return Array.from({ length: count }, () => baseKey);
+  }
+
+  const ordered = [...templates].sort((a, b) => {
+    const aHash = hashForDeterministicOrdering(params.seed, a.key);
+    const bHash = hashForDeterministicOrdering(params.seed, b.key);
+    return aHash.localeCompare(bHash);
+  });
+
+  const keys: string[] = [];
+  const used = new Set<string>();
+  if (baseKey && ordered.some((template) => template.key === baseKey)) {
+    keys.push(baseKey);
+    used.add(baseKey);
+  }
+
+  for (const template of ordered) {
+    if (keys.length >= count) {
+      break;
+    }
+    if (used.has(template.key)) {
+      continue;
+    }
+    keys.push(template.key);
+    used.add(template.key);
+  }
+
+  if (keys.length <= 0) {
+    keys.push(baseKey || ordered[0]?.key || "layout_text_left_art_right");
+  }
+
+  while (keys.length < count) {
+    keys.push(keys[keys.length % Math.max(1, keys.length)]);
+  }
+
+  return keys.slice(0, count);
 }
 
 function referencesSignalVintageDemand(references: ReferenceLibraryItem[]): boolean {
@@ -1867,19 +2424,21 @@ function buildLockupGenerationPrompt(params: {
   const subtitleLine = params.subtitle
     ? `Series subtitle (must be secondary): ${truncateForPrompt(params.subtitle, 140)}`
     : "Series subtitle: none (render only the title).";
+  const isReferenceFirst = Boolean(params.directionSpec?.referenceId);
   const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionLine = params.directionSpec
     ? `Direction context: ${params.directionSpec.styleFamily || "unassigned"} / ${params.directionSpec.laneFamily} / ${
         params.directionSpec.compositionType
       } / ${params.directionSpec.backgroundMode}.`
     : "";
-  const hardStyleConstraintLine = styleFamily
+  const hardStyleConstraintLine = styleFamily && !isReferenceFirst
     ? `HARD STYLE CONSTRAINT: Bucket = ${styleFamily.bucket}. Follow bucket rules strictly.`
     : "";
   const bucketRulesLine = styleFamily ? `Bucket rules: ${styleFamily.bucketRules}` : "";
-  const hardToneConstraintLine = styleFamily ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
+  const hardToneConstraintLine = styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
   const toneRulesLine = styleFamily ? `Tone rules: ${styleFamily.toneRules}` : "";
-  const hardMediumConstraintLine = styleFamily ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
+  const hardMediumConstraintLine =
+    styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
   const mediumRulesLine = styleFamily ? `Medium rules: ${styleFamily.mediumRules}` : "";
   const styleFamilyLockupRulesLine = styleFamily
     ? `Style family: ${styleFamily.name}. Follow these rules strongly: ${styleFamily.lockupRules.join(" ")}`
@@ -1901,8 +2460,26 @@ function buildLockupGenerationPrompt(params: {
       ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
       : null;
   const variationTemplateLine = variationTemplate
-    ? `Variation template (${variationTemplate.key}): ${variationTemplate.lockupLayoutInstruction}`
+    ? buildVariationTemplateHardInstruction({
+        variationTemplate,
+        target: "lockup"
+      })
     : "";
+  const titleIntegrationMode = resolveTitleIntegrationMode(params.directionSpec);
+  const titleIntegrationModeLine = titleIntegrationMode
+    ? `Title integration mode: ${titleIntegrationMode}.`
+    : "";
+  const titleIntegrationAuthorityLine = titleIntegrationMode
+    ? buildTitleIntegrationAuthorityInstruction({
+        mode: titleIntegrationMode,
+        target: "lockup",
+        variationTemplate
+      })
+    : "";
+  const titleIntegrationQualityLine = titleIntegrationMode
+    ? "Integration quality bar: title lockup must feel architected with the composition, never pasted as a detached sticker."
+    : "";
+  const defaultBiasGuardLine = referenceFirstDefaultBiasGuardLine(params.directionSpec);
   const referenceAnchorContextLine = params.directionSpec?.referenceId
     ? `Reference anchor: ${params.directionSpec.referenceId} (${params.directionSpec.referenceCluster || "other"}, ${
         params.directionSpec.referenceTier || "unknown"
@@ -1910,6 +2487,12 @@ function buildLockupGenerationPrompt(params: {
     : "";
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
+    : "";
+  const referenceAnchorPriorityLine = isReferenceFirst
+    ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
+    : "";
+  const referenceSecondaryGuardrailLine = isReferenceFirst
+    ? "Bucket/tone/medium are secondary guardrails; use them only if they do not contradict the reference."
     : "";
   const originalityRuleLine = params.directionSpec?.referenceId
     ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
@@ -1926,8 +2509,9 @@ function buildLockupGenerationPrompt(params: {
           params.directionSpec?.referenceMediumHint || "auto"
         }.`
       : "";
-  const styleAuthorityOverrideLine =
-    "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
+  const styleAuthorityOverrideLine = isReferenceFirst
+    ? ""
+    : "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const styleSpecificLine =
     params.styleMode === "engraved_stamp"
       ? "Style mode: engraved/stamped treatment. Mimic engraved, stamped, debossed, or etched print behavior with tactile ink-like edges. Use a one-ink print look at high opacity (85-100%). Do not use faint emboss/deboss effects where title/subtitle disappear."
@@ -1996,11 +2580,17 @@ function buildLockupGenerationPrompt(params: {
     styleAuthorityOverrideLine,
     referenceAnchorContextLine,
     referenceAnchorDirectiveLine,
+    referenceAnchorPriorityLine,
+    referenceSecondaryGuardrailLine,
     originalityRuleLine,
     motifRecompositionLine,
     referenceLockupLayoutFamilyLine,
     referenceToneMediumLine,
     variationTemplateLine,
+    titleIntegrationModeLine,
+    titleIntegrationAuthorityLine,
+    titleIntegrationQualityLine,
+    defaultBiasGuardLine,
     referenceLine,
     styleSpecificLine,
     archetypeLine,
@@ -2439,9 +3029,20 @@ async function renderValidatedLockupPng(params: {
 
 type FeedbackGenerationControls = {
   chosenGenerationId: string | null;
+  selectedOptionIndex?: number;
+  primaryDirectionMode?: "refinement_funnel" | "new_direction";
   regenerateLockup?: boolean;
   explicitNewTitleStyle?: boolean;
   regenerateBackground?: boolean;
+};
+
+type PrimaryDirectionContext = {
+  sourceRound: number;
+  selectedOptionIndex: number;
+  chosenGenerationId: string | null;
+  mode: "refinement_funnel" | "new_direction";
+  explicitDirectionChangeRequested: boolean;
+  directionSpec: PlannedDirectionSpec;
 };
 
 function readLockupLayoutFromInput(input: unknown): LockupLayoutArchetype | null {
@@ -2492,6 +3093,8 @@ function readFeedbackGenerationControls(input: unknown): FeedbackGenerationContr
 
   const typedFeedback = feedback as {
     chosenGenerationId?: unknown;
+    selectedOptionIndex?: unknown;
+    primaryDirectionMode?: unknown;
     regenerateLockup?: unknown;
     explicitNewTitleStyle?: unknown;
     regenerateBackground?: unknown;
@@ -2500,9 +3103,22 @@ function readFeedbackGenerationControls(input: unknown): FeedbackGenerationContr
     typeof typedFeedback.chosenGenerationId === "string" && typedFeedback.chosenGenerationId.trim()
       ? typedFeedback.chosenGenerationId.trim()
       : null;
+  const selectedOptionIndex =
+    typeof typedFeedback.selectedOptionIndex === "number" &&
+    Number.isInteger(typedFeedback.selectedOptionIndex) &&
+    typedFeedback.selectedOptionIndex >= 0 &&
+    typedFeedback.selectedOptionIndex < ROUND_OPTION_COUNT
+      ? typedFeedback.selectedOptionIndex
+      : undefined;
+  const primaryDirectionMode =
+    typedFeedback.primaryDirectionMode === "refinement_funnel" || typedFeedback.primaryDirectionMode === "new_direction"
+      ? typedFeedback.primaryDirectionMode
+      : undefined;
 
   return {
     chosenGenerationId,
+    selectedOptionIndex,
+    primaryDirectionMode,
     regenerateLockup: typeof typedFeedback.regenerateLockup === "boolean" ? typedFeedback.regenerateLockup : undefined,
     explicitNewTitleStyle:
       typeof typedFeedback.explicitNewTitleStyle === "boolean" ? typedFeedback.explicitNewTitleStyle : undefined,
@@ -3773,11 +4389,16 @@ type BackgroundRerankCandidateDebug = {
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
+  variationTemplateKey?: string | null;
   score: number;
+  layoutDiversityPenalty?: number;
+  frameScaffoldPenalty?: number;
   checks: {
     textFree: boolean;
     tonePass: boolean;
     designPresencePass: boolean;
+    meaningfulStructurePass: boolean;
+    frameScaffoldTriggered: boolean;
     hardFailBlankDesign: boolean;
   };
   stats: {
@@ -3803,6 +4424,17 @@ type BackgroundRerankCandidateDebug = {
       edgeDensityFull: number;
       luminanceStdFull: number;
       edgeDensityNonTitle: number;
+      luminanceStdNonTitle: number;
+      requiredNonTitleEdgeDensity: number;
+      requiredNonTitleLuminanceStd: number;
+      meaningfulStructureScore: number;
+      meaningfulStructureMinScore: number;
+      meaningfulStructurePass: boolean;
+      nonTitleLowDetail: boolean;
+      borderEdgeRatio: number;
+      borderLineEdgeDominance: number;
+      longStraightBorderLineCount: number;
+      mostEdgesAreLongStraightBorders: boolean;
       passes: boolean;
     } | null;
   };
@@ -3815,6 +4447,7 @@ type BackgroundRerankWinnerDebug = {
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
+  variationTemplateKey?: string | null;
   score: number;
 };
 
@@ -4005,6 +4638,7 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     referenceCluster: directionSpec?.referenceCluster || null,
     referenceTier: directionSpec?.referenceTier || null,
     variationTemplateKey: directionSpec?.variationTemplateKey || null,
+    titleIntegrationMode: directionSpec?.titleIntegrationMode || null,
     motifFocus: directionSpec?.motifFocus || [],
     bookKeys: params.motifBankContext?.bookKeys || [],
     bookNames: params.motifBankContext?.bookNames || [],
@@ -4141,7 +4775,8 @@ function buildGenerationInput(
   plannedStyleFamilies?: [StyleFamily, StyleFamily, StyleFamily],
   runSeed?: string,
   directionPlan?: PlannedDirectionSpec[],
-  lockupLayout?: LockupLayoutArchetype
+  lockupLayout?: LockupLayoutArchetype,
+  primaryDirection?: PrimaryDirectionContext | null
 ) {
   const palette = brandKit ? parsePaletteJson(brandKit.paletteJson) : [];
 
@@ -4177,6 +4812,7 @@ function buildGenerationInput(
     runSeed: runSeed || styleFamilySeed || randomUUID(),
     directionPlan: directionPlan || [],
     lockupLayout: lockupLayout || null,
+    primaryDirection: primaryDirection || null,
     designBrief
   };
 }
@@ -4248,6 +4884,7 @@ function readDirectionSpecFromInput(input: unknown, optionIndex: number): Planne
     laneFamily: laneFamilyCandidate,
     wantsSeriesMark: parsed.wantsSeriesMark === true,
     wantsTitleStage: parsed.wantsTitleStage === true,
+    titleIntegrationMode: isTitleIntegrationMode(parsed.titleIntegrationMode) ? parsed.titleIntegrationMode : undefined,
     styleFamily: isStyleFamilyKey(parsed.styleFamily) ? parsed.styleFamily : undefined,
     styleBucket: isStyleBucketKey(parsed.styleBucket)
       ? parsed.styleBucket
@@ -4270,6 +4907,133 @@ function readDirectionSpecFromInput(input: unknown, optionIndex: number): Planne
         ? parsed.motifScope
         : undefined
   };
+}
+
+function normalizeOptionIndex(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return null;
+  }
+  if (value < 0 || value >= ROUND_OPTION_COUNT) {
+    return null;
+  }
+  return value;
+}
+
+function readOptionIndexFromGenerationOutput(output: unknown): number | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+
+  const optionLane = (designSpec as { optionLane?: unknown }).optionLane;
+  if (typeof optionLane === "string") {
+    const normalizedLane = optionLane.trim().toUpperCase();
+    if (normalizedLane === "A") {
+      return 0;
+    }
+    if (normalizedLane === "B") {
+      return 1;
+    }
+    if (normalizedLane === "C") {
+      return 2;
+    }
+  }
+
+  const nestedDirectionSpec = (designSpec as { directionSpec?: unknown }).directionSpec;
+  if (nestedDirectionSpec && typeof nestedDirectionSpec === "object" && !Array.isArray(nestedDirectionSpec)) {
+    return normalizeOptionIndex((nestedDirectionSpec as { optionIndex?: unknown }).optionIndex);
+  }
+  return null;
+}
+
+function readDirectionSpecFromGenerationOutput(output: unknown, optionIndex: number): PlannedDirectionSpec | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return null;
+  }
+  const candidate = (designSpec as { directionSpec?: unknown }).directionSpec;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+
+  const parsed = candidate as Partial<PlannedDirectionSpec>;
+  const laneFamilyCandidate = isDirectionLaneFamily(parsed.laneFamily) ? parsed.laneFamily : null;
+  if (
+    typeof parsed.presetKey !== "string" ||
+    typeof parsed.lockupPresetId !== "string" ||
+    !laneFamilyCandidate ||
+    typeof parsed.compositionType !== "string" ||
+    typeof parsed.backgroundMode !== "string" ||
+    typeof parsed.typeProfile !== "string" ||
+    typeof parsed.ornamentProfile !== "string" ||
+    typeof parsed.templateStyleFamily !== "string" ||
+    typeof parsed.lanePrompt !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    ...(candidate as PlannedDirectionSpec),
+    optionIndex,
+    optionLabel: optionLane(optionIndex),
+    laneFamily: laneFamilyCandidate,
+    wantsSeriesMark: parsed.wantsSeriesMark === true,
+    wantsTitleStage: parsed.wantsTitleStage === true,
+    titleIntegrationMode: isTitleIntegrationMode(parsed.titleIntegrationMode) ? parsed.titleIntegrationMode : undefined,
+    styleFamily: isStyleFamilyKey(parsed.styleFamily) ? parsed.styleFamily : undefined,
+    styleBucket: isStyleBucketKey(parsed.styleBucket)
+      ? parsed.styleBucket
+      : isStyleFamilyKey(parsed.styleFamily)
+        ? STYLE_FAMILY_BANK[parsed.styleFamily].bucket
+        : undefined,
+    styleTone: isStyleToneKey(parsed.styleTone)
+      ? parsed.styleTone
+      : isStyleFamilyKey(parsed.styleFamily)
+        ? STYLE_FAMILY_BANK[parsed.styleFamily].tone
+        : undefined,
+    styleMedium: isStyleMediumKey(parsed.styleMedium)
+      ? parsed.styleMedium
+      : isStyleFamilyKey(parsed.styleFamily)
+        ? STYLE_FAMILY_BANK[parsed.styleFamily].medium
+        : undefined,
+    motifFocus: safeArrayOfStrings(parsed.motifFocus, []).slice(0, 2),
+    motifScope:
+      parsed.motifScope === "whole_book" || parsed.motifScope === "multi_passage" || parsed.motifScope === "specific_passage"
+        ? parsed.motifScope
+        : undefined
+  };
+}
+
+function isExplicitDirectionChangeRequest(params: {
+  styleDirection: StyleDirection;
+  feedbackText?: string | null;
+}): boolean {
+  if (params.styleDirection !== "SURPRISE") {
+    return true;
+  }
+  const feedback = (params.feedbackText || "").trim().toLowerCase();
+  if (!feedback) {
+    return false;
+  }
+  return (
+    /\b(change|switch|new|different)\s+(direction|style|look|approach)\b/.test(feedback) ||
+    /\bfresh\s+direction\b/.test(feedback) ||
+    /\bstart\s+over\b/.test(feedback)
+  );
 }
 
 function withResolvedLockupPaletteInput(
@@ -4349,7 +5113,7 @@ async function pickReferenceSetsForRound(
       })
     )
   );
-  if (!directionPlan || round !== 1) {
+  if (!directionPlan) {
     return fallbackSets;
   }
 
@@ -4730,6 +5494,7 @@ function buildTemplateBackgroundPrompt(params: {
   paletteComplianceBoost?: string;
   toneComplianceBoost?: string;
 }): string {
+  const isReferenceFirst = Boolean(params.directionSpec?.referenceId);
   const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionHint = params.directionSpec
     ? [
@@ -4742,13 +5507,14 @@ function buildTemplateBackgroundPrompt(params: {
         params.directionSpec.lanePrompt
       ].join(" ")
     : "";
-  const hardStyleConstraintLine = styleFamily
+  const hardStyleConstraintLine = styleFamily && !isReferenceFirst
     ? `HARD STYLE CONSTRAINT: Bucket = ${styleFamily.bucket}. Follow bucket rules strictly.`
     : "";
   const bucketRulesLine = styleFamily ? `Bucket rules: ${styleFamily.bucketRules}` : "";
-  const hardToneConstraintLine = styleFamily ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
+  const hardToneConstraintLine = styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
   const toneRulesLine = styleFamily ? `Tone rules: ${styleFamily.toneRules}` : "";
-  const hardMediumConstraintLine = styleFamily ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
+  const hardMediumConstraintLine =
+    styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
   const mediumRulesLine = styleFamily ? `Medium rules: ${styleFamily.mediumRules}` : "";
   const styleFamilyBackgroundRulesLine = styleFamily
     ? `Style family: ${styleFamily.name}. Follow these rules strongly: ${styleFamily.backgroundRules.join(
@@ -4760,8 +5526,26 @@ function buildTemplateBackgroundPrompt(params: {
       ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
       : null;
   const variationTemplateLine = variationTemplate
-    ? `Variation template (${variationTemplate.key}): ${variationTemplate.backgroundLayoutInstruction}`
+    ? buildVariationTemplateHardInstruction({
+        variationTemplate,
+        target: "background"
+      })
     : "";
+  const titleIntegrationMode = resolveTitleIntegrationMode(params.directionSpec);
+  const titleIntegrationModeLine = titleIntegrationMode
+    ? `Title integration mode: ${titleIntegrationMode}.`
+    : "";
+  const titleIntegrationAuthorityLine = titleIntegrationMode
+    ? buildTitleIntegrationAuthorityInstruction({
+        mode: titleIntegrationMode,
+        target: "background",
+        variationTemplate
+      })
+    : "";
+  const titleIntegrationQualityLine = titleIntegrationMode
+    ? "Integration quality bar: build the composition to host typography natively so title never looks pasted."
+    : "";
+  const defaultBiasGuardLine = referenceFirstDefaultBiasGuardLine(params.directionSpec);
   const referenceAnchorContextLine = params.directionSpec?.referenceId
     ? `Reference anchor: ${params.directionSpec.referenceId} (${params.directionSpec.referenceCluster || "other"}, ${
         params.directionSpec.referenceTier || "unknown"
@@ -4770,20 +5554,33 @@ function buildTemplateBackgroundPrompt(params: {
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
     : "";
+  const referenceAnchorPriorityLine = isReferenceFirst
+    ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
+    : "";
+  const referenceSecondaryGuardrailLine = isReferenceFirst
+    ? "Bucket/tone/medium are secondary guardrails; use them only if they do not contradict the reference."
+    : "";
   const originalityRuleLine = params.directionSpec?.referenceId
     ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
     : "";
   const motifRecompositionLine = params.directionSpec?.referenceId
     ? "Use the sermon motif/themes (from our motif system) to create a new focal element."
     : "";
-  const styleAuthorityOverrideLine =
-    "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
+  const styleAuthorityOverrideLine = isReferenceFirst
+    ? ""
+    : "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const backgroundTextFreeRuleLine =
-    "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos.";
+    titleIntegrationMode === "TYPE_AS_TEXTURE"
+      ? "BACKGROUND TEXT RULE: no readable words, no readable letters, no logos, no watermarks, no signage. Abstract non-readable letterform fragments are allowed only as subtle texture."
+      : "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos.";
   const ignoreTypographyRefLine =
-    "If style refs show typography, ignore it completely and output only the graphical background style.";
+    titleIntegrationMode === "TYPE_AS_TEXTURE"
+      ? "If style refs show typography, only borrow abstract texture rhythm; never reproduce readable words or signage."
+      : "If style refs show typography, ignore it completely and output only the graphical background style.";
   const explorationTextInvalidLine = params.explorationMode
-    ? "If ANY text appears, the result is invalid. Prioritize removing/avoiding text over all other style cues."
+    ? titleIntegrationMode === "TYPE_AS_TEXTURE"
+      ? "If any readable text appears, the result is invalid. Keep any letterform texture fragmentary, non-readable, and secondary."
+      : "If ANY text appears, the result is invalid. Prioritize removing/avoiding text over all other style cues."
     : "";
   const playfulBrandModeLine =
     params.brandMode === "brand" && styleFamily && PLAYFUL_STYLE_FAMILY_KEYS.has(styleFamily.key)
@@ -4802,6 +5599,16 @@ function buildTemplateBackgroundPrompt(params: {
   const motifFocus = safeArrayOfStrings(params.directionSpec?.motifFocus, []).slice(0, 2);
   const motifFocusLine =
     motifFocus.length > 0 ? `Primary motifs for this direction: ${motifFocus.join(", ")}. Incorporate these subtly.` : "";
+  const designCompletenessLine =
+    isReferenceFirst && params.explorationMode
+      ? [
+          "DESIGN COMPLETENESS: This must look like a finished sermon series graphic, not a wireframe or layout scaffold.",
+          motifFocus.length > 0
+            ? `Include a clear focal motif tied to motifFocus (${motifFocus.join(", ")}).`
+            : "Include a clear focal motif tied to motifFocus.",
+          "Do not output placeholder rectangles, empty frames, or generic borders."
+        ].join(" ")
+      : "";
   const motifScopeLine = params.directionSpec?.motifScope
     ? `Motif scope: ${params.directionSpec.motifScope}.`
     : "";
@@ -4827,7 +5634,8 @@ function buildTemplateBackgroundPrompt(params: {
       ? buildTitleStageInstructions({
           format: params.shape,
           placementHint: resolveSafeAreaAnchor(params.directionSpec),
-          mode: params.brandMode || "fresh"
+          mode: params.brandMode || "fresh",
+          directionSpec: params.directionSpec
         })
       : "";
 
@@ -4842,9 +5650,15 @@ function buildTemplateBackgroundPrompt(params: {
     styleFamilyBackgroundRulesLine,
     referenceAnchorContextLine,
     referenceAnchorDirectiveLine,
+    referenceAnchorPriorityLine,
+    referenceSecondaryGuardrailLine,
     originalityRuleLine,
     motifRecompositionLine,
     variationTemplateLine,
+    titleIntegrationModeLine,
+    titleIntegrationAuthorityLine,
+    titleIntegrationQualityLine,
+    defaultBiasGuardLine,
     styleAuthorityOverrideLine,
     backgroundTextFreeRuleLine,
     ignoreTypographyRefLine,
@@ -4858,10 +5672,15 @@ function buildTemplateBackgroundPrompt(params: {
     motifScopeLine,
     motifScopeRuleLine,
     motifFocusLine,
+    designCompletenessLine,
     allowedGenericLine,
     genericMotifBanLine,
     params.seriesPreferenceGuidance || "",
-    shapeCompositionHint(params.shape),
+    shapeCompositionHint({
+      shape: params.shape,
+      directionSpec: params.directionSpec,
+      variationTemplate
+    }),
     "Incorporate 1-2 motifs subtly and symbolically; avoid literal portraits or face-centric depictions.",
     buildLockupSafeAreaInstructions(params.directionSpec),
     titleStageInstructions,
@@ -4883,26 +5702,32 @@ async function generateCleanMinimalBackgroundPng(params: {
   prompt: string;
   shape: PreviewShape;
   referenceDataUrls: string[];
+  runImageGeneration?: ConcurrencyLimiter;
 }): Promise<Buffer> {
   const size = OPENAI_IMAGE_SIZE_BY_SHAPE[params.shape];
+  const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
 
   if (params.referenceDataUrls.length > 0) {
     try {
-      return await generatePngFromPrompt({
-        prompt: params.prompt,
-        size,
-        references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl }))
-      });
+      return await runImageGeneration(() =>
+        generatePngFromPrompt({
+          prompt: params.prompt,
+          size,
+          references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl }))
+        })
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
       console.warn(`Reference-guided generation failed for ${params.shape}; retrying prompt-only. ${message}`);
     }
   }
 
-  return generatePngFromPrompt({
-    prompt: params.prompt,
-    size
-  });
+  return runImageGeneration(() =>
+    generatePngFromPrompt({
+      prompt: params.prompt,
+      size
+    })
+  );
 }
 
 const NO_TEXT_RETRY_BOOSTS = [
@@ -4929,6 +5754,7 @@ async function generateValidatedBackgroundPng(params: {
   paletteComplianceBoost?: string;
   toneComplianceBoost?: string;
   textArtifactRetryBoost?: string;
+  runImageGeneration?: ConcurrencyLimiter;
 }): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number; textCheckPassed: boolean }> {
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
@@ -4956,7 +5782,8 @@ async function generateValidatedBackgroundPng(params: {
     const backgroundSource = await generateCleanMinimalBackgroundPng({
       prompt,
       shape: params.shape,
-      referenceDataUrls: params.referenceDataUrls
+      referenceDataUrls: params.referenceDataUrls,
+      runImageGeneration: params.runImageGeneration
     });
     const backgroundPng = await normalizePngToShape(backgroundSource, params.shape, params.focalPoint);
     const hasText = await imageHasReadableText(backgroundPng);
@@ -5151,6 +5978,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   motifBankContext?: MotifBankContext;
 }): Promise<void> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
+  const imageGenerationLimit = createConcurrencyLimiter(ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY);
+  const optionGenerationLimit = createConcurrencyLimiter(
+    Math.min(ROUND1_OPTION_PARALLEL_CONCURRENCY, Math.max(1, params.plannedGenerations.length))
+  );
   const [referenceIndex, curatedReferences] = await Promise.all([loadIndex(), getCuratedReferences()]);
   const referenceIndexById = new Map(referenceIndex.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
   const curatedReferenceById = new Map(curatedReferences.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
@@ -5200,8 +6031,31 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     });
     return cachedRecentStyleFamiliesForFallback;
   };
+  const round1SelectedVariationTemplateUsage = new Map<string, number>();
+  let round1SelectedDefaultBiasCount = 0;
+  const layoutDiversityPenaltyForTemplate = (round: number, templateKey: string | null): number => {
+    if (round !== 1 || !templateKey) {
+      return 0;
+    }
+    const repeatCount = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
+    let penalty = repeatCount * ROUND1_LAYOUT_TEMPLATE_REPEAT_PENALTY;
+    if (isRound1DefaultBiasTemplateKey(templateKey) && round1SelectedDefaultBiasCount > 0) {
+      penalty += round1SelectedDefaultBiasCount * ROUND1_LAYOUT_DEFAULT_BIAS_REPEAT_PENALTY;
+    }
+    return penalty;
+  };
+  const noteRound1SelectedTemplate = (round: number, templateKey: string | null) => {
+    if (round !== 1 || !templateKey) {
+      return;
+    }
+    const current = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
+    round1SelectedVariationTemplateUsage.set(templateKey, current + 1);
+    if (isRound1DefaultBiasTemplateKey(templateKey)) {
+      round1SelectedDefaultBiasCount += 1;
+    }
+  };
 
-  for (const plannedGeneration of params.plannedGenerations) {
+  await Promise.all(params.plannedGenerations.map((plannedGeneration) => optionGenerationLimit(async () => {
     let fallbackOutput = plannedGeneration.fallbackOutput;
 
     if (!openAiEnabled) {
@@ -5210,7 +6064,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         generationId: plannedGeneration.id,
         output: fallbackOutput
       });
-      continue;
+      return;
     }
 
     try {
@@ -5323,7 +6177,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       });
       const plannedLockupLayout = readLockupLayoutFromInput(plannedGeneration.input);
       const lockupLayout = plannedLockupLayout || defaultLockupLayoutForStyleMode(lockupStyleMode);
-      const lockupPrompt = buildLockupGenerationPrompt({
+      let lockupPrompt = buildLockupGenerationPrompt({
         title: content.title,
         subtitle: content.subtitle,
         styleMode: lockupStyleMode,
@@ -5401,7 +6255,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             lockupLayout
           });
       const typographicRecipe = lockupTypographicRecipeForArchetype(lockupLayout);
-      const titleSafeBox: TitleSafeBox = LOCKUP_SAFE_REGION_RATIOS[OPTION_MASTER_BACKGROUND_SHAPE];
+      const titleSafeBoxForDirection = (targetDirectionSpec?: PlannedDirectionSpec | null): TitleSafeBox =>
+        resolveTitleSafeBoxForDirection(OPTION_MASTER_BACKGROUND_SHAPE, targetDirectionSpec);
       let rerankMeta: RerankDebugMeta = {};
 
       const resolveToneTargetFromDirectionSpec = (targetDirectionSpec?: PlannedDirectionSpec | null) => {
@@ -5414,6 +6269,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         originalityBoost?: string;
         candidateSuffix?: string;
       } = {}) => {
+        const activeDirectionSpec =
+          attemptParams.directionSpecOverride === undefined ? backgroundDirectionSpec : attemptParams.directionSpecOverride;
         if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
           const backgroundPng = await normalizePngToShape(
             reusableAssets.masterBackgroundPng,
@@ -5432,12 +6289,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             toneCheck: null as ToneCheckSummary | null,
             textArtifactRetryCount: 0,
             backgroundTextCheck: null as BackgroundTextCheckSummary | null,
-            textCheckPassed: true
+            textCheckPassed: true,
+            variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
           };
         }
-
-        const activeDirectionSpec =
-          attemptParams.directionSpecOverride === undefined ? backgroundDirectionSpec : attemptParams.directionSpecOverride;
         const toneTargetForCompliance = shouldRunExplorationToneCheck
           ? resolveToneTargetFromDirectionSpec(activeDirectionSpec)
           : null;
@@ -5455,7 +6310,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           referenceDataUrls,
           focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
           originalityBoost: attemptParams.originalityBoost,
-          brandPaletteHardConstraint: brandPaletteHardConstraintPrompt
+          brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
+          runImageGeneration: imageGenerationLimit
         });
 
         let validatedBackground = initialBackground;
@@ -5508,7 +6364,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
                 originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
-                paletteComplianceBoost: BRAND_PALETTE_STRICT_RETRY_BOOST
+                paletteComplianceBoost: BRAND_PALETTE_STRICT_RETRY_BOOST,
+                runImageGeneration: imageGenerationLimit
               });
               paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
             }
@@ -5564,7 +6421,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
-                toneComplianceBoost: toneOverrideRetryBoost(toneTargetForCompliance)
+                toneComplianceBoost: toneOverrideRetryBoost(toneTargetForCompliance),
+                runImageGeneration: imageGenerationLimit
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -5622,7 +6480,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
                 toneComplianceBoost: toneTargetForCompliance ? toneOverrideRetryBoost(toneTargetForCompliance) : undefined,
-                textArtifactRetryBoost: TEXT_ARTIFACT_RETRY_OVERRIDE
+                textArtifactRetryBoost: TEXT_ARTIFACT_RETRY_OVERRIDE,
+                runImageGeneration: imageGenerationLimit
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -5665,7 +6524,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           toneCheck,
           textArtifactRetryCount,
           backgroundTextCheck,
-          textCheckPassed: validatedBackground.textCheckPassed
+          textCheckPassed: validatedBackground.textCheckPassed,
+          variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
         };
       };
 
@@ -5686,7 +6546,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             bestScore: Number.POSITIVE_INFINITY,
             laneFailed: false,
             candidates: [] as BackgroundRerankCandidateDebug[],
-            winner: null as BackgroundRerankWinnerDebug | null
+            winner: null as BackgroundRerankWinnerDebug | null,
+            winnerDirectionSpec:
+              params.directionSpecOverride === undefined ? backgroundDirectionSpec : (params.directionSpecOverride ?? null)
           };
         }
 
@@ -5695,75 +6557,96 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const candidateTag = params.originalityBoost ? `${params.stage}-orig` : `${params.stage}-base`;
         const toneTargetForCompliance = resolveToneTargetFromDirectionSpec(activeDirectionSpec);
         const styleFields = resolveDirectionStyleFields(activeDirectionSpec);
-        const candidates: Array<{
-          attempt: Awaited<ReturnType<typeof renderMasterAttempt>>;
-          score: number;
-          checks: {
-            textFree: boolean;
-            tonePass: boolean;
-            designPresencePass: boolean;
-            hardFailBlankDesign: boolean;
-          };
-          stats: {
-            tone: ImageToneStats | null;
-            titleSafe: TitleSafeRegionScore | null;
-            midtoneRange: MidtoneRangeScore | null;
-            hardFail: BackgroundHardFailStats | null;
-          };
-          debugUrl: string;
-        }> = [];
+        const candidateTemplateKeys = buildBackgroundCandidateTemplateKeys({
+          seed: `${runSeed}|${plannedGeneration.optionIndex}|${candidateTag}|attempt-${params.attemptNumber}`,
+          count: ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT,
+          directionSpec: activeDirectionSpec
+        });
+        const backgroundCandidateLimit = createConcurrencyLimiter(ROUND1_CANDIDATE_PARALLEL_CONCURRENCY);
+        const candidates = await Promise.all(
+          Array.from({ length: ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT }, (_, candidateIndex) =>
+            backgroundCandidateLimit(async () => {
+              const candidateVariationTemplateKey =
+                candidateTemplateKeys[candidateIndex] || activeDirectionSpec?.variationTemplateKey || null;
+              const candidateDirectionSpec = withVariationTemplateKey(activeDirectionSpec, candidateVariationTemplateKey);
+              const candidateTitleSafeBox = titleSafeBoxForDirection(candidateDirectionSpec);
+              const attempt = await renderMasterAttempt({
+                directionSpecOverride: candidateDirectionSpec,
+                originalityBoost: params.originalityBoost,
+                candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
+              });
+              const toneStats = attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(attempt.backgroundPng));
+              const tonePass = toneTargetForCompliance
+                ? toneStats
+                  ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
+                  : false
+                : true;
+              const textArtifactDetected = await detectTextArtifactsHeuristic(attempt.backgroundPng);
+              const textFree = attempt.textCheckPassed && !textArtifactDetected;
+              const designPresencePass = passesDesignPresence(toneStats);
+              const hardFail = await computeBackgroundHardFailStatsFromBuffer(
+                attempt.backgroundPng,
+                candidateTitleSafeBox,
+                candidateDirectionSpec?.referenceCluster || null
+              );
+              const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
+              const frameScaffoldTriggered =
+                hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
+              const frameScaffoldPenalty = frameScaffoldTriggered
+                ? ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY
+                : hardFail?.mostEdgesAreLongStraightBorders
+                  ? ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY
+                  : 0;
+              const hardFailBlankDesign = !hardFail || !hardFail.passes;
+              const titleSafe = await scoreTitleSafeRegion(pngBufferToDataUrl(attempt.backgroundPng), candidateTitleSafeBox);
+              const midtoneRange = await scoreMidtoneRangeFromBuffer(attempt.backgroundPng);
+              let score = 0;
+              score += tonePass ? 140 : -140;
+              score += textFree ? 140 : -140;
+              score += designPresencePass ? 90 : -90;
+              score += meaningfulStructurePass ? 70 : -140;
+              score += hardFailBlankDesign ? -240 : 120;
+              score += (titleSafe?.score || 0) * 30;
+              score += (midtoneRange?.score || 0) * 35;
+              score -= attempt.textRetryCount * 2;
+              score -= attempt.textArtifactRetryCount * 4;
+              score -= frameScaffoldPenalty;
+              const layoutDiversityPenalty = layoutDiversityPenaltyForTemplate(
+                plannedGeneration.round,
+                attempt.variationTemplateKey || candidateVariationTemplateKey
+              );
+              score -= layoutDiversityPenalty;
+              const debugUrl = await writeGenerationPreviewFiles({
+                fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}.png`,
+                png: attempt.backgroundPng
+              });
 
-        for (let candidateIndex = 0; candidateIndex < ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT; candidateIndex += 1) {
-          const attempt = await renderMasterAttempt({
-            directionSpecOverride: activeDirectionSpec,
-            originalityBoost: params.originalityBoost,
-            candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
-          });
-          const toneStats = attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(attempt.backgroundPng));
-          const tonePass = toneTargetForCompliance
-            ? toneStats
-              ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
-              : false
-            : true;
-          const textArtifactDetected = await detectTextArtifactsHeuristic(attempt.backgroundPng);
-          const textFree = attempt.textCheckPassed && !textArtifactDetected;
-          const designPresencePass = passesDesignPresence(toneStats);
-          const hardFail = await computeBackgroundHardFailStatsFromBuffer(attempt.backgroundPng, titleSafeBox);
-          const hardFailBlankDesign = !hardFail || !hardFail.passes;
-          const titleSafe = await scoreTitleSafeRegion(pngBufferToDataUrl(attempt.backgroundPng), titleSafeBox);
-          const midtoneRange = await scoreMidtoneRangeFromBuffer(attempt.backgroundPng);
-          let score = 0;
-          score += tonePass ? 140 : -140;
-          score += textFree ? 140 : -140;
-          score += designPresencePass ? 90 : -90;
-          score += hardFailBlankDesign ? -240 : 120;
-          score += (titleSafe?.score || 0) * 30;
-          score += (midtoneRange?.score || 0) * 35;
-          score -= attempt.textRetryCount * 2;
-          score -= attempt.textArtifactRetryCount * 4;
-          const debugUrl = await writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}.png`,
-            png: attempt.backgroundPng
-          });
-
-          candidates.push({
-            attempt,
-            score,
-            checks: {
-              textFree,
-              tonePass,
-              designPresencePass,
-              hardFailBlankDesign
-            },
-            stats: {
-              tone: toneStats,
-              titleSafe,
-              midtoneRange,
-              hardFail
-            },
-            debugUrl
-          });
-        }
+              return {
+                attempt,
+                directionSpecUsed: candidateDirectionSpec,
+                variationTemplateKey: attempt.variationTemplateKey || candidateVariationTemplateKey,
+                layoutDiversityPenalty,
+                frameScaffoldPenalty,
+                score,
+                checks: {
+                  textFree,
+                  tonePass,
+                  designPresencePass,
+                  meaningfulStructurePass,
+                  frameScaffoldTriggered,
+                  hardFailBlankDesign
+                },
+                stats: {
+                  tone: toneStats,
+                  titleSafe,
+                  midtoneRange,
+                  hardFail
+                },
+                debugUrl
+              };
+            })
+          )
+        );
 
         const eligible = candidates
           .map((candidate, index) => ({ candidate, index }))
@@ -5772,6 +6655,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               entry.candidate.checks.textFree &&
               entry.candidate.checks.tonePass &&
               entry.candidate.checks.designPresencePass &&
+              entry.candidate.checks.meaningfulStructurePass &&
               !entry.candidate.checks.hardFailBlankDesign
           );
         const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
@@ -5790,7 +6674,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             attempt: params.attemptNumber,
             styleFamily: styleFields.styleFamily,
             explorationSetKey: styleFields.explorationSetKey,
+            variationTemplateKey: candidate.variationTemplateKey,
             score: candidate.score,
+            layoutDiversityPenalty: candidate.layoutDiversityPenalty,
+            frameScaffoldPenalty: candidate.frameScaffoldPenalty,
             checks: candidate.checks,
             stats: {
               textRetryCount: candidate.attempt.textRetryCount,
@@ -5809,8 +6696,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             attempt: params.attemptNumber,
             styleFamily: styleFields.styleFamily,
             explorationSetKey: styleFields.explorationSetKey,
+            variationTemplateKey: winner.candidate.variationTemplateKey,
             score: winner.candidate.score
-          }
+          },
+          winnerDirectionSpec: winner.candidate.directionSpecUsed
         };
       };
 
@@ -5819,7 +6708,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           return {
             attempt: await renderMasterAttempt({ originalityBoost }),
             winnerIndex: 0,
-            laneFailed: false
+            laneFailed: false,
+            winnerDirectionSpec: backgroundDirectionSpec
           };
         }
 
@@ -5852,6 +6742,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           originalityBoost
         });
         appendAttempt(selection);
+        activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
 
         const laneFamily = directionSpec?.laneFamily;
         const laneTone = initialDirectionStyleFields.styleTone;
@@ -5895,6 +6786,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               originalityBoost
             });
             appendAttempt(selection);
+            activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
           }
         }
 
@@ -5937,10 +6829,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               originalityBoost
             });
             appendAttempt(selection);
+            activeDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
           }
         }
 
-        backgroundDirectionSpec = activeDirectionSpec;
+        backgroundDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
         if (!shouldReuseBackground) {
           const finalStyleFields = resolveDirectionStyleFields(backgroundDirectionSpec);
           effectiveDirectionStyleFamily = finalStyleFields.styleFamily;
@@ -5961,7 +6854,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         return {
           attempt: selection.attempt,
           winnerIndex: selection.winnerIndex,
-          laneFailed: selection.laneFailed
+          laneFailed: selection.laneFailed,
+          winnerDirectionSpec: selection.winnerDirectionSpec || activeDirectionSpec
         };
       };
 
@@ -5975,6 +6869,22 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         );
         masterAttempt = originalityMasterSelection.attempt;
       }
+      const selectedVariationTemplateKey =
+        backgroundDirectionSpec?.variationTemplateKey || directionSpec?.variationTemplateKey || null;
+      noteRound1SelectedTemplate(plannedGeneration.round, selectedVariationTemplateKey);
+      lockupPrompt = buildLockupGenerationPrompt({
+        title: content.title,
+        subtitle: content.subtitle,
+        styleMode: lockupStyleMode,
+        lockupLayout,
+        directionSpec: backgroundDirectionSpec || directionSpec,
+        references,
+        bibleCreativeBrief,
+        wantsSeriesMark: (backgroundDirectionSpec || directionSpec)?.wantsSeriesMark || false,
+        brandMode: params.project.brandMode,
+        typographyDirection: organizationTypographyDirection,
+        optionalMarkAccentHexes: palette
+      });
       const masterLayout = computeCleanMinimalLayout({
         width: masterDimensions.width,
         height: masterDimensions.height,
@@ -6028,55 +6938,49 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         : shouldRunExplorationToneCheck
           ? await (async () => {
-              const candidates: Array<{
-                computation: Awaited<ReturnType<typeof renderLockupAttempt>>;
-                score: number;
-                checks: {
-                  textIntegrity: boolean;
-                  fitPass: boolean;
-                  insideTitleSafeWithMargin: boolean;
-                  notTooSmall: boolean;
-                };
-                fit: LockupFitCheck;
-                debugUrl: string;
-              }> = [];
+              const lockupCandidateLimit = createConcurrencyLimiter(ROUND1_CANDIDATE_PARALLEL_CONCURRENCY);
+              const candidates = await Promise.all(
+                Array.from({ length: ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT }, (_, candidateIndex) =>
+                  lockupCandidateLimit(async () => {
+                    const computation = await renderLockupAttempt(`${fontSeedBase}|lockup-candidate-${candidateIndex}`);
+                    const validation = computation.textValidation;
+                    const textIntegrity =
+                      validation.valid && validation.unexpected.length === 0 && validation.missing.length === 0;
+                    const fit = evaluateLockupFit({
+                      lockupWidth: computation.renderResult.width,
+                      lockupHeight: computation.renderResult.height,
+                      shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                      canvasWidth: masterDimensions.width,
+                      canvasHeight: masterDimensions.height,
+                      marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
+                      titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
+                    });
+                    let score = 0;
+                    score += textIntegrity ? 130 : -130;
+                    score += fit.fitPass ? 95 : -95;
+                    score += fit.notTooSmall ? 26 : -26;
+                    score += fit.score * 28;
+                    score -= computation.textOverrideRetried ? 4 : 0;
+                    const debugUrl = await writeGenerationPreviewFiles({
+                      fileName: `${plannedGeneration.id}-lockup-candidate-${candidateIndex}.png`,
+                      png: computation.renderResult.png
+                    });
 
-              for (let candidateIndex = 0; candidateIndex < ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT; candidateIndex += 1) {
-                const computation = await renderLockupAttempt(`${fontSeedBase}|lockup-candidate-${candidateIndex}`);
-                const validation = computation.textValidation;
-                const textIntegrity = validation.valid && validation.unexpected.length === 0 && validation.missing.length === 0;
-                const fit = evaluateLockupFit({
-                  lockupWidth: computation.renderResult.width,
-                  lockupHeight: computation.renderResult.height,
-                  shape: OPTION_MASTER_BACKGROUND_SHAPE,
-                  canvasWidth: masterDimensions.width,
-                  canvasHeight: masterDimensions.height,
-                  marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO
-                });
-                let score = 0;
-                score += textIntegrity ? 130 : -130;
-                score += fit.fitPass ? 95 : -95;
-                score += fit.notTooSmall ? 26 : -26;
-                score += fit.score * 28;
-                score -= computation.textOverrideRetried ? 4 : 0;
-                const debugUrl = await writeGenerationPreviewFiles({
-                  fileName: `${plannedGeneration.id}-lockup-candidate-${candidateIndex}.png`,
-                  png: computation.renderResult.png
-                });
-
-                candidates.push({
-                  computation,
-                  score,
-                  checks: {
-                    textIntegrity,
-                    fitPass: fit.fitPass,
-                    insideTitleSafeWithMargin: fit.insideTitleSafeWithMargin,
-                    notTooSmall: fit.notTooSmall
-                  },
-                  fit,
-                  debugUrl
-                });
-              }
+                    return {
+                      computation,
+                      score,
+                      checks: {
+                        textIntegrity,
+                        fitPass: fit.fitPass,
+                        insideTitleSafeWithMargin: fit.insideTitleSafeWithMargin,
+                        notTooSmall: fit.notTooSmall
+                      },
+                      fit,
+                      debugUrl
+                    };
+                  })
+                )
+              );
 
               const eligible = candidates
                 .map((candidate, index) => ({ candidate, index }))
@@ -6147,14 +7051,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             resolvedPalette: resolvedLockupPalette
           });
           const titleBlock = layout.blocks.find((block) => block.key === "title");
+          const shapeSafeBox = resolveTitleSafeBoxForDirection(shape, backgroundDirectionSpec);
+          const selectedVariationTemplate = resolveVariationTemplateFromDirectionSpec(backgroundDirectionSpec);
+          const templateAlign =
+            !selectedVariationTemplate
+              ? null
+              : selectedVariationTemplate.typeRegion === "right"
+                ? "right"
+                : selectedVariationTemplate.typeRegion === "center" || selectedVariationTemplate.overlayAnchor === "center"
+                  ? "center"
+                  : "left";
           const finalPng = await composeLockupOnBackground({
             backgroundPng,
             lockupPng: lockupPngForComposite,
             shape,
             width: dimensions.width,
             height: dimensions.height,
-            align: titleBlock?.align || "left",
-            integrationMode: lockupIntegrationMode
+            align: templateAlign || titleBlock?.align || "left",
+            integrationMode: lockupIntegrationMode,
+            safeRegionOverride: shapeSafeBox
           });
           const backgroundPath = await writeGenerationPreviewFiles({
             fileName: `${plannedGeneration.id}-${shape}-bg.png`,
@@ -6176,16 +7091,17 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           };
         })
       );
+      const finalDirectionSpec = backgroundDirectionSpec || directionSpec;
 
       const promptUsed = [
         `master(${OPTION_MASTER_BACKGROUND_SHAPE}): ${masterAttempt.prompt}`,
-        directionSpec
-          ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily || "unassigned"} / ${directionSpec.laneFamily} / ${directionSpec.compositionType}]`
+        finalDirectionSpec
+          ? `[direction: ${finalDirectionSpec.optionLabel} ${finalDirectionSpec.styleFamily || "unassigned"} / ${finalDirectionSpec.laneFamily} / ${finalDirectionSpec.compositionType}]`
           : "",
-        directionSpec?.referenceId
-          ? `[reference-anchor: ${directionSpec.referenceId}${resolvedReferenceCluster ? `/${resolvedReferenceCluster}` : ""}]`
+        finalDirectionSpec?.referenceId
+          ? `[reference-anchor: ${finalDirectionSpec.referenceId}${resolvedReferenceCluster ? `/${resolvedReferenceCluster}` : ""}]`
           : "",
-        directionSpec?.variationTemplateKey ? `[variation-template: ${directionSpec.variationTemplateKey}]` : "",
+        selectedVariationTemplateKey ? `[variation-template: ${selectedVariationTemplateKey}]` : "",
         effectiveDirectionStyleFamily ? `[style-family: ${effectiveDirectionStyleFamily}]` : "",
         effectiveDirectionStyleBucket ? `[style-bucket: ${effectiveDirectionStyleBucket}]` : "",
         effectiveDirectionStyleTone ? `[style-tone: ${effectiveDirectionStyleTone}]` : "",
@@ -6195,10 +7111,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         `[lockup-style-mode: ${lockupStyleMode}]`,
         `[lockup-layout: ${lockupLayout}]`,
         `[lockup-integration: ${lockupIntegrationMode}]`,
-        directionSpec?.wantsSeriesMark ? "[series-mark: requested]" : "[series-mark: not-requested]",
-        directionSpec?.wantsTitleStage ? "[title-stage: requested]" : "[title-stage: not-requested]",
-        directionSpec?.motifFocus && directionSpec.motifFocus.length > 0
-          ? `[motif-focus: ${directionSpec.motifFocus.join(" + ")}]`
+        finalDirectionSpec?.titleIntegrationMode ? `[title-integration-mode: ${finalDirectionSpec.titleIntegrationMode}]` : "",
+        finalDirectionSpec?.wantsSeriesMark ? "[series-mark: requested]" : "[series-mark: not-requested]",
+        finalDirectionSpec?.wantsTitleStage ? "[title-stage: requested]" : "[title-stage: not-requested]",
+        finalDirectionSpec?.motifFocus && finalDirectionSpec.motifFocus.length > 0
+          ? `[motif-focus: ${finalDirectionSpec.motifFocus.join(" + ")}]`
           : "",
         `[lockup-typography-recipe: ${typographicRecipe.id}]`,
         `[lockup-prompt: ${effectiveLockupPrompt}]`,
@@ -6325,7 +7242,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             optionLane: optionLane(plannedGeneration.optionIndex),
             masterBackgroundShape: OPTION_MASTER_BACKGROUND_SHAPE,
             palette,
-            directionSpec,
+            directionSpec: backgroundDirectionSpec || directionSpec,
             templateStyleFamily: optionStyleFamily,
             styleFamilies: designBrief.styleFamilies,
             styleFamily: effectiveDirectionStyleFamily || null,
@@ -6333,16 +7250,17 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             styleTone: effectiveDirectionStyleTone || null,
             styleMedium: effectiveDirectionStyleMedium || null,
             referenceIds: usedReferenceIds,
-            referenceId: directionSpec?.referenceId || references[0]?.id || null,
+            referenceId: backgroundDirectionSpec?.referenceId || directionSpec?.referenceId || references[0]?.id || null,
             referenceCluster: resolvedReferenceCluster,
             referenceTier: resolvedReferenceTier,
-            variationTemplateKey: directionSpec?.variationTemplateKey || null,
-            motifScope: directionSpec?.motifScope || motifBankContext.scriptureScope,
+            variationTemplateKey: selectedVariationTemplateKey,
+            titleIntegrationMode: (backgroundDirectionSpec || directionSpec)?.titleIntegrationMode || null,
+            motifScope: backgroundDirectionSpec?.motifScope || directionSpec?.motifScope || motifBankContext.scriptureScope,
             lockupPresetId,
             lockupLayout,
-            wantsTitleStage: directionSpec?.wantsTitleStage === true,
-            wantsSeriesMark: directionSpec?.wantsSeriesMark === true,
-            motifFocus: directionSpec?.motifFocus || [],
+            wantsTitleStage: (backgroundDirectionSpec || directionSpec)?.wantsTitleStage === true,
+            wantsSeriesMark: (backgroundDirectionSpec || directionSpec)?.wantsSeriesMark === true,
+            motifFocus: (backgroundDirectionSpec || directionSpec)?.motifFocus || [],
             bookKeys: motifBankContext.bookKeys,
             bookNames: motifBankContext.bookNames,
             topicKeys: motifBankContext.topicKeys,
@@ -6417,7 +7335,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         output: fallbackOutput
       });
     }
-  }
+  })));
 }
 
 export async function createProjectAction(
@@ -6828,6 +7746,7 @@ export async function generateRoundTwoAction(
         },
         select: {
           id: true,
+          round: true,
           input: true,
           output: true
         }
@@ -6838,10 +7757,45 @@ export async function generateRoundTwoAction(
     return { error: "Selected direction was not found for this project." };
   }
 
+  if (chosenGeneration && chosenGeneration.round !== parsed.data.currentRound) {
+    return { error: "Selected direction must come from the current round." };
+  }
+
+  let selectedOptionIndex: number | null = null;
+  if (chosenGeneration) {
+    const roundGenerations = await prisma.generation.findMany({
+      where: {
+        projectId: project.id,
+        round: chosenGeneration.round
+      },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: {
+        id: true
+      }
+    });
+    const indexFromRoundOrder = roundGenerations.findIndex((generation) => generation.id === chosenGeneration.id);
+    selectedOptionIndex = indexFromRoundOrder >= 0 ? indexFromRoundOrder : readOptionIndexFromGenerationOutput(chosenGeneration.output);
+  }
+
+  const fallbackOptionIndex = selectedOptionIndex ?? 0;
+  const primaryDirectionSpec = chosenGeneration
+    ? readDirectionSpecFromInput(chosenGeneration.input, fallbackOptionIndex) ||
+      readDirectionSpecFromGenerationOutput(chosenGeneration.output, fallbackOptionIndex)
+    : null;
+
   const styleDirection = normalizeStyleDirection(parsed.data.styleDirection);
+  const explicitDirectionChangeRequested = isExplicitDirectionChangeRequest({
+    styleDirection,
+    feedbackText: parsed.data.feedbackText
+  });
   const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
   const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
   const round = parsed.data.currentRound + 1;
+  const useRoundTwoRefinementFunnel =
+    round === 2 &&
+    !explicitDirectionChangeRequested &&
+    selectedOptionIndex !== null &&
+    Boolean(primaryDirectionSpec && chosenGenerationId);
   const runSeed = randomUUID();
   const chosenInputSeriesNotes = chosenGeneration ? readSeriesPreferencesDesignNotesFromInput(chosenGeneration.input) : null;
   const seriesMarkRequested = shouldRequestSeriesMarkFromNotes([project.designNotes, chosenInputSeriesNotes]);
@@ -6884,37 +7838,56 @@ export async function generateRoundTwoAction(
     designNotes: project.designNotes || chosenInputSeriesNotes || null,
     motifBankContext
   });
-  const directionPlan = planDirectionSet({
-    runSeed,
-    projectId: project.id,
-    round,
-    explorationSetSeed: `${project.id}|round-${round}|${runSeed}`,
-    enabledPresetKeys: enabledPresets.map((preset) => preset.key),
-    optionCount: ROUND_OPTION_COUNT,
-    preferredFamilies: preferredDirectionFamiliesForStyleDirection(styleDirection),
-    seriesMarkRequested,
-    wantsSeriesMarkLane: seriesMarkRequested,
-    motifs: bibleCreativeBrief.motifs,
-    allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
-    markIdeas: bibleCreativeBrief.markIdeas,
-    recentMotifs,
-    recentStyleFamilies,
-    recentStyleBuckets,
-    recentExplorationSetKeys,
-    recentRecipeIds,
-    explorationMode,
-    brandMode: project.brandMode,
-    seriesTitle: project.series_title,
-    seriesSubtitle: project.series_subtitle,
-    seriesDescription: project.series_description,
-    designNotes: project.designNotes || chosenInputSeriesNotes || null,
-    topicNames: motifBankContext.topicNames,
-    motifScope: motifBankContext.scriptureScope,
-    primaryThemes: motifBankContext.primaryThemeCandidates,
-    secondaryThemes: motifBankContext.secondaryThemeCandidates,
-    sceneMotifs: motifBankContext.sceneMotifCandidates,
-    sceneMotifRequested: motifBankContext.sceneMotifRequested
-  });
+  const primaryDirectionContext: PrimaryDirectionContext | null =
+    primaryDirectionSpec && selectedOptionIndex !== null
+      ? {
+          sourceRound: parsed.data.currentRound,
+          selectedOptionIndex,
+          chosenGenerationId,
+          mode: useRoundTwoRefinementFunnel ? "refinement_funnel" : "new_direction",
+          explicitDirectionChangeRequested,
+          directionSpec: primaryDirectionSpec
+        }
+      : null;
+  const directionPlan =
+    useRoundTwoRefinementFunnel && primaryDirectionSpec
+      ? planRoundTwoRefinementSet({
+          runSeed,
+          primaryDirection: primaryDirectionSpec,
+          motifPool: [...bibleCreativeBrief.motifs, ...bibleCreativeBrief.markIdeas, ...bibleCreativeBrief.allowedGenericMotifs],
+          optionCount: ROUND_OPTION_COUNT
+        })
+      : planDirectionSet({
+          runSeed,
+          projectId: project.id,
+          round,
+          explorationSetSeed: `${project.id}|round-${round}|${runSeed}`,
+          enabledPresetKeys: enabledPresets.map((preset) => preset.key),
+          optionCount: ROUND_OPTION_COUNT,
+          preferredFamilies: preferredDirectionFamiliesForStyleDirection(styleDirection),
+          seriesMarkRequested,
+          wantsSeriesMarkLane: seriesMarkRequested,
+          motifs: bibleCreativeBrief.motifs,
+          allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
+          markIdeas: bibleCreativeBrief.markIdeas,
+          recentMotifs,
+          recentStyleFamilies,
+          recentStyleBuckets,
+          recentExplorationSetKeys,
+          recentRecipeIds,
+          explorationMode,
+          brandMode: project.brandMode,
+          seriesTitle: project.series_title,
+          seriesSubtitle: project.series_subtitle,
+          seriesDescription: project.series_description,
+          designNotes: project.designNotes || chosenInputSeriesNotes || null,
+          topicNames: motifBankContext.topicNames,
+          motifScope: motifBankContext.scriptureScope,
+          primaryThemes: motifBankContext.primaryThemeCandidates,
+          secondaryThemes: motifBankContext.secondaryThemeCandidates,
+          sceneMotifs: motifBankContext.sceneMotifCandidates,
+          sceneMotifRequested: motifBankContext.sceneMotifRequested
+        });
   const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
   const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
   const plannedStyleFamilies = directionPlan.map((spec) => spec.templateStyleFamily) as [StyleFamily, StyleFamily, StyleFamily];
@@ -6923,7 +7896,7 @@ export async function generateRoundTwoAction(
     return { error: "At least three presets are required to generate options." };
   }
 
-  const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT);
+  const refsForOptions = await pickReferenceSetsForRound(project.id, round, ROUND_OPTION_COUNT, directionPlan);
   const chosenLockupLayout = chosenGeneration ? readLockupLayoutFromGenerationPayload(chosenGeneration.input, chosenGeneration.output) : null;
   const shouldRequestNewLockupLayout =
     parsed.data.regenerateLockup === true && parsed.data.explicitNewTitleStyle === true;
@@ -6954,11 +7927,14 @@ export async function generateRoundTwoAction(
       plannedStyleFamilies,
       runSeed,
       directionPlan,
-      lockupLayoutsForOptions[index]
+      lockupLayoutsForOptions[index],
+      primaryDirectionContext
     ),
     feedback: {
       sourceRound: parsed.data.currentRound,
       chosenGenerationId,
+      selectedOptionIndex: primaryDirectionContext?.selectedOptionIndex,
+      primaryDirectionMode: primaryDirectionContext?.mode,
       request: parsed.data.feedbackText || "",
       emphasis: parsed.data.emphasis,
       expressiveness: parsed.data.expressiveness,

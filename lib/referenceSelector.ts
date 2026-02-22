@@ -15,10 +15,21 @@ const GLOBAL_SOFT_AVOID_WINDOW = 30;
 const REFERENCE_ID_PATTERN = /^ref_\d{4}$/i;
 const REFERENCE_ID_IN_PATH_PATTERN = /\bref_\d{4}\b/gi;
 
+type LayoutRegion = "left" | "right" | "center" | "top" | "bottom";
+type VariationTemplateOverlapRule = "type_over_art" | "separated";
+type VariationTemplateAsymmetryRule = "diagonal" | "split" | "corner_badge" | "full_bleed";
+type VariationTemplateOverlayAnchor = "top-left" | "center" | "bottom-left";
+
 export type Round1VariationTemplate = {
   key: string;
   backgroundLayoutInstruction: string;
   lockupLayoutInstruction: string;
+  primaryFocalRegion?: LayoutRegion;
+  typeRegion?: LayoutRegion;
+  overlapRule?: VariationTemplateOverlapRule;
+  asymmetryRule?: VariationTemplateAsymmetryRule;
+  overlayAnchor?: VariationTemplateOverlayAnchor;
+  matchesDefaultBias?: boolean;
 };
 
 export type Round1ClusterProfile = {
@@ -32,6 +43,136 @@ export type Round1ClusterProfile = {
 };
 
 type ClusterProfileMap = Record<ReferenceCluster, Round1ClusterProfile>;
+
+const ROUND1_COMPOSITION_TEMPLATES: readonly Round1VariationTemplate[] = [
+  {
+    key: "layout_text_left_art_right",
+    primaryFocalRegion: "right",
+    typeRegion: "left",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: true,
+    backgroundLayoutInstruction:
+      "Template mandate: type on left, art on right. Keep left type lane clean and concentrate focal detail on right mass.",
+    lockupLayoutInstruction:
+      "Place lockup in left lane with strong hierarchy; keep typography separate from art mass."
+  },
+  {
+    key: "layout_text_right_art_left",
+    primaryFocalRegion: "left",
+    typeRegion: "right",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: type on right, art on left. Keep right type lane calm and push focal detail into left side mass.",
+    lockupLayoutInstruction:
+      "Place lockup in right lane and keep it spatially separated from left-side focal art."
+  },
+  {
+    key: "layout_centered_type_centered_motif",
+    primaryFocalRegion: "center",
+    typeRegion: "center",
+    overlapRule: "separated",
+    asymmetryRule: "corner_badge",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: centered type and centered motif with controlled breathing room and radial balance.",
+    lockupLayoutInstruction:
+      "Use centered lockup hierarchy aligned to central axis; keep supporting ornament restrained."
+  },
+  {
+    key: "layout_type_top_art_bottom",
+    primaryFocalRegion: "bottom",
+    typeRegion: "top",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: keep type stage in top band and place heavier art activity in bottom band.",
+    lockupLayoutInstruction:
+      "Anchor lockup in upper band with clear top-weighted hierarchy and no lower-band intrusion."
+  },
+  {
+    key: "layout_type_bottom_art_top",
+    primaryFocalRegion: "top",
+    typeRegion: "bottom",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: keep type stage in bottom band and place focal art in upper band.",
+    lockupLayoutInstruction:
+      "Anchor lockup in lower band with strong baseline stability and clean separation from top art."
+  },
+  {
+    key: "layout_full_bleed_overlay_top_left",
+    primaryFocalRegion: "center",
+    typeRegion: "left",
+    overlapRule: "type_over_art",
+    asymmetryRule: "full_bleed",
+    overlayAnchor: "top-left",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: full-bleed art across frame with controlled low-noise overlay zone at top-left for type.",
+    lockupLayoutInstruction:
+      "Overlay lockup at top-left over full-bleed art; preserve local contrast under text."
+  },
+  {
+    key: "layout_full_bleed_overlay_center",
+    primaryFocalRegion: "center",
+    typeRegion: "center",
+    overlapRule: "type_over_art",
+    asymmetryRule: "full_bleed",
+    overlayAnchor: "center",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: full-bleed art with centered overlay stage carved by tonal quieting, not by boxes.",
+    lockupLayoutInstruction:
+      "Overlay lockup in center over art with disciplined contrast control and centered rhythm."
+  },
+  {
+    key: "layout_full_bleed_overlay_bottom_left",
+    primaryFocalRegion: "center",
+    typeRegion: "bottom",
+    overlapRule: "type_over_art",
+    asymmetryRule: "full_bleed",
+    overlayAnchor: "bottom-left",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: full-bleed art with bottom-left overlay stage kept readable via local tonal restraint.",
+    lockupLayoutInstruction:
+      "Overlay lockup at bottom-left over full-bleed art with high contrast and stable baseline."
+  },
+  {
+    key: "layout_split_vertical_halves",
+    primaryFocalRegion: "right",
+    typeRegion: "left",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: explicit vertical half-split with one half as type field and opposite half as art field.",
+    lockupLayoutInstruction:
+      "Keep lockup constrained to one vertical half and maintain hard separation from opposite art half."
+  },
+  {
+    key: "layout_split_horizontal_bands",
+    primaryFocalRegion: "bottom",
+    typeRegion: "top",
+    overlapRule: "separated",
+    asymmetryRule: "split",
+    matchesDefaultBias: false,
+    backgroundLayoutInstruction:
+      "Template mandate: explicit horizontal band split with one band for type and one for focal art.",
+    lockupLayoutInstruction:
+      "Keep lockup constrained to one horizontal band with clear cross-band hierarchy."
+  }
+] as const;
+
+const ROUND1_COMPOSITION_TEMPLATE_BY_KEY = new Map(
+  ROUND1_COMPOSITION_TEMPLATES.map((template) => [template.key, template] as const)
+);
 
 const ROUND1_CLUSTER_PROFILES: ClusterProfileMap = {
   minimal: {
@@ -525,12 +666,32 @@ export function getRound1ClusterProfile(cluster: ReferenceCluster): Round1Cluste
   return ROUND1_CLUSTER_PROFILES[cluster] || ROUND1_CLUSTER_PROFILES.other;
 }
 
+export function listRound1VariationTemplates(): readonly Round1VariationTemplate[] {
+  return ROUND1_COMPOSITION_TEMPLATES;
+}
+
+export function isRound1DefaultBiasTemplateKey(key: string | null | undefined): boolean {
+  if (typeof key !== "string") {
+    return false;
+  }
+  const template = ROUND1_COMPOSITION_TEMPLATE_BY_KEY.get(key.trim());
+  return template?.matchesDefaultBias === true;
+}
+
 export function getRound1VariationTemplateByKey(
   key: string
 ): (Round1VariationTemplate & { cluster: ReferenceCluster }) | null {
   const normalized = key.trim();
   if (!normalized) {
     return null;
+  }
+
+  const globalTemplate = ROUND1_COMPOSITION_TEMPLATE_BY_KEY.get(normalized);
+  if (globalTemplate) {
+    return {
+      ...globalTemplate,
+      cluster: "other"
+    };
   }
 
   for (const cluster of Object.keys(ROUND1_CLUSTER_PROFILES) as ReferenceCluster[]) {
@@ -551,15 +712,14 @@ export function pickRound1VariationTemplateKey(params: {
   cluster: ReferenceCluster;
   usedTemplateKeys?: readonly string[];
 }): string | null {
-  const profile = getRound1ClusterProfile(params.cluster);
-  if (profile.variationTemplates.length <= 0) {
+  if (ROUND1_COMPOSITION_TEMPLATES.length <= 0) {
     return null;
   }
 
   const used = new Set((params.usedTemplateKeys || []).map((item) => item.trim()).filter(Boolean));
-  const ordered = [...profile.variationTemplates].sort((a, b) => {
-    const aHash = hashToSeed(`${params.seed}|${profile.cluster}|template|${a.key}`);
-    const bHash = hashToSeed(`${params.seed}|${profile.cluster}|template|${b.key}`);
+  const ordered = [...ROUND1_COMPOSITION_TEMPLATES].sort((a, b) => {
+    const aHash = hashToSeed(`${params.seed}|${params.cluster}|template|${a.key}`);
+    const bHash = hashToSeed(`${params.seed}|${params.cluster}|template|${b.key}`);
     return aHash - bHash;
   });
   const preferred = ordered.find((template) => !used.has(template.key));
