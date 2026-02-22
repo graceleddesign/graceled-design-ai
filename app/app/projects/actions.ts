@@ -41,11 +41,13 @@ import {
   loadIndex,
   resolveReferenceAbsolutePath,
   sampleRefsForOption,
-  type ReferenceLibraryItem
+  type ReferenceLibraryItem,
+  type ReferenceLibraryStyleTag
 } from "@/lib/referenceLibrary";
-import { getCuratedReferences } from "@/lib/referenceCuration";
+import { getCuratedReferences, type CuratedReference } from "@/lib/referenceCuration";
 import {
   deriveRecentReferenceIds,
+  getRound1ClusterProfile,
   getRound1VariationTemplateByKey
 } from "@/lib/referenceSelector";
 import { normalizeStyleDirection, type StyleDirection } from "@/lib/style-direction";
@@ -3867,6 +3869,13 @@ type GenerationOutputPayload = {
         usedCleanMinFallback: boolean;
         resolvedStyleFamily: StyleFamily;
       };
+      referenceAnchor?: {
+        referenceId: string;
+        referenceCluster: string | null;
+        referenceTier: string | null;
+        anchorRefSrc: string;
+        anchorThumbSrc: string;
+      };
     };
     toneCheck?: ToneCheckSummary;
     backgroundTextCheck?: BackgroundTextCheckSummary;
@@ -4379,26 +4388,131 @@ function mimeTypeFromPath(filePath: string): string | null {
   return null;
 }
 
-async function buildReferenceDataUrls(references: ReferenceLibraryItem[]): Promise<string[]> {
-  const dataUrls = await Promise.all(
-    references.map(async (reference) => {
-      const relativePath = reference.path || reference.thumbPath;
-      const absolutePath = resolveReferenceAbsolutePath(relativePath);
-      const mime = mimeTypeFromPath(relativePath);
-      if (!mime) {
-        return null;
-      }
+type LoadedReferenceDataUrl = {
+  referenceId: string;
+  dataUrl: string;
+  sourcePath: string;
+};
 
-      const bytes = await readFile(absolutePath).catch(() => null);
-      if (!bytes) {
-        return null;
-      }
+function normalizeReferenceId(value: string): string {
+  return value.trim().toLowerCase();
+}
 
-      return `data:${mime};base64,${bytes.toString("base64")}`;
-    })
-  );
+function dedupeReferencePaths(paths: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const rawPath of paths) {
+    if (typeof rawPath !== "string") {
+      continue;
+    }
+    const normalized = rawPath.trim().replaceAll("\\", "/").replace(/^\/+/, "");
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
 
-  return dataUrls.filter((value): value is string => Boolean(value));
+function toReferenceOriginalPublicUrl(referencePath: string): string | null {
+  const normalizedPath = referencePath.trim().replaceAll("\\", "/");
+  const fileName = path.posix.basename(normalizedPath);
+  if (!fileName) {
+    return null;
+  }
+  return `/reference_library/originals/${encodeURIComponent(fileName)}`;
+}
+
+function toReferenceThumbPublicUrl(referencePath: string): string | null {
+  const normalizedPath = referencePath.trim().replaceAll("\\", "/");
+  const fileName = path.posix.basename(normalizedPath);
+  if (!fileName) {
+    return null;
+  }
+  return `/reference_library/thumbs/${encodeURIComponent(fileName)}`;
+}
+
+function styleTagFromStyleTags(styleTags: string[]): ReferenceLibraryStyleTag {
+  const lowered = styleTags.map((tag) => tag.trim().toLowerCase()).filter(Boolean);
+  if (lowered.some((tag) => tag.includes("bold-typography") || tag === "type" || tag === "typography")) {
+    return "bold-typography";
+  }
+  if (lowered.some((tag) => tag.includes("illustrat") || tag.includes("line-art") || tag.includes("engrav"))) {
+    return "illustrative";
+  }
+  if (lowered.some((tag) => tag.includes("photo") || tag.includes("cinematic"))) {
+    return "photo";
+  }
+  if (lowered.some((tag) => tag.includes("texture") || tag.includes("textured"))) {
+    return "textured";
+  }
+  return "minimal";
+}
+
+function buildReferenceItemFromCurated(params: {
+  curated: CuratedReference;
+  fallback: ReferenceLibraryItem | null;
+}): ReferenceLibraryItem {
+  const fallback = params.fallback;
+  const styleTags =
+    params.curated.styleTags.length > 0
+      ? params.curated.styleTags
+      : fallback?.styleTags && fallback.styleTags.length > 0
+        ? fallback.styleTags
+        : [];
+  const styleTag = fallback?.styleTag || styleTagFromStyleTags(styleTags);
+
+  return {
+    id: params.curated.id,
+    path: params.curated.rawPath || fallback?.path || params.curated.thumbPath || params.curated.normalizedPath,
+    width: params.curated.width,
+    height: params.curated.height,
+    aspect: params.curated.aspect,
+    fileSize: params.curated.fileSize,
+    dHash: params.curated.dHash || fallback?.dHash,
+    styleTag,
+    styleTags,
+    sourceZip: fallback?.sourceZip,
+    originalName: fallback?.originalName,
+    rawPath: params.curated.rawPath || fallback?.rawPath || params.curated.normalizedPath,
+    normalizedPath: params.curated.normalizedPath || fallback?.normalizedPath || params.curated.rawPath,
+    thumbPath: params.curated.thumbPath || fallback?.thumbPath || params.curated.normalizedPath
+  };
+}
+
+function referenceFileCandidates(reference: ReferenceLibraryItem): string[] {
+  return dedupeReferencePaths([reference.path, reference.rawPath, reference.normalizedPath, reference.thumbPath]);
+}
+
+async function loadReferenceDataUrl(reference: ReferenceLibraryItem): Promise<LoadedReferenceDataUrl | null> {
+  const candidates = referenceFileCandidates(reference);
+  for (const relativePath of candidates) {
+    const mime = mimeTypeFromPath(relativePath);
+    if (!mime) {
+      continue;
+    }
+    const absolutePath = resolveReferenceAbsolutePath(relativePath);
+    const bytes = await readFile(absolutePath).catch(() => null);
+    if (!bytes) {
+      continue;
+    }
+    return {
+      referenceId: reference.id,
+      dataUrl: `data:${mime};base64,${bytes.toString("base64")}`,
+      sourcePath: relativePath
+    };
+  }
+  return null;
+}
+
+async function buildReferenceDataUrls(references: ReferenceLibraryItem[]): Promise<LoadedReferenceDataUrl[]> {
+  const refs = await Promise.all(references.map((reference) => loadReferenceDataUrl(reference)));
+  return refs.filter((reference): reference is LoadedReferenceDataUrl => Boolean(reference));
 }
 
 async function createStyleBrief(params: {
@@ -4941,7 +5055,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   motifBankContext?: MotifBankContext;
 }): Promise<void> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
-  const referenceIndex = await loadIndex();
+  const [referenceIndex, curatedReferences] = await Promise.all([loadIndex(), getCuratedReferences()]);
+  const referenceIndexById = new Map(referenceIndex.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
+  const curatedReferenceById = new Map(curatedReferences.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
   const reusableAssetsByGenerationId = new Map<string, ReusableGenerationAssets | null>();
   const initialGenerationInput = params.plannedGenerations[0]?.input;
   const seriesPreferenceNotes = readSeriesPreferencesDesignNotesFromInput(initialGenerationInput);
@@ -5040,16 +5156,50 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 n: 3
               })
             : [];
-      const anchorReferenceId = directionSpec?.referenceId?.trim().toLowerCase() || "";
+      const anchorReferenceId = normalizeReferenceId(directionSpec?.referenceId || "");
+      const sampledAnchorReference =
+        anchorReferenceId.length > 0
+          ? sampledReferences.find((reference) => normalizeReferenceId(reference.id) === anchorReferenceId) || null
+          : null;
+      const indexedAnchorReference = anchorReferenceId.length > 0 ? referenceIndexById.get(anchorReferenceId) || null : null;
+      const curatedAnchorReference = anchorReferenceId.length > 0 ? curatedReferenceById.get(anchorReferenceId) || null : null;
       const anchorReference =
         anchorReferenceId.length > 0
-          ? sampledReferences.find((reference) => reference.id.trim().toLowerCase() === anchorReferenceId) ||
-            referenceIndex.find((reference) => reference.id.trim().toLowerCase() === anchorReferenceId) ||
-            null
+          ? curatedAnchorReference
+            ? buildReferenceItemFromCurated({
+                curated: curatedAnchorReference,
+                fallback: sampledAnchorReference || indexedAnchorReference
+              })
+            : sampledAnchorReference || indexedAnchorReference
           : null;
       const references = anchorReference
         ? dedupeReferencesById([anchorReference, ...sampledReferences]).slice(0, 3)
         : sampledReferences;
+      const styleRefs = await buildReferenceDataUrls(references);
+      if (anchorReference) {
+        const firstStyleRef = styleRefs[0];
+        if (!firstStyleRef || normalizeReferenceId(firstStyleRef.referenceId) !== normalizeReferenceId(anchorReference.id)) {
+          throw new Error(`Anchor reference ${anchorReference.id} was not resolved as style ref #1.`);
+        }
+      }
+      const anchorStyleRef = anchorReference ? styleRefs[0] || null : null;
+      const anchorRefSrc =
+        anchorStyleRef?.sourcePath
+          ? toReferenceOriginalPublicUrl(anchorStyleRef.sourcePath)
+          : curatedAnchorReference?.rawPath
+            ? toReferenceOriginalPublicUrl(curatedAnchorReference.rawPath)
+            : anchorReference?.rawPath
+              ? toReferenceOriginalPublicUrl(anchorReference.rawPath)
+              : null;
+      const anchorThumbSrc =
+        curatedAnchorReference?.thumbPath
+          ? toReferenceThumbPublicUrl(curatedAnchorReference.thumbPath)
+          : anchorReference?.thumbPath
+            ? toReferenceThumbPublicUrl(anchorReference.thumbPath)
+            : null;
+      const resolvedReferenceCluster = curatedAnchorReference?.cluster || directionSpec?.referenceCluster || null;
+      const resolvedReferenceTier = curatedAnchorReference?.tier || directionSpec?.referenceTier || null;
+      const referenceDataUrls = styleRefs.map((reference) => reference.dataUrl);
       const lockupStyleMode = resolveLockupStyleMode({
         directionSpec,
         styleFamily: optionStyleFamily,
@@ -5074,7 +5224,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         optionalMarkAccentHexes: palette
       });
       const lockupIntegrationMode = chooseLockupIntegrationMode(lockupStyleMode);
-      const referenceDataUrls = await buildReferenceDataUrls(references);
       const templateBrief: TemplateBrief = {
         title: content.title,
         subtitle: content.subtitle,
@@ -5602,6 +5751,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
           const currentFamilyForFallback = currentStyleFields.styleFamily || baseStyleFamily;
           const currentSetForFallback = currentStyleFields.explorationSetKey || baseSetKey;
+          const allowedFamiliesForFallback =
+            activeDirectionSpec?.referenceCluster
+              ? getRound1ClusterProfile(activeDirectionSpec.referenceCluster).allowedStyleFamilies
+              : undefined;
           const altFamilyFallback = pickExplorationFallbackStyleFamily({
             runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-family`,
             laneFamily,
@@ -5610,7 +5763,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             tone: laneTone,
             medium: laneMedium,
             recentStyleFamilies: recentFamiliesForFallback,
-            setConstraint: "same"
+            setConstraint: "same",
+            allowedFamilies: allowedFamiliesForFallback
           });
           if (altFamilyFallback && altFamilyFallback.family !== currentFamilyForFallback) {
             activeDirectionSpec = applyFallbackStyleFamilyToDirectionSpec({
@@ -5635,6 +5789,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
           const currentSetKey = currentStyleFields.explorationSetKey || baseSetKey;
           const currentFamily = currentStyleFields.styleFamily || baseStyleFamily;
+          const allowedFamiliesForFallback =
+            activeDirectionSpec?.referenceCluster
+              ? getRound1ClusterProfile(activeDirectionSpec.referenceCluster).allowedStyleFamilies
+              : undefined;
           const altSetFallback = pickExplorationFallbackStyleFamily({
             runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-set`,
             laneFamily,
@@ -5644,7 +5802,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             medium: laneMedium,
             recentStyleFamilies: recentFamiliesForFallback,
             avoidFamilies: [currentFamily],
-            setConstraint: "different"
+            setConstraint: "different",
+            allowedFamilies: allowedFamiliesForFallback
           });
           const switchedSet = altSetFallback
             ? !currentSetKey || altSetFallback.explorationSetKey !== currentSetKey
@@ -5911,7 +6070,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           ? `[direction: ${directionSpec.optionLabel} ${directionSpec.styleFamily || "unassigned"} / ${directionSpec.laneFamily} / ${directionSpec.compositionType}]`
           : "",
         directionSpec?.referenceId
-          ? `[reference-anchor: ${directionSpec.referenceId}${directionSpec.referenceCluster ? `/${directionSpec.referenceCluster}` : ""}]`
+          ? `[reference-anchor: ${directionSpec.referenceId}${resolvedReferenceCluster ? `/${resolvedReferenceCluster}` : ""}]`
           : "",
         directionSpec?.variationTemplateKey ? `[variation-template: ${directionSpec.variationTemplateKey}]` : "",
         effectiveDirectionStyleFamily ? `[style-family: ${effectiveDirectionStyleFamily}]` : "",
@@ -5993,6 +6152,28 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         width: PREVIEW_DIMENSIONS[shape].width,
         height: PREVIEW_DIMENSIONS[shape].height
       }));
+      const usedReferenceIds = [...new Set(styleRefs.map((reference) => reference.referenceId))];
+      const referenceAnchorDebug =
+        anchorReference && anchorRefSrc
+          ? {
+              referenceId: anchorReference.id,
+              referenceCluster: resolvedReferenceCluster,
+              referenceTier: resolvedReferenceTier,
+              anchorRefSrc,
+              anchorThumbSrc: anchorThumbSrc || anchorRefSrc
+            }
+          : null;
+      const debugMeta =
+        !hasDesignNotes && fallbackStyleFamilyDebug
+          ? {
+              styleFamilyFallback: fallbackStyleFamilyDebug,
+              ...(referenceAnchorDebug ? { referenceAnchor: referenceAnchorDebug } : {})
+            }
+          : referenceAnchorDebug
+            ? {
+                referenceAnchor: referenceAnchorDebug
+              }
+            : undefined;
 
       const completedOutput: GenerationOutputPayload = {
         ...fallbackOutput,
@@ -6001,19 +6182,17 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         notes: "ai+split-background-lockup",
         promptUsed,
         meta: {
-          styleRefCount: references.length,
-          usedStylePaths: references.map((reference) => reference.path || reference.thumbPath),
-          usedReferenceIds: dedupeReferencesById(references).map((reference) => reference.id),
+          styleRefCount: styleRefs.length,
+          usedStylePaths: styleRefs.map((reference) => reference.sourcePath),
+          usedReferenceIds,
           lockupValidation: {
             ok: lockupTextValidation?.valid ?? true,
             reasons: lockupTextValidation?.reasons || [],
             retried: lockupTextOverrideRetried
           },
-          ...(!hasDesignNotes && fallbackStyleFamilyDebug
+          ...(debugMeta
             ? {
-                debug: {
-                  styleFamilyFallback: fallbackStyleFamilyDebug
-                }
+                debug: debugMeta
               }
             : {}),
           ...(shouldRunExplorationToneCheck
@@ -6052,10 +6231,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             styleBucket: effectiveDirectionStyleBucket || null,
             styleTone: effectiveDirectionStyleTone || null,
             styleMedium: effectiveDirectionStyleMedium || null,
-            referenceIds: dedupeReferencesById(references).map((reference) => reference.id),
+            referenceIds: usedReferenceIds,
             referenceId: directionSpec?.referenceId || references[0]?.id || null,
-            referenceCluster: directionSpec?.referenceCluster || null,
-            referenceTier: directionSpec?.referenceTier || null,
+            referenceCluster: resolvedReferenceCluster,
+            referenceTier: resolvedReferenceTier,
             variationTemplateKey: directionSpec?.variationTemplateKey || null,
             motifScope: directionSpec?.motifScope || motifBankContext.scriptureScope,
             lockupPresetId,

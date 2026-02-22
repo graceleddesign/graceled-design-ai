@@ -902,11 +902,16 @@ export function pickExplorationFallbackStyleFamily(params: {
   recentStyleFamilies?: readonly StyleFamilyKey[];
   avoidFamilies?: readonly StyleFamilyKey[];
   setConstraint?: ExplorationSetConstraint;
+  allowedFamilies?: readonly StyleFamilyKey[];
 }): ExplorationFallbackStyleFamilyPick | null {
   const seededOrder = createSeededRandom(`${params.runSeed}|fallback-style-family-order`).shuffle(STYLE_FAMILY_KEYS);
   const recentFamilyOrder = normalizeRecentStyleFamilies(params.recentStyleFamilies);
   const recentRanks = new Map(recentFamilyOrder.map((family, index) => [family, index] as const));
   const avoid = new Set<StyleFamilyKey>([params.currentStyleFamily, ...(params.avoidFamilies || [])]);
+  const allowedFamilySet =
+    params.allowedFamilies && params.allowedFamilies.length > 0
+      ? new Set(params.allowedFamilies.filter((family): family is StyleFamilyKey => isStyleFamilyKey(family)))
+      : null;
   const currentSetKey = params.currentExplorationSetKey?.trim() || "";
   const setConstraint = params.setConstraint || "any";
 
@@ -940,6 +945,9 @@ export function pickExplorationFallbackStyleFamily(params: {
     for (const lane of matchingLanes) {
       for (const family of seededOrder) {
         if (avoid.has(family)) {
+          continue;
+        }
+        if (allowedFamilySet && !allowedFamilySet.has(family)) {
           continue;
         }
         if (
@@ -1219,6 +1227,8 @@ function styleFamilyScore(params: {
     laneFamily: DirectionLaneFamily;
     wantsSeriesMark: boolean;
     wantsTitleStage: boolean;
+    referenceToneHint?: StyleToneKey;
+    referenceMediumHint?: StyleMediumKey;
   };
   recentRanks: Map<StyleFamilyKey, number>;
   preferredLaneFamilies: Set<DirectionLaneFamily>;
@@ -1272,6 +1282,14 @@ function styleFamilyScore(params: {
     }
   }
 
+  if (params.spec.referenceToneHint) {
+    score += familyRecord.tone === params.spec.referenceToneHint ? 6 : -4;
+  }
+
+  if (params.spec.referenceMediumHint) {
+    score += familyRecord.medium === params.spec.referenceMediumHint ? 5 : -3;
+  }
+
   return score;
 }
 
@@ -1282,6 +1300,8 @@ function assignStyleFamilies(params: {
     laneFamily: DirectionLaneFamily;
     wantsSeriesMark: boolean;
     wantsTitleStage: boolean;
+    referenceToneHint?: StyleToneKey;
+    referenceMediumHint?: StyleMediumKey;
   }[];
   preferredLaneFamilies?: readonly DirectionLaneFamily[];
   recentStyleFamilies?: readonly StyleFamilyKey[];
@@ -1289,10 +1309,12 @@ function assignStyleFamilies(params: {
   recentExplorationSetKeys?: readonly string[];
   recentRecipeIds?: readonly string[];
   explorationMode?: boolean;
+  referenceFirstMode?: boolean;
+  strictAllowedFamilies?: boolean;
   brandMode: "brand" | "fresh";
   playfulIntent: PlayfulIntentSignal;
   allowedFamiliesByOption?: readonly (readonly StyleFamilyKey[] | undefined)[];
-}): ExplorationStyleFamilySelection {
+}): ExplorationStyleFamilySelection | null {
   const seededOrder = createSeededRandom(`${params.runSeed}|style-family-order`).shuffle(STYLE_FAMILY_KEYS);
   const orderIndex = new Map(seededOrder.map((family, index) => [family, index] as const));
   const recentStyleFamilyOrder = normalizeRecentStyleFamilies(params.recentStyleFamilies);
@@ -1303,6 +1325,7 @@ function assignStyleFamilies(params: {
   const recentExplorationSetRanks = new Map(recentExplorationSetOrder.map((setKey, index) => [setKey, index] as const));
   const recentRecipeRanks = new Map(recentRecipeOrder.map((recipeId, index) => [recipeId, index] as const));
   const preferredLaneFamilies = new Set(params.preferredLaneFamilies || []);
+  const isReferenceFirstMode = params.referenceFirstMode === true;
   const allowedFamilySetsByOption = Array.from({ length: params.specs.length }, (_, optionIndex) => {
     const rawAllowed = params.allowedFamiliesByOption?.[optionIndex];
     if (!rawAllowed || rawAllowed.length <= 0) {
@@ -1312,7 +1335,7 @@ function assignStyleFamilies(params: {
     return normalized.length > 0 ? new Set(normalized) : null;
   });
 
-  if (params.explorationMode) {
+  if (params.explorationMode && !isReferenceFirstMode) {
     const explorationPicks = pickExplorationStyleFamilies({
       runSeed: params.runSeed,
       explorationSeed: params.explorationSeed,
@@ -1340,6 +1363,9 @@ function assignStyleFamilies(params: {
 
   for (const [optionIndex, spec] of params.specs.entries()) {
     const allowedSet = allowedFamilySetsByOption[optionIndex];
+    if (params.strictAllowedFamilies && !allowedSet) {
+      return null;
+    }
     const candidates = seededOrder.filter((family) => {
       if (used.has(family)) {
         return false;
@@ -1347,7 +1373,10 @@ function assignStyleFamilies(params: {
       if (allowedSet && !allowedSet.has(family)) {
         return false;
       }
-      return !params.explorationMode || !usedBuckets.has(STYLE_FAMILY_BANK[family].bucket);
+      if (!params.explorationMode || isReferenceFirstMode) {
+        return true;
+      }
+      return !usedBuckets.has(STYLE_FAMILY_BANK[family].bucket);
     });
     const fallbackCandidates = seededOrder.filter((family) => {
       if (used.has(family)) {
@@ -1356,10 +1385,19 @@ function assignStyleFamilies(params: {
       return !allowedSet || allowedSet.has(family);
     });
     const unconstrainedFallbackCandidates = seededOrder.filter((family) => !used.has(family));
-    const effectiveCandidates =
-      candidates.length > 0 ? candidates : fallbackCandidates.length > 0 ? fallbackCandidates : unconstrainedFallbackCandidates;
+    const effectiveCandidates = params.strictAllowedFamilies
+      ? candidates.length > 0
+        ? candidates
+        : fallbackCandidates
+      : candidates.length > 0
+        ? candidates
+        : fallbackCandidates.length > 0
+          ? fallbackCandidates
+          : unconstrainedFallbackCandidates;
     if (effectiveCandidates.length === 0) {
-      break;
+      return params.strictAllowedFamilies ? null : {
+        picks
+      };
     }
 
     const ranked = effectiveCandidates
@@ -1377,7 +1415,7 @@ function assignStyleFamilies(params: {
         if (!params.explorationMode && usedBuckets.has(bucket)) {
           score -= 2;
         }
-        if (params.explorationMode) {
+        if (params.explorationMode && !isReferenceFirstMode) {
           score += usedTones.has(record.tone) ? -3 : 3;
           score += usedMediums.has(record.medium) ? -3 : 3;
           if (record.tone === "light" || record.tone === "vivid") {
@@ -1416,7 +1454,7 @@ function assignStyleFamilies(params: {
     usedMediums.add(selectedRecord.medium);
   }
 
-  if (params.explorationMode && picks.length > 0 && !hasLightOrVividTone(picks)) {
+  if (params.explorationMode && !isReferenceFirstMode && picks.length > 0 && !hasLightOrVividTone(picks)) {
     for (let optionIndex = picks.length - 1; optionIndex >= 0; optionIndex -= 1) {
       const remainingBuckets = new Set(
         picks.filter((_, index) => index !== optionIndex).map((pick) => pick.bucket)
@@ -1509,6 +1547,10 @@ function assignStyleFamilies(params: {
         break;
       }
     }
+  }
+
+  if (params.strictAllowedFamilies && picks.length < params.specs.length) {
+    return null;
   }
 
   return {
@@ -1851,6 +1893,8 @@ function buildRound1ReferenceAssignments(params: {
   recentReferenceIdsProject?: readonly string[];
   recentReferenceIdsGlobal?: readonly string[];
   fallbackLockupPresetIds: readonly string[];
+  tripletSeedKey?: string;
+  reselectSameClusterReferences?: boolean;
 }): Array<Round1ReferenceAssignment | null> {
   const shouldUseRound1ReferencePlan =
     params.explorationMode === true && params.round === 1 && (params.curatedRefs?.length || 0) > 0;
@@ -1858,8 +1902,9 @@ function buildRound1ReferenceAssignments(params: {
     return Array.from({ length: params.optionCount }, () => null);
   }
 
+  const tripletSeedKey = params.tripletSeedKey?.trim();
   const pickedTriplet = pickRound1ReferenceTriplet({
-    seed: `${params.runSeed}|round1-reference-triplet`,
+    seed: [params.runSeed, "round1-reference-triplet", tripletSeedKey].filter(Boolean).join("|"),
     recentReferenceIdsProject: params.recentReferenceIdsProject,
     recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
     curatedRefs: params.curatedRefs || []
@@ -1868,11 +1913,52 @@ function buildRound1ReferenceAssignments(params: {
     return Array.from({ length: params.optionCount }, () => null);
   }
 
+  const optionReferenceSequence = Array.from({ length: params.optionCount }, (_, optionIndex) => {
+    const reference = pickedTriplet[optionIndex] || pickedTriplet[optionIndex % pickedTriplet.length];
+    return reference || null;
+  });
+  if (params.reselectSameClusterReferences && (params.curatedRefs?.length || 0) > 0) {
+    const proPoolByCluster = new Map<ReferenceCluster, CuratedReference[]>();
+    for (const reference of params.curatedRefs || []) {
+      if (reference.tier !== "pro") {
+        continue;
+      }
+      const existing = proPoolByCluster.get(reference.cluster) || [];
+      existing.push(reference);
+      proPoolByCluster.set(reference.cluster, existing);
+    }
+    const usedReferenceIds = new Set<string>();
+    for (let optionIndex = 0; optionIndex < optionReferenceSequence.length; optionIndex += 1) {
+      const baseReference = optionReferenceSequence[optionIndex];
+      if (!baseReference) {
+        continue;
+      }
+      const clusterPool = proPoolByCluster.get(baseReference.cluster) || [];
+      if (clusterPool.length <= 0) {
+        usedReferenceIds.add(baseReference.id.toLowerCase());
+        continue;
+      }
+      const orderedClusterPool = [...clusterPool].sort((a, b) => {
+        const aHash = hashToSeed(
+          `${params.runSeed}|round1-cluster-reselect|${tripletSeedKey || "base"}|option-${optionIndex}|cluster-${baseReference.cluster}|${a.id}`
+        );
+        const bHash = hashToSeed(
+          `${params.runSeed}|round1-cluster-reselect|${tripletSeedKey || "base"}|option-${optionIndex}|cluster-${baseReference.cluster}|${b.id}`
+        );
+        return aHash - bHash;
+      });
+      const preferred = orderedClusterPool.find((candidate) => !usedReferenceIds.has(candidate.id.toLowerCase()));
+      const selected = preferred || orderedClusterPool[0] || baseReference;
+      optionReferenceSequence[optionIndex] = selected;
+      usedReferenceIds.add(selected.id.toLowerCase());
+    }
+  }
+
   const usedTemplateKeys = new Set<string>();
   const usedLockupPresetIds = new Set<string>();
 
   return Array.from({ length: params.optionCount }, (_, optionIndex) => {
-    const reference = pickedTriplet[optionIndex] || pickedTriplet[optionIndex % pickedTriplet.length];
+    const reference = optionReferenceSequence[optionIndex];
     if (!reference) {
       return null;
     }
@@ -2019,28 +2105,6 @@ export function planDirectionSet(params: {
     wantsTitleStage: optionIndex === wantsTitleStageIndex
   }));
 
-  const round1ReferenceAssignments = buildRound1ReferenceAssignments({
-    runSeed,
-    optionCount: count,
-    round: params.round,
-    explorationMode: params.explorationMode === true,
-    curatedRefs: params.curatedRefs,
-    recentReferenceIdsProject: params.recentReferenceIdsProject,
-    recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
-    fallbackLockupPresetIds: baseSpecs.map((spec) => spec.lockupPresetId)
-  });
-  const referenceAwareSpecs = baseSpecs.map((spec, optionIndex) => {
-    const assignment = round1ReferenceAssignments[optionIndex];
-    if (!assignment) {
-      return spec;
-    }
-    return {
-      ...spec,
-      lockupPresetId: assignment.lockupPresetId || spec.lockupPresetId
-    };
-  });
-  const allowedFamiliesByOption = round1ReferenceAssignments.map((assignment) => assignment?.allowedStyleFamilies);
-
   const playfulIntent = detectPlayfulIntent({
     title: params.seriesTitle,
     subtitle: params.seriesSubtitle,
@@ -2048,21 +2112,149 @@ export function planDirectionSet(params: {
     designNotes: params.designNotes,
     topics: params.topicNames
   });
+  const buildReferenceAwareSpecs = (assignments: readonly (Round1ReferenceAssignment | null)[]) =>
+    baseSpecs.map((spec, optionIndex) => {
+      const assignment = assignments[optionIndex];
+      if (!assignment) {
+        return spec;
+      }
+      return {
+        ...spec,
+        lockupPresetId: assignment.lockupPresetId || spec.lockupPresetId,
+        referenceToneHint: assignment.referenceToneHint,
+        referenceMediumHint: assignment.referenceMediumHint
+      };
+    });
+  const styleSelectionRespectsReferenceAllowlist = (
+    assignments: readonly (Round1ReferenceAssignment | null)[],
+    selection: ExplorationStyleFamilySelection | null
+  ): boolean => {
+    if (!selection || selection.picks.length < count) {
+      return false;
+    }
+    for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
+      const assignment = assignments[optionIndex];
+      if (!assignment?.referenceId) {
+        continue;
+      }
+      const family = selection.picks[optionIndex]?.family;
+      if (!family || !assignment.allowedStyleFamilies.includes(family)) {
+        return false;
+      }
+    }
+    return true;
+  };
 
-  const styleFamilies = assignStyleFamilies({
-    runSeed,
-    explorationSeed,
-    specs: referenceAwareSpecs,
-    preferredLaneFamilies: params.preferredFamilies,
-    recentStyleFamilies: params.recentStyleFamilies,
-    recentStyleBuckets: params.recentStyleBuckets,
-    recentExplorationSetKeys: params.recentExplorationSetKeys,
-    recentRecipeIds: params.recentRecipeIds,
-    explorationMode: params.explorationMode === true,
-    brandMode: params.brandMode === "brand" ? "brand" : "fresh",
-    playfulIntent,
-    allowedFamiliesByOption
-  });
+  let round1ReferenceAssignments: Array<Round1ReferenceAssignment | null> = Array.from({ length: count }, () => null);
+  let referenceAwareSpecs = buildReferenceAwareSpecs(round1ReferenceAssignments);
+  let allowedFamiliesByOption = round1ReferenceAssignments.map((assignment) => assignment?.allowedStyleFamilies);
+  let styleFamilies: ExplorationStyleFamilySelection | null = null;
+
+  const shouldUseReferenceFirstPlan =
+    params.explorationMode === true && params.round === 1 && (params.curatedRefs?.length || 0) > 0;
+  if (shouldUseReferenceFirstPlan) {
+    const maxAttempts = Math.max(1, Math.min(12, (params.curatedRefs?.length || 3) * 2));
+    for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex += 1) {
+      const useSameClusterReselection = attemptIndex % 2 === 1;
+      const attemptAssignments = buildRound1ReferenceAssignments({
+        runSeed,
+        optionCount: count,
+        round: params.round,
+        explorationMode: params.explorationMode === true,
+        curatedRefs: params.curatedRefs,
+        recentReferenceIdsProject: params.recentReferenceIdsProject,
+        recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
+        fallbackLockupPresetIds: baseSpecs.map((spec) => spec.lockupPresetId),
+        tripletSeedKey: `attempt-${Math.floor(attemptIndex / 2)}`,
+        reselectSameClusterReferences: useSameClusterReselection
+      });
+      const attemptHasReferences = attemptAssignments.some((assignment) => Boolean(assignment?.referenceId));
+      if (!attemptHasReferences) {
+        continue;
+      }
+      const attemptReferenceAwareSpecs = buildReferenceAwareSpecs(attemptAssignments);
+      const attemptAllowedFamiliesByOption = attemptAssignments.map((assignment) => assignment?.allowedStyleFamilies);
+      const attemptStyleFamilies = assignStyleFamilies({
+        runSeed,
+        explorationSeed,
+        specs: attemptReferenceAwareSpecs,
+        preferredLaneFamilies: params.preferredFamilies,
+        recentStyleFamilies: params.recentStyleFamilies,
+        recentStyleBuckets: params.recentStyleBuckets,
+        recentExplorationSetKeys: params.recentExplorationSetKeys,
+        recentRecipeIds: params.recentRecipeIds,
+        explorationMode: params.explorationMode === true,
+        referenceFirstMode: true,
+        strictAllowedFamilies: true,
+        brandMode: params.brandMode === "brand" ? "brand" : "fresh",
+        playfulIntent,
+        allowedFamiliesByOption: attemptAllowedFamiliesByOption
+      });
+      if (!styleSelectionRespectsReferenceAllowlist(attemptAssignments, attemptStyleFamilies)) {
+        continue;
+      }
+
+      round1ReferenceAssignments = attemptAssignments;
+      referenceAwareSpecs = attemptReferenceAwareSpecs;
+      allowedFamiliesByOption = attemptAllowedFamiliesByOption;
+      styleFamilies = attemptStyleFamilies;
+      break;
+    }
+  }
+
+  if (!styleFamilies) {
+    round1ReferenceAssignments = buildRound1ReferenceAssignments({
+      runSeed,
+      optionCount: count,
+      round: params.round,
+      explorationMode: params.explorationMode === true,
+      curatedRefs: params.curatedRefs,
+      recentReferenceIdsProject: params.recentReferenceIdsProject,
+      recentReferenceIdsGlobal: params.recentReferenceIdsGlobal,
+      fallbackLockupPresetIds: baseSpecs.map((spec) => spec.lockupPresetId)
+    });
+    referenceAwareSpecs = buildReferenceAwareSpecs(round1ReferenceAssignments);
+    allowedFamiliesByOption = round1ReferenceAssignments.map((assignment) => assignment?.allowedStyleFamilies);
+    const referenceFirstMode = round1ReferenceAssignments.some((assignment) => Boolean(assignment?.referenceId));
+    styleFamilies = assignStyleFamilies({
+      runSeed,
+      explorationSeed,
+      specs: referenceAwareSpecs,
+      preferredLaneFamilies: params.preferredFamilies,
+      recentStyleFamilies: params.recentStyleFamilies,
+      recentStyleBuckets: params.recentStyleBuckets,
+      recentExplorationSetKeys: params.recentExplorationSetKeys,
+      recentRecipeIds: params.recentRecipeIds,
+      explorationMode: params.explorationMode === true,
+      referenceFirstMode,
+      strictAllowedFamilies: referenceFirstMode,
+      brandMode: params.brandMode === "brand" ? "brand" : "fresh",
+      playfulIntent,
+      allowedFamiliesByOption
+    });
+  }
+  if (!styleFamilies) {
+    const forcedPicks = Array.from({ length: count }, (_, optionIndex) => {
+      const assignment = round1ReferenceAssignments[optionIndex];
+      const allowedFamilies =
+        assignment?.allowedStyleFamilies && assignment.allowedStyleFamilies.length > 0
+          ? assignment.allowedStyleFamilies.filter((family): family is StyleFamilyKey => isStyleFamilyKey(family))
+          : STYLE_FAMILY_KEYS;
+      if (allowedFamilies.length <= 0) {
+        return null;
+      }
+      const ordered = [...allowedFamilies].sort((a, b) => {
+        const aHash = hashToSeed(`${runSeed}|forced-reference-first-family|option-${optionIndex}|${a}`);
+        const bHash = hashToSeed(`${runSeed}|forced-reference-first-family|option-${optionIndex}|${b}`);
+        return aHash - bHash;
+      });
+      return toStyleFamilyPick(ordered[0]);
+    }).filter((pick): pick is StyleFamilyPick => Boolean(pick));
+    styleFamilies = {
+      picks: forcedPicks
+    };
+  }
+  const effectiveStyleFamilies = styleFamilies || { picks: [] };
 
   const motifFocusByDirection = assignMotifFocuses({
     runSeed,
@@ -2080,14 +2272,30 @@ export function planDirectionSet(params: {
 
   return referenceAwareSpecs.map((spec, optionIndex) => {
     const referenceAssignment = round1ReferenceAssignments[optionIndex];
+    const selectedFamily = effectiveStyleFamilies.picks[optionIndex]?.family;
+    const selectedRecord = selectedFamily ? STYLE_FAMILY_BANK[selectedFamily] : null;
+    if (
+      process.env.NODE_ENV !== "production" &&
+      referenceAssignment?.referenceCluster &&
+      selectedFamily &&
+      !referenceAssignment.allowedStyleFamilies.includes(selectedFamily)
+    ) {
+      console.error("[direction-planner] reference-first style-family mismatch", {
+        optionIndex,
+        referenceId: referenceAssignment.referenceId,
+        referenceCluster: referenceAssignment.referenceCluster,
+        styleFamily: selectedFamily
+      });
+    }
     return {
     ...spec,
-    explorationSetKey: styleFamilies.explorationSetKey,
-    explorationLaneKey: styleFamilies.explorationLaneKeys?.[optionIndex],
-    styleFamily: styleFamilies.picks[optionIndex]?.family,
-    styleBucket: styleFamilies.picks[optionIndex]?.bucket,
-    styleTone: styleFamilies.picks[optionIndex]?.tone,
-    styleMedium: styleFamilies.picks[optionIndex]?.medium,
+    explorationSetKey: referenceAssignment?.referenceId ? undefined : effectiveStyleFamilies.explorationSetKey,
+    explorationLaneKey: referenceAssignment?.referenceId ? undefined : effectiveStyleFamilies.explorationLaneKeys?.[optionIndex],
+    styleFamily: selectedFamily,
+    styleBucket: selectedRecord?.bucket || effectiveStyleFamilies.picks[optionIndex]?.bucket,
+    styleTone: selectedRecord?.tone || referenceAssignment?.referenceToneHint || effectiveStyleFamilies.picks[optionIndex]?.tone,
+    styleMedium:
+      selectedRecord?.medium || referenceAssignment?.referenceMediumHint || effectiveStyleFamilies.picks[optionIndex]?.medium,
     motifFocus: motifFocusByDirection[optionIndex] || [],
     motifScope: params.motifScope,
     referenceId: referenceAssignment?.referenceId,

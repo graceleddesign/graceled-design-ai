@@ -38,6 +38,8 @@ type OptionDesignSpecSummary = {
   referenceId: string | null;
   referenceCluster: string | null;
   variationTemplateKey: string | null;
+  debugAnchorRefSrc: string | null;
+  debugAnchorThumbSrc: string | null;
 };
 
 const OPTION_TINTS = [
@@ -138,7 +140,9 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     motifFocus: [],
     referenceId: null,
     referenceCluster: null,
-    variationTemplateKey: null
+    variationTemplateKey: null,
+    debugAnchorRefSrc: null,
+    debugAnchorThumbSrc: null
   };
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return fallback;
@@ -149,9 +153,35 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     return fallback;
   }
 
+  const debug = (meta as { debug?: unknown }).debug;
+  const debugReferenceAnchor =
+    debug && typeof debug === "object" && !Array.isArray(debug)
+      ? (debug as { referenceAnchor?: unknown }).referenceAnchor
+      : null;
+  const debugAnchorRefSrcCandidate =
+    debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
+      ? (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc
+      : null;
+  const debugAnchorThumbSrcCandidate =
+    debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
+      ? (debugReferenceAnchor as { anchorThumbSrc?: unknown }).anchorThumbSrc
+      : null;
+  const debugAnchorRefSrc =
+    typeof debugAnchorRefSrcCandidate === "string" && debugAnchorRefSrcCandidate.trim()
+      ? debugAnchorRefSrcCandidate.trim()
+      : null;
+  const debugAnchorThumbSrc =
+    typeof debugAnchorThumbSrcCandidate === "string" && debugAnchorThumbSrcCandidate.trim()
+      ? debugAnchorThumbSrcCandidate.trim()
+      : null;
+
   const designSpec = (meta as { designSpec?: unknown }).designSpec;
   if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
-    return fallback;
+    return {
+      ...fallback,
+      debugAnchorRefSrc,
+      debugAnchorThumbSrc
+    };
   }
 
   const nestedDirectionSpec = (
@@ -272,7 +302,9 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     referenceId: referenceIdCandidate && referenceIdCandidate.trim() ? referenceIdCandidate.trim() : null,
     referenceCluster: referenceClusterCandidate && referenceClusterCandidate.trim() ? referenceClusterCandidate.trim() : null,
     variationTemplateKey:
-      variationTemplateKeyCandidate && variationTemplateKeyCandidate.trim() ? variationTemplateKeyCandidate.trim() : null
+      variationTemplateKeyCandidate && variationTemplateKeyCandidate.trim() ? variationTemplateKeyCandidate.trim() : null,
+    debugAnchorRefSrc,
+    debugAnchorThumbSrc
   };
 }
 
@@ -493,6 +525,8 @@ export default async function ProjectGenerationsPage({
                       debugReferenceId={designSpecSummary.referenceId}
                       debugReferenceCluster={designSpecSummary.referenceCluster}
                       debugVariationTemplateKey={designSpecSummary.variationTemplateKey}
+                      debugAnchorRefSrc={designSpecSummary.debugAnchorRefSrc}
+                      debugAnchorThumbSrc={designSpecSummary.debugAnchorThumbSrc}
                       showDebugChips={debugStageEnabled}
                       previewUrls={previewUrls}
                       finalizeAction={finalizeAction}
