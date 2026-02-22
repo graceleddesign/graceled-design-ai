@@ -9,7 +9,8 @@
     "aspect": 1.7778,
     "fileSize": 167841,
     "dHash": "00000f1f0f860307",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0001.png"
   },
   {
     "id": "ref_0002",
@@ -24,7 +25,8 @@
     "styleTags": [
       "minimal",
       "typography"
-    ]
+    ],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0002.png"
   },
   {
     "id": "ref_0003",
@@ -36,7 +38,8 @@
     "aspect": 1.7778,
     "fileSize": 1294828,
     "dHash": "372747070f170f0b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0003.png"
   },
   {
     "id": "ref_0004",
@@ -48,7 +51,8 @@
     "aspect": 1.7699,
     "fileSize": 495347,
     "dHash": "ce962426373634b9",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0004.png"
   },
   {
     "id": "ref_0005",
@@ -60,7 +64,8 @@
     "aspect": 1.7778,
     "fileSize": 834339,
     "dHash": "6b697161ea8e8e1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0005.png"
   },
   {
     "id": "ref_0006",
@@ -72,7 +77,8 @@
     "aspect": 1.7778,
     "fileSize": 1393954,
     "dHash": "a0d41686861612a2",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0006.png"
   },
   {
     "id": "ref_0007",
@@ -84,7 +90,8 @@
     "aspect": 1.7778,
     "fileSize": 4917809,
     "dHash": "5a9a0583a2439698",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0007.png"
   },
   {
     "id": "ref_0008",
@@ -96,7 +103,8 @@
     "aspect": 1.7778,
     "fileSize": 119549,
     "dHash": "7b73733513734f9d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0008.png"
   },
   {
     "id": "ref_0009",
@@ -108,7 +116,8 @@
     "aspect": 1.7778,
     "fileSize": 628653,
     "dHash": "000000252301e0f0",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0009.png"
   },
   {
     "id": "ref_0010",
@@ -120,7 +129,8 @@
     "aspect": 1.7778,
     "fileSize": 949546,
     "dHash": "1e1e3f37272f183b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0010.png"
   },
   {
     "id": "ref_0011",
@@ -132,7 +142,8 @@
     "aspect": 1.7778,
     "fileSize": 2116753,
     "dHash": "4c8c953531814127",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0011.png"
   },
   {
     "id": "ref_0012",
@@ -144,7 +155,8 @@
     "aspect": 1.768,
     "fileSize": 396844,
     "dHash": "7557def402812506",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0012.png"
   },
   {
     "id": "ref_0013",
@@ -156,7 +168,8 @@
     "aspect": 1.7778,
     "fileSize": 484545,
     "dHash": "6a69696971b2767e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0013.png"
   },
   {
     "id": "ref_0014",
@@ -168,7 +181,8 @@
     "aspect": 1.7778,
     "fileSize": 3262638,
     "dHash": "0f0f0f0f0f0f8d5f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0014.png"
   },
   {
     "id": "ref_0015",
@@ -180,7 +194,8 @@
     "aspect": 2.5714,
     "fileSize": 257653,
     "dHash": "06131a350d333325",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0015.png"
   },
   {
     "id": "ref_0016",
@@ -192,7 +207,8 @@
     "aspect": 1.7778,
     "fileSize": 453161,
     "dHash": "0707061686161f1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0016.png"
   },
   {
     "id": "ref_0017",
@@ -204,7 +220,8 @@
     "aspect": 1.7778,
     "fileSize": 3273506,
     "dHash": "4f0f07c284060707",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0017.png"
   },
   {
     "id": "ref_0018",
@@ -216,7 +233,8 @@
     "aspect": 1.7778,
     "fileSize": 1718795,
     "dHash": "1b1b13362747494b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0018.png"
   },
   {
     "id": "ref_0019",
@@ -228,7 +246,8 @@
     "aspect": 1.7778,
     "fileSize": 1754145,
     "dHash": "8696121312d69ccc",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0019.png"
   },
   {
     "id": "ref_0020",
@@ -240,7 +259,8 @@
     "aspect": 1.7778,
     "fileSize": 279049,
     "dHash": "2c2c6d2b0b0e2c2c",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0020.png"
   },
   {
     "id": "ref_0021",
@@ -252,7 +272,8 @@
     "aspect": 1.7778,
     "fileSize": 749330,
     "dHash": "1f0b1b1f274b070f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0021.png"
   },
   {
     "id": "ref_0022",
@@ -264,7 +285,8 @@
     "aspect": 1.7778,
     "fileSize": 1545225,
     "dHash": "5a06858f0f1f3733",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0022.png"
   },
   {
     "id": "ref_0023",
@@ -276,7 +298,8 @@
     "aspect": 1.7794,
     "fileSize": 55991,
     "dHash": "622e55d74e0f2445",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0023.png"
   },
   {
     "id": "ref_0024",
@@ -288,7 +311,8 @@
     "aspect": 1.768,
     "fileSize": 8774076,
     "dHash": "0f1536b4f0151313",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0024.png"
   },
   {
     "id": "ref_0025",
@@ -300,7 +324,8 @@
     "aspect": 1.7778,
     "fileSize": 268354,
     "dHash": "af4d4d29cd2b170e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0025.png"
   },
   {
     "id": "ref_0026",
@@ -312,7 +337,8 @@
     "aspect": 1.7778,
     "fileSize": 379816,
     "dHash": "d4dc9c9cdc98dcd8",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0026.png"
   },
   {
     "id": "ref_0027",
@@ -324,7 +350,8 @@
     "aspect": 1.7778,
     "fileSize": 72873,
     "dHash": "0000606068600000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0027.png"
   },
   {
     "id": "ref_0028",
@@ -336,7 +363,8 @@
     "aspect": 1.7778,
     "fileSize": 372089,
     "dHash": "2bd0c0c4d4d8f0c0",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0028.png"
   },
   {
     "id": "ref_0029",
@@ -348,7 +376,8 @@
     "aspect": 1.7778,
     "fileSize": 961554,
     "dHash": "1c183c0a6a220303",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0029.png"
   },
   {
     "id": "ref_0030",
@@ -360,7 +389,8 @@
     "aspect": 1.7778,
     "fileSize": 7802326,
     "dHash": "0f4765330f1fd666",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0030.png"
   },
   {
     "id": "ref_0031",
@@ -372,7 +402,8 @@
     "aspect": 1.7778,
     "fileSize": 3873173,
     "dHash": "a16daaae4d0f5313",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0031.png"
   },
   {
     "id": "ref_0032",
@@ -384,7 +415,8 @@
     "aspect": 1.7778,
     "fileSize": 181324,
     "dHash": "0094e4e4d8d88e00",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0032.png"
   },
   {
     "id": "ref_0033",
@@ -396,7 +428,8 @@
     "aspect": 1.7778,
     "fileSize": 1778739,
     "dHash": "0b030707071f1f17",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0033.png"
   },
   {
     "id": "ref_0034",
@@ -408,7 +441,8 @@
     "aspect": 1.7778,
     "fileSize": 611526,
     "dHash": "0f37233731211d1c",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0034.png"
   },
   {
     "id": "ref_0035",
@@ -420,7 +454,8 @@
     "aspect": 1.7778,
     "fileSize": 630095,
     "dHash": "3332716971717171",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0035.png"
   },
   {
     "id": "ref_0036",
@@ -432,7 +467,8 @@
     "aspect": 1.7778,
     "fileSize": 1550789,
     "dHash": "0852921223921212",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0036.png"
   },
   {
     "id": "ref_0037",
@@ -444,7 +480,8 @@
     "aspect": 1.7778,
     "fileSize": 1340788,
     "dHash": "9430e8d4c6e83014",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0037.png"
   },
   {
     "id": "ref_0038",
@@ -456,7 +493,8 @@
     "aspect": 1.7778,
     "fileSize": 1335794,
     "dHash": "0e0a4ae7ab0b1b1a",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0038.png"
   },
   {
     "id": "ref_0039",
@@ -468,7 +506,8 @@
     "aspect": 1.7778,
     "fileSize": 574108,
     "dHash": "031723071b0b2f2b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0039.png"
   },
   {
     "id": "ref_0040",
@@ -480,7 +519,8 @@
     "aspect": 1.7778,
     "fileSize": 2788937,
     "dHash": "a6e2000420313032",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0040.png"
   },
   {
     "id": "ref_0041",
@@ -492,7 +532,8 @@
     "aspect": 1.7778,
     "fileSize": 2129109,
     "dHash": "0f07331b1b2b0b0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0041.png"
   },
   {
     "id": "ref_0042",
@@ -504,7 +545,8 @@
     "aspect": 1.7778,
     "fileSize": 46140,
     "dHash": "2d2f1f372713133b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0042.png"
   },
   {
     "id": "ref_0043",
@@ -516,7 +558,8 @@
     "aspect": 1.7778,
     "fileSize": 3435710,
     "dHash": "0f0f0f0f170d4d4d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0043.png"
   },
   {
     "id": "ref_0044",
@@ -528,7 +571,8 @@
     "aspect": 1.7778,
     "fileSize": 628101,
     "dHash": "3f3b391f33356c66",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0044.png"
   },
   {
     "id": "ref_0045",
@@ -540,7 +584,8 @@
     "aspect": 1.7778,
     "fileSize": 2918432,
     "dHash": "0f0f0f0f07070707",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0045.png"
   },
   {
     "id": "ref_0046",
@@ -552,7 +597,8 @@
     "aspect": 1.7778,
     "fileSize": 598869,
     "dHash": "352a531103131244",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0046.png"
   },
   {
     "id": "ref_0047",
@@ -564,7 +610,8 @@
     "aspect": 1.768,
     "fileSize": 1332447,
     "dHash": "eb6d370f4fdb9737",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0047.png"
   },
   {
     "id": "ref_0048",
@@ -576,7 +623,8 @@
     "aspect": 1.7778,
     "fileSize": 1574358,
     "dHash": "40307068706030f8",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0048.png"
   },
   {
     "id": "ref_0049",
@@ -588,7 +636,8 @@
     "aspect": 1.7778,
     "fileSize": 1654648,
     "dHash": "0810706970693279",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0049.png"
   },
   {
     "id": "ref_0050",
@@ -600,7 +649,8 @@
     "aspect": 1.7778,
     "fileSize": 1971725,
     "dHash": "13070f0f0f971618",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0050.png"
   },
   {
     "id": "ref_0051",
@@ -612,7 +662,8 @@
     "aspect": 1.7778,
     "fileSize": 478491,
     "dHash": "2492e8c8e8b2dc12",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0051.png"
   },
   {
     "id": "ref_0052",
@@ -624,7 +675,8 @@
     "aspect": 1.7778,
     "fileSize": 139509,
     "dHash": "0f0f0f07871f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0052.png"
   },
   {
     "id": "ref_0053",
@@ -636,7 +688,8 @@
     "aspect": 1.7778,
     "fileSize": 281396,
     "dHash": "1939790727174f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0053.png"
   },
   {
     "id": "ref_0054",
@@ -648,7 +701,8 @@
     "aspect": 1.7778,
     "fileSize": 529029,
     "dHash": "0f0f1b3b3b1b0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0054.png"
   },
   {
     "id": "ref_0055",
@@ -660,7 +714,8 @@
     "aspect": 1.7778,
     "fileSize": 173043,
     "dHash": "0020109e8c303010",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0055.png"
   },
   {
     "id": "ref_0056",
@@ -675,7 +730,8 @@
     "styleTags": [
       "minimal",
       "typography"
-    ]
+    ],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0056.png"
   },
   {
     "id": "ref_0057",
@@ -687,7 +743,8 @@
     "aspect": 1.7778,
     "fileSize": 1758004,
     "dHash": "63a3b3395bb32363",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0057.png"
   },
   {
     "id": "ref_0058",
@@ -699,7 +756,8 @@
     "aspect": 2.7016,
     "fileSize": 167213,
     "dHash": "b4b08cbc968e9ae1",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0058.png"
   },
   {
     "id": "ref_0059",
@@ -711,7 +769,8 @@
     "aspect": 1.7778,
     "fileSize": 427418,
     "dHash": "141d091d3d29a932",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0059.png"
   },
   {
     "id": "ref_0060",
@@ -723,7 +782,8 @@
     "aspect": 1.7778,
     "fileSize": 569070,
     "dHash": "0f17171717070f13",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0060.png"
   },
   {
     "id": "ref_0061",
@@ -735,7 +795,8 @@
     "aspect": 1.7778,
     "fileSize": 124704,
     "dHash": "0f07ccd8ec170f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0061.png"
   },
   {
     "id": "ref_0062",
@@ -747,7 +808,8 @@
     "aspect": 1.7778,
     "fileSize": 171294,
     "dHash": "0101006860000101",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0062.png"
   },
   {
     "id": "ref_0063",
@@ -759,7 +821,8 @@
     "aspect": 1.7778,
     "fileSize": 1502788,
     "dHash": "dc1e8404135b4b5d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0063.png"
   },
   {
     "id": "ref_0064",
@@ -771,7 +834,8 @@
     "aspect": 1.7778,
     "fileSize": 1729212,
     "dHash": "2a0d4d0f074d4d49",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0064.png"
   },
   {
     "id": "ref_0065",
@@ -783,7 +847,8 @@
     "aspect": 1.7778,
     "fileSize": 125606,
     "dHash": "0f0f070f0b0b458e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0065.png"
   },
   {
     "id": "ref_0066",
@@ -795,7 +860,8 @@
     "aspect": 1.7778,
     "fileSize": 269545,
     "dHash": "171f1f17339fcf0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0066.png"
   },
   {
     "id": "ref_0067",
@@ -807,7 +873,8 @@
     "aspect": 1.7778,
     "fileSize": 283111,
     "dHash": "0f0f0f0f0f0f0b0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0067.png"
   },
   {
     "id": "ref_0068",
@@ -819,7 +886,8 @@
     "aspect": 1.7778,
     "fileSize": 1553382,
     "dHash": "6351d50fc7c9796b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0068.png"
   },
   {
     "id": "ref_0069",
@@ -831,7 +899,8 @@
     "aspect": 1.7778,
     "fileSize": 3806526,
     "dHash": "8f1e9c1c1e1a1a8b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0069.png"
   },
   {
     "id": "ref_0070",
@@ -843,7 +912,8 @@
     "aspect": 1.7778,
     "fileSize": 43851,
     "dHash": "22146f7f7f370000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0070.png"
   },
   {
     "id": "ref_0071",
@@ -855,7 +925,8 @@
     "aspect": 1.7778,
     "fileSize": 1074862,
     "dHash": "0f0f071717170f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0071.png"
   },
   {
     "id": "ref_0072",
@@ -867,7 +938,8 @@
     "aspect": 1.7778,
     "fileSize": 82609,
     "dHash": "0786aa6962a2860f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0072.png"
   },
   {
     "id": "ref_0073",
@@ -879,7 +951,8 @@
     "aspect": 1.7778,
     "fileSize": 63301,
     "dHash": "0f0f0f5f17571f1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0073.png"
   },
   {
     "id": "ref_0074",
@@ -891,7 +964,8 @@
     "aspect": 1.7778,
     "fileSize": 133208,
     "dHash": "0f1901074f6f7f5f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0074.png"
   },
   {
     "id": "ref_0075",
@@ -903,7 +977,8 @@
     "aspect": 1.7778,
     "fileSize": 835732,
     "dHash": "0f17172b33070f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0075.png"
   },
   {
     "id": "ref_0076",
@@ -915,7 +990,8 @@
     "aspect": 1.7778,
     "fileSize": 477754,
     "dHash": "d3d3c9c8b6ae6e34",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0076.png"
   },
   {
     "id": "ref_0077",
@@ -927,7 +1003,8 @@
     "aspect": 1.7778,
     "fileSize": 611387,
     "dHash": "0f0f0f0f0f0f070f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0077.png"
   },
   {
     "id": "ref_0078",
@@ -939,7 +1016,8 @@
     "aspect": 1.7778,
     "fileSize": 450339,
     "dHash": "1560e0d4ece8ae1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0078.png"
   },
   {
     "id": "ref_0079",
@@ -951,7 +1029,8 @@
     "aspect": 1.7778,
     "fileSize": 1204475,
     "dHash": "0f0f1f0f0f9f1f5f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0079.png"
   },
   {
     "id": "ref_0080",
@@ -963,7 +1042,8 @@
     "aspect": 1.7778,
     "fileSize": 430831,
     "dHash": "0f0f4dd4c4cc0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0080.png"
   },
   {
     "id": "ref_0081",
@@ -975,7 +1055,8 @@
     "aspect": 1.7778,
     "fileSize": 1457665,
     "dHash": "057906061e1a440a",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0081.png"
   },
   {
     "id": "ref_0082",
@@ -987,7 +1068,8 @@
     "aspect": 1.768,
     "fileSize": 513139,
     "dHash": "13175757553430b1",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0082.png"
   },
   {
     "id": "ref_0083",
@@ -999,7 +1081,8 @@
     "aspect": 1.768,
     "fileSize": 439489,
     "dHash": "ddb3237755f8f0b8",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0083.png"
   },
   {
     "id": "ref_0084",
@@ -1011,7 +1094,8 @@
     "aspect": 1.7778,
     "fileSize": 751754,
     "dHash": "4cd6220e0ea0c44c",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0084.png"
   },
   {
     "id": "ref_0085",
@@ -1023,7 +1107,8 @@
     "aspect": 1.7778,
     "fileSize": 1328102,
     "dHash": "2f27250c0c8d2796",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0085.png"
   },
   {
     "id": "ref_0086",
@@ -1035,7 +1120,8 @@
     "aspect": 1.7778,
     "fileSize": 260886,
     "dHash": "171733321c371333",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0086.png"
   },
   {
     "id": "ref_0087",
@@ -1047,7 +1133,8 @@
     "aspect": 1.7778,
     "fileSize": 477949,
     "dHash": "371e0e0f0f0f0f0b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0087.png"
   },
   {
     "id": "ref_0088",
@@ -1059,7 +1146,8 @@
     "aspect": 0.64,
     "fileSize": 1939418,
     "dHash": "0958f0c600221000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0088.png"
   },
   {
     "id": "ref_0089",
@@ -1071,7 +1159,8 @@
     "aspect": 1.7778,
     "fileSize": 991736,
     "dHash": "4848f0f1e9a6c694",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0089.png"
   },
   {
     "id": "ref_0090",
@@ -1083,7 +1172,8 @@
     "aspect": 1.7778,
     "fileSize": 562363,
     "dHash": "0f2f073337170f0b",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0090.png"
   },
   {
     "id": "ref_0091",
@@ -1095,7 +1185,8 @@
     "aspect": 1.7778,
     "fileSize": 4958568,
     "dHash": "070f8f6d0f0f0f8f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0091.png"
   },
   {
     "id": "ref_0092",
@@ -1107,7 +1198,8 @@
     "aspect": 1.7778,
     "fileSize": 198269,
     "dHash": "294e9687961e3923",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0092.png"
   },
   {
     "id": "ref_0093",
@@ -1119,7 +1211,8 @@
     "aspect": 2.8235,
     "fileSize": 53267,
     "dHash": "1f1f0f0f0f0f0f1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0093.png"
   },
   {
     "id": "ref_0094",
@@ -1131,7 +1224,8 @@
     "aspect": 1.768,
     "fileSize": 497298,
     "dHash": "cacaca92dcea8c98",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0094.png"
   },
   {
     "id": "ref_0095",
@@ -1143,7 +1237,8 @@
     "aspect": 1.768,
     "fileSize": 7196404,
     "dHash": "b2b271e8e87172b2",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0095.png"
   },
   {
     "id": "ref_0096",
@@ -1155,7 +1250,8 @@
     "aspect": 1.7778,
     "fileSize": 409662,
     "dHash": "0f0f0f0f0f0f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0096.png"
   },
   {
     "id": "ref_0097",
@@ -1167,7 +1263,8 @@
     "aspect": 1.768,
     "fileSize": 282897,
     "dHash": "1b9a9e9e2bae2c6c",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0097.png"
   },
   {
     "id": "ref_0098",
@@ -1179,7 +1276,8 @@
     "aspect": 1.7778,
     "fileSize": 1309796,
     "dHash": "d7539696e47736ee",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0098.png"
   },
   {
     "id": "ref_0099",
@@ -1191,7 +1289,8 @@
     "aspect": 0.6469,
     "fileSize": 8493291,
     "dHash": "1101262323373303",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0099.png"
   },
   {
     "id": "ref_0100",
@@ -1203,7 +1302,8 @@
     "aspect": 1.7778,
     "fileSize": 4169525,
     "dHash": "1307070b5b0b0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0100.png"
   },
   {
     "id": "ref_0101",
@@ -1215,7 +1315,8 @@
     "aspect": 1.7794,
     "fileSize": 46644,
     "dHash": "0f0f0f0f0f0f4d0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0101.png"
   },
   {
     "id": "ref_0102",
@@ -1230,7 +1331,8 @@
     "styleTags": [
       "minimal",
       "typography"
-    ]
+    ],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0102.png"
   },
   {
     "id": "ref_0103",
@@ -1242,7 +1344,8 @@
     "aspect": 1.7778,
     "fileSize": 418586,
     "dHash": "8f9b970f0f8f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0103.png"
   },
   {
     "id": "ref_0104",
@@ -1254,7 +1357,8 @@
     "aspect": 2.5714,
     "fileSize": 186165,
     "dHash": "3f2d0f33370f0b0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0104.png"
   },
   {
     "id": "ref_0105",
@@ -1266,7 +1370,8 @@
     "aspect": 1.7778,
     "fileSize": 466228,
     "dHash": "0e0c2c0f0f0c1f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0105.png"
   },
   {
     "id": "ref_0106",
@@ -1278,7 +1383,8 @@
     "aspect": 1.7778,
     "fileSize": 7539578,
     "dHash": "80a6e8e0e4cae023",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0106.png"
   },
   {
     "id": "ref_0107",
@@ -1290,7 +1396,8 @@
     "aspect": 1.7778,
     "fileSize": 211419,
     "dHash": "06864d6d6f0f0707",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0107.png"
   },
   {
     "id": "ref_0108",
@@ -1302,7 +1409,8 @@
     "aspect": 1.7778,
     "fileSize": 1706309,
     "dHash": "0f0f0f4d4d0f0f35",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0108.png"
   },
   {
     "id": "ref_0109",
@@ -1314,7 +1422,8 @@
     "aspect": 1.7778,
     "fileSize": 1117541,
     "dHash": "05a0573525354800",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0109.png"
   },
   {
     "id": "ref_0110",
@@ -1326,7 +1435,8 @@
     "aspect": 2.5714,
     "fileSize": 115413,
     "dHash": "0f1f1f1f4f4f5f1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0110.png"
   },
   {
     "id": "ref_0111",
@@ -1338,7 +1448,8 @@
     "aspect": 1.7778,
     "fileSize": 157319,
     "dHash": "1f0f2f2f0f0f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0111.png"
   },
   {
     "id": "ref_0112",
@@ -1350,7 +1461,8 @@
     "aspect": 1.7778,
     "fileSize": 510271,
     "dHash": "39783135337472f2",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0112.png"
   },
   {
     "id": "ref_0113",
@@ -1362,7 +1474,8 @@
     "aspect": 1.7778,
     "fileSize": 166648,
     "dHash": "69ccc4c4d4606971",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0113.png"
   },
   {
     "id": "ref_0114",
@@ -1374,7 +1487,8 @@
     "aspect": 1.7778,
     "fileSize": 540944,
     "dHash": "010d0d0d0b0d0d84",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0114.png"
   },
   {
     "id": "ref_0115",
@@ -1386,7 +1500,8 @@
     "aspect": 1.7778,
     "fileSize": 84712,
     "dHash": "002408cce4880000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0115.png"
   },
   {
     "id": "ref_0116",
@@ -1398,7 +1513,8 @@
     "aspect": 1.7778,
     "fileSize": 485011,
     "dHash": "0643232303272f23",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0116.png"
   },
   {
     "id": "ref_0117",
@@ -1410,7 +1526,8 @@
     "aspect": 1.7574,
     "fileSize": 237683,
     "dHash": "0307072703030503",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0117.png"
   },
   {
     "id": "ref_0118",
@@ -1422,7 +1539,8 @@
     "aspect": 1.7778,
     "fileSize": 383167,
     "dHash": "0f73d9d0d0517317",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0118.png"
   },
   {
     "id": "ref_0119",
@@ -1434,7 +1552,8 @@
     "aspect": 1.7778,
     "fileSize": 102611,
     "dHash": "13151d49171e1f1f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0119.png"
   },
   {
     "id": "ref_0120",
@@ -1446,7 +1565,8 @@
     "aspect": 1.7778,
     "fileSize": 1109605,
     "dHash": "3f3f0f2f0f0f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0120.png"
   },
   {
     "id": "ref_0121",
@@ -1458,7 +1578,8 @@
     "aspect": 1.7778,
     "fileSize": 878073,
     "dHash": "0f0f0f0f0f0f0f17",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0121.png"
   },
   {
     "id": "ref_0122",
@@ -1470,7 +1591,8 @@
     "aspect": 1.7778,
     "fileSize": 505929,
     "dHash": "173331694c4d0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0122.png"
   },
   {
     "id": "ref_0123",
@@ -1482,7 +1604,8 @@
     "aspect": 1.7778,
     "fileSize": 61644,
     "dHash": "2806070f07660706",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0123.png"
   },
   {
     "id": "ref_0124",
@@ -1494,7 +1617,8 @@
     "aspect": 1.7778,
     "fileSize": 1934802,
     "dHash": "12333939333b8c8e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0124.png"
   },
   {
     "id": "ref_0125",
@@ -1506,7 +1630,8 @@
     "aspect": 0.6469,
     "fileSize": 4630881,
     "dHash": "0f0f0f0f2537183d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0125.png"
   },
   {
     "id": "ref_0126",
@@ -1518,7 +1643,8 @@
     "aspect": 2.5714,
     "fileSize": 110391,
     "dHash": "878e8ececc973726",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0126.png"
   },
   {
     "id": "ref_0127",
@@ -1530,7 +1656,8 @@
     "aspect": 1.7778,
     "fileSize": 290827,
     "dHash": "0080110606e40000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0127.png"
   },
   {
     "id": "ref_0128",
@@ -1542,7 +1669,8 @@
     "aspect": 1.7778,
     "fileSize": 953915,
     "dHash": "0727372323370707",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0128.png"
   },
   {
     "id": "ref_0129",
@@ -1554,7 +1682,8 @@
     "aspect": 1.7778,
     "fileSize": 978949,
     "dHash": "1733331313696929",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0129.png"
   },
   {
     "id": "ref_0130",
@@ -1566,7 +1695,8 @@
     "aspect": 1.7778,
     "fileSize": 620842,
     "dHash": "f6e3e1921331b95a",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0130.png"
   },
   {
     "id": "ref_0131",
@@ -1578,7 +1708,8 @@
     "aspect": 1.7778,
     "fileSize": 455447,
     "dHash": "0f0f070f070f070f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0131.png"
   },
   {
     "id": "ref_0132",
@@ -1590,7 +1721,8 @@
     "aspect": 1.7778,
     "fileSize": 895424,
     "dHash": "0f0f0f2b170f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0132.png"
   },
   {
     "id": "ref_0133",
@@ -1602,7 +1734,8 @@
     "aspect": 1.7778,
     "fileSize": 531771,
     "dHash": "158e2e233b0b9753",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0133.png"
   },
   {
     "id": "ref_0134",
@@ -1614,7 +1747,8 @@
     "aspect": 1.7778,
     "fileSize": 513633,
     "dHash": "558e073b4f4f27a4",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0134.png"
   },
   {
     "id": "ref_0135",
@@ -1626,7 +1760,8 @@
     "aspect": 1.7778,
     "fileSize": 656317,
     "dHash": "e9cece2e242c2e3d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0135.png"
   },
   {
     "id": "ref_0136",
@@ -1638,7 +1773,8 @@
     "aspect": 2.6866,
     "fileSize": 178938,
     "dHash": "d8cd4544444ece0e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0136.png"
   },
   {
     "id": "ref_0137",
@@ -1650,7 +1786,8 @@
     "aspect": 1.7778,
     "fileSize": 624589,
     "dHash": "45c1c4c969850909",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0137.png"
   },
   {
     "id": "ref_0138",
@@ -1662,7 +1799,8 @@
     "aspect": 1.7778,
     "fileSize": 280828,
     "dHash": "054a4ae8d2d646d6",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0138.png"
   },
   {
     "id": "ref_0139",
@@ -1674,7 +1812,8 @@
     "aspect": 1.7778,
     "fileSize": 491154,
     "dHash": "083030e8f0b2b2b2",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0139.png"
   },
   {
     "id": "ref_0140",
@@ -1686,7 +1825,8 @@
     "aspect": 0.6469,
     "fileSize": 6577997,
     "dHash": "030f0f070f0f0e96",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0140.png"
   },
   {
     "id": "ref_0141",
@@ -1698,7 +1838,8 @@
     "aspect": 1.7531,
     "fileSize": 872335,
     "dHash": "4301032b0f550000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0141.png"
   },
   {
     "id": "ref_0142",
@@ -1710,7 +1851,8 @@
     "aspect": 1.7778,
     "fileSize": 429537,
     "dHash": "8e8e330f0e0e0e0c",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0142.png"
   },
   {
     "id": "ref_0143",
@@ -1722,7 +1864,8 @@
     "aspect": 1.7778,
     "fileSize": 44374,
     "dHash": "2300333737130002",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0143.png"
   },
   {
     "id": "ref_0144",
@@ -1734,7 +1877,8 @@
     "aspect": 1.7778,
     "fileSize": 521947,
     "dHash": "0f07155b670761e9",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0144.png"
   },
   {
     "id": "ref_0145",
@@ -1746,7 +1890,8 @@
     "aspect": 1.7778,
     "fileSize": 599994,
     "dHash": "376747171b1d1c6d",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0145.png"
   },
   {
     "id": "ref_0146",
@@ -1758,7 +1903,8 @@
     "aspect": 1.7778,
     "fileSize": 571765,
     "dHash": "80809040c0800100",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0146.png"
   },
   {
     "id": "ref_0147",
@@ -1770,7 +1916,8 @@
     "aspect": 1.3333,
     "fileSize": 766453,
     "dHash": "060e8d4b278797a7",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0147.png"
   },
   {
     "id": "ref_0148",
@@ -1782,7 +1929,8 @@
     "aspect": 1.7794,
     "fileSize": 60196,
     "dHash": "ef1f336133334c14",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0148.png"
   },
   {
     "id": "ref_0149",
@@ -1797,7 +1945,8 @@
     "styleTags": [
       "minimal",
       "typography"
-    ]
+    ],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0149.png"
   },
   {
     "id": "ref_0150",
@@ -1809,7 +1958,8 @@
     "aspect": 1.7778,
     "fileSize": 1457442,
     "dHash": "0892296949b21b84",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0150.png"
   },
   {
     "id": "ref_0151",
@@ -1821,7 +1971,8 @@
     "aspect": 1.7778,
     "fileSize": 203470,
     "dHash": "0f0f1b370f371757",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0151.png"
   },
   {
     "id": "ref_0152",
@@ -1833,7 +1984,8 @@
     "aspect": 1.7778,
     "fileSize": 185100,
     "dHash": "9b94b5b52fe5ef2e",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0152.png"
   },
   {
     "id": "ref_0153",
@@ -1845,7 +1997,8 @@
     "aspect": 1.7778,
     "fileSize": 188886,
     "dHash": "3e8e212f2f2fd206",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0153.png"
   },
   {
     "id": "ref_0154",
@@ -1857,7 +2010,8 @@
     "aspect": 1.7778,
     "fileSize": 98502,
     "dHash": "0f0f1f1f170f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0154.png"
   },
   {
     "id": "ref_0155",
@@ -1869,7 +2023,8 @@
     "aspect": 1.7778,
     "fileSize": 132010,
     "dHash": "1200333333330020",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0155.png"
   },
   {
     "id": "ref_0156",
@@ -1881,7 +2036,8 @@
     "aspect": 1.7778,
     "fileSize": 92780,
     "dHash": "10423c3838144000",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0156.png"
   },
   {
     "id": "ref_0157",
@@ -1893,7 +2049,8 @@
     "aspect": 1.7531,
     "fileSize": 192652,
     "dHash": "b68dcd8f8f8f0f0f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0157.png"
   },
   {
     "id": "ref_0158",
@@ -1905,7 +2062,8 @@
     "aspect": 1.7778,
     "fileSize": 368945,
     "dHash": "01002109052a2004",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0158.png"
   },
   {
     "id": "ref_0159",
@@ -1917,7 +2075,8 @@
     "aspect": 1.7778,
     "fileSize": 1516787,
     "dHash": "0f0f8c0ccc0f0f8f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0159.png"
   },
   {
     "id": "ref_0160",
@@ -1929,7 +2088,8 @@
     "aspect": 0.7681,
     "fileSize": 16718805,
     "dHash": "0e01d0c003070733",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0160.png"
   },
   {
     "id": "ref_0161",
@@ -1941,6 +2101,7 @@
     "aspect": 1.7778,
     "fileSize": 1095391,
     "dHash": "0321d106ccd1130f",
-    "styleTags": []
+    "styleTags": [],
+    "styleAnchorPath": "/reference_library/style_anchors/ref_0161.png"
   }
 ]
