@@ -4374,7 +4374,7 @@ async function imageHasReadableText(image: Buffer): Promise<boolean> {
   }
 
   if (!process.env.OPENAI_API_KEY?.trim()) {
-    return false;
+    return true;
   }
 
   try {
@@ -4386,22 +4386,32 @@ async function imageHasReadableText(image: Buffer): Promise<boolean> {
           content: [
             {
               type: "input_text",
-              text: 'Detect readable text in this image. Return JSON only: {"hasText": true|false}.'
+              text: "Return hasText=true if ANY letters/words are visible even faintly or partially."
             },
             {
               type: "input_image",
               image_url: `data:image/png;base64,${image.toString("base64")}`,
-              detail: "low"
+              detail: "high"
             }
           ]
         }
       ]
     });
 
-    const parsed = parseJsonObject(parseResponseText(response));
-    return parsed?.hasText === true;
+    const responseText = parseResponseText(response);
+    const parsed = parseJsonObject(responseText);
+    if (parsed && typeof parsed.hasText === "boolean") {
+      return parsed.hasText;
+    }
+    if (/hasText\s*[:=]\s*true/i.test(responseText)) {
+      return true;
+    }
+    if (/hasText\s*[:=]\s*false/i.test(responseText)) {
+      return false;
+    }
+    return true;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -5846,7 +5856,8 @@ async function generateCleanMinimalBackgroundPng(params: {
 
 const NO_TEXT_RETRY_BOOSTS = [
   "Hard requirement: absolutely no letterforms. If any characters appear, regenerate a fully abstract scene.",
-  "CRITICAL NO-TEXT RETRY: zero readable text, zero glyphs, zero typographic marks. Produce pure image textures and shapes only."
+  "CRITICAL NO-TEXT RETRY: zero readable text, zero glyphs, zero typographic marks. Produce pure image textures and shapes only.",
+  "Remove ALL letterforms; replace with texture."
 ] as const;
 const TEXT_ARTIFACT_RETRY_OVERRIDE =
   "TEXT REMOVAL RETRY OVERRIDE: remove all typography artifacts; regenerate as pure background only; no letters/words at all.";
@@ -5873,7 +5884,7 @@ async function generateValidatedBackgroundPng(params: {
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
 
-  for (let attempt = 0; attempt <= 2; attempt += 1) {
+  for (let attempt = 0; attempt <= NO_TEXT_RETRY_BOOSTS.length; attempt += 1) {
     const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[attempt - 1];
     const prompt = buildTemplateBackgroundPrompt({
       brief: params.brief,
@@ -5917,7 +5928,7 @@ async function generateValidatedBackgroundPng(params: {
   return {
     backgroundPng: lastBackgroundPng as Buffer,
     prompt: lastPrompt,
-    textRetryCount: 2,
+    textRetryCount: NO_TEXT_RETRY_BOOSTS.length,
     textCheckPassed: false
   };
 }
@@ -6392,6 +6403,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             OPTION_MASTER_BACKGROUND_SHAPE,
             resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE)
           );
+          const hasText = await imageHasReadableText(backgroundPng);
           const hash = await computeDHashFromBuffer(backgroundPng);
           return {
             prompt: `reused background from generation ${reusableAssets.sourceGenerationId}`,
@@ -6404,7 +6416,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             toneCheck: null as ToneCheckSummary | null,
             textArtifactRetryCount: 0,
             backgroundTextCheck: null as BackgroundTextCheckSummary | null,
-            textCheckPassed: true,
+            textCheckPassed: !hasText,
             variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
           };
         }
@@ -6660,6 +6672,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             winnerIndex: 0,
             bestScore: Number.POSITIVE_INFINITY,
             laneFailed: false,
+            hardFailReadableText: false,
             candidates: [] as BackgroundRerankCandidateDebug[],
             winner: null as BackgroundRerankWinnerDebug | null,
             winnerDirectionSpec:
@@ -6763,8 +6776,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           )
         );
 
-        const eligible = candidates
-          .map((candidate, index) => ({ candidate, index }))
+        const indexedCandidates = candidates.map((candidate, index) => ({ candidate, index }));
+        const noReadableTextCandidates = indexedCandidates.filter((entry) => entry.candidate.attempt.textCheckPassed);
+        const eligible = noReadableTextCandidates
           .filter(
             (entry) =>
               entry.candidate.checks.textFree &&
@@ -6773,16 +6787,20 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               entry.candidate.checks.meaningfulStructurePass &&
               !entry.candidate.checks.hardFailBlankDesign
           );
-        const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
-        const winner = pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0]);
-        const bestScore = winner.candidate.score;
-        const laneFailed = eligible.length <= 0 || bestScore < ROUND1_RERANK_MIN_ACCEPTABLE_SCORE;
+        const pool = eligible.length > 0 ? eligible : noReadableTextCandidates;
+        const winner = pool.length
+          ? pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0])
+          : null;
+        const bestScore = winner?.candidate.score ?? Number.NEGATIVE_INFINITY;
+        const hardFailReadableText = pool.length <= 0;
+        const laneFailed = hardFailReadableText || eligible.length <= 0 || bestScore < ROUND1_RERANK_MIN_ACCEPTABLE_SCORE;
 
         return {
-          attempt: winner.candidate.attempt,
-          winnerIndex: winner.index,
+          attempt: winner?.candidate.attempt || candidates[0].attempt,
+          winnerIndex: winner?.index || 0,
           bestScore,
           laneFailed,
+          hardFailReadableText,
           candidates: candidates.map((candidate) => ({
             url: candidate.debugUrl,
             stage: params.stage,
@@ -6804,17 +6822,23 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               hardFail: candidate.stats.hardFail
             }
           })),
-          winner: {
-            index: winner.index,
-            url: winner.candidate.debugUrl,
-            stage: params.stage,
-            attempt: params.attemptNumber,
-            styleFamily: styleFields.styleFamily,
-            explorationSetKey: styleFields.explorationSetKey,
-            variationTemplateKey: winner.candidate.variationTemplateKey,
-            score: winner.candidate.score
-          },
-          winnerDirectionSpec: winner.candidate.directionSpecUsed
+          winner: winner
+            ? {
+                index: winner.index,
+                url: winner.candidate.debugUrl,
+                stage: params.stage,
+                attempt: params.attemptNumber,
+                styleFamily: styleFields.styleFamily,
+                explorationSetKey: styleFields.explorationSetKey,
+                variationTemplateKey: winner.candidate.variationTemplateKey,
+                score: winner.candidate.score
+              }
+            : null,
+          winnerDirectionSpec: winner
+            ? winner.candidate.directionSpecUsed
+            : params.directionSpecOverride === undefined
+              ? backgroundDirectionSpec
+              : (params.directionSpecOverride ?? null)
         };
       };
 
@@ -6840,13 +6864,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const appendAttempt = (result: Awaited<ReturnType<typeof runBackgroundRerankAttempt>>) => {
           const startIndex = aggregatedCandidates.length;
           aggregatedCandidates.push(...result.candidates);
-          globalWinnerIndex = startIndex + result.winnerIndex;
-          winner = result.winner
-            ? {
-                ...result.winner,
-                index: globalWinnerIndex
-              }
-            : null;
+          if (result.winner) {
+            globalWinnerIndex = startIndex + result.winnerIndex;
+            winner = {
+              ...result.winner,
+              index: globalWinnerIndex
+            };
+          }
         };
 
         let activeDirectionSpec = backgroundDirectionSpec;
@@ -6948,6 +6972,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         }
 
+        if (selection.hardFailReadableText || !selection.attempt.textCheckPassed) {
+          throw new Error(
+            `Strict text rejection: all rerank candidates contained readable text for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}.`
+          );
+        }
+
         backgroundDirectionSpec = selection.winnerDirectionSpec || activeDirectionSpec;
         if (!shouldReuseBackground) {
           const finalStyleFields = resolveDirectionStyleFields(backgroundDirectionSpec);
@@ -6983,6 +7013,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
         );
         masterAttempt = originalityMasterSelection.attempt;
+      }
+      if (!masterAttempt.textCheckPassed) {
+        throw new Error(
+          `Strict text rejection: selected background contains readable text for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}.`
+        );
       }
       const selectedVariationTemplateKey =
         backgroundDirectionSpec?.variationTemplateKey || directionSpec?.variationTemplateKey || null;
