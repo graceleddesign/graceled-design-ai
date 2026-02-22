@@ -4,6 +4,8 @@ import { isGenericMotif } from "@/lib/motif-guardrails";
 import type { CuratedReference, ReferenceCluster, ReferenceTier } from "@/lib/referenceCuration";
 import {
   getRound1ClusterProfile,
+  getRound1VariationTemplateByKey,
+  listRound1VariationTemplates,
   pickRound1ReferenceTriplet,
   pickRound1VariationTemplateKey
 } from "@/lib/referenceSelector";
@@ -40,6 +42,7 @@ export type BackgroundMode =
 export type TypeProfile = "condensed_sans" | "humanist_sans" | "mono_sans" | "display_serif" | "high_contrast_serif";
 
 export type OrnamentProfile = "none" | "anchored_rule" | "grain" | "wheat" | "frame_bold";
+export type TitleIntegrationMode = "OVERLAY_GLASS" | "CUTOUT_MASK" | "GRID_LOCKUP" | "TYPE_AS_TEXTURE";
 
 export type DirectionTags = {
   laneFamily: DirectionLaneFamily;
@@ -62,6 +65,7 @@ export type PlannedDirectionSpec = DirectionTemplate & {
   optionLabel: "A" | "B" | "C";
   wantsSeriesMark: boolean;
   wantsTitleStage: boolean;
+  titleIntegrationMode?: TitleIntegrationMode;
   explorationSetKey?: string;
   explorationLaneKey?: string;
   styleFamily?: StyleFamilyKey;
@@ -386,6 +390,7 @@ type Round1ReferenceAssignment = {
   referenceCluster: ReferenceCluster;
   referenceTier: ReferenceTier;
   variationTemplateKey?: string;
+  titleIntegrationMode?: TitleIntegrationMode;
   referenceToneHint?: StyleToneKey;
   referenceMediumHint?: StyleMediumKey;
   lockupLayoutFamily?: string;
@@ -1884,6 +1889,168 @@ function pickRound1LockupPresetId(params: {
   return selected;
 }
 
+const ROUND1_TITLE_INTEGRATION_MODES: readonly TitleIntegrationMode[] = [
+  "OVERLAY_GLASS",
+  "CUTOUT_MASK",
+  "GRID_LOCKUP",
+  "TYPE_AS_TEXTURE"
+];
+
+function pickRound1TitleIntegrationMode(params: {
+  runSeed: string;
+  optionIndex: number;
+  referenceId: string;
+  usedTitleIntegrationModes: Set<TitleIntegrationMode>;
+}): TitleIntegrationMode {
+  const ordered = [...ROUND1_TITLE_INTEGRATION_MODES].sort((a, b) => {
+    const aHash = hashToSeed(
+      `${params.runSeed}|option-${params.optionIndex}|reference-${params.referenceId}|title-integration|${a}`
+    );
+    const bHash = hashToSeed(
+      `${params.runSeed}|option-${params.optionIndex}|reference-${params.referenceId}|title-integration|${b}`
+    );
+    return aHash - bHash;
+  });
+  const unused = ordered.find((mode) => !params.usedTitleIntegrationModes.has(mode));
+  const selected = unused || ordered[0] || "OVERLAY_GLASS";
+  params.usedTitleIntegrationModes.add(selected);
+  return selected;
+}
+
+function normalizeMotifPool(motifs?: readonly string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of motifs || []) {
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = normalizeMotifKey(trimmed);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function pickRound2BackgroundVariationTemplateKey(params: {
+  runSeed: string;
+  primaryDirection: PlannedDirectionSpec;
+}): string | undefined {
+  const currentKey = params.primaryDirection.variationTemplateKey?.trim() || "";
+  const currentTemplate = currentKey ? getRound1VariationTemplateByKey(currentKey) : null;
+  const cluster =
+    params.primaryDirection.referenceCluster ||
+    (currentTemplate?.cluster && currentTemplate.cluster !== "other" ? currentTemplate.cluster : null);
+  const templatePool = cluster ? getRound1ClusterProfile(cluster).variationTemplates : listRound1VariationTemplates();
+  if (templatePool.length <= 0) {
+    return currentKey || undefined;
+  }
+
+  const ordered = [...templatePool].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|background-variation|${cluster || "global"}|${a.key}`);
+    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|background-variation|${cluster || "global"}|${b.key}`);
+    return aHash - bHash;
+  });
+  const alternative = ordered.find((template) => template.key !== currentKey);
+  return (alternative || ordered[0])?.key || currentKey || undefined;
+}
+
+function pickRound2TitleIntegrationModeVariation(params: {
+  runSeed: string;
+  primaryDirection: PlannedDirectionSpec;
+}): TitleIntegrationMode | undefined {
+  const currentMode = params.primaryDirection.titleIntegrationMode;
+  const ordered = [...ROUND1_TITLE_INTEGRATION_MODES].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|title-mode|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|title-mode|${b}`);
+    return aHash - bHash;
+  });
+  const alternative = ordered.find((mode) => mode !== currentMode);
+  return alternative || currentMode || ordered[0];
+}
+
+function pickRound2MotifFocusVariation(params: {
+  runSeed: string;
+  primaryDirection: PlannedDirectionSpec;
+  motifPool?: readonly string[];
+}): string[] {
+  const currentFocus = normalizeMotifPool(params.primaryDirection.motifFocus).slice(0, 2);
+  const pool = normalizeMotifPool([...(params.motifPool || []), ...currentFocus]);
+
+  if (currentFocus.length >= 2) {
+    return [currentFocus[1], currentFocus[0]];
+  }
+
+  if (currentFocus.length === 1) {
+    const primary = currentFocus[0];
+    const alternative = pool.find((motif) => normalizeMotifKey(motif) !== normalizeMotifKey(primary));
+    return alternative ? [alternative, primary] : [primary];
+  }
+
+  if (pool.length <= 0) {
+    return [];
+  }
+
+  const orderedPool = [...pool].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|motif-emphasis|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|motif-emphasis|${b}`);
+    return aHash - bHash;
+  });
+  return orderedPool.slice(0, 2);
+}
+
+export function planRoundTwoRefinementSet(params: {
+  runSeed: string;
+  primaryDirection: PlannedDirectionSpec;
+  motifPool?: readonly string[];
+  optionCount?: number;
+}): PlannedDirectionSpec[] {
+  const count = Math.max(1, Math.min(params.optionCount || 3, 3));
+  const baseDirection: PlannedDirectionSpec = {
+    ...params.primaryDirection,
+    optionIndex: 0,
+    optionLabel: "A",
+    motifFocus: normalizeMotifPool(params.primaryDirection.motifFocus).slice(0, 2)
+  };
+
+  const optionA: PlannedDirectionSpec = {
+    ...baseDirection,
+    variationTemplateKey: pickRound2BackgroundVariationTemplateKey({
+      runSeed: params.runSeed,
+      primaryDirection: baseDirection
+    })
+  };
+
+  const optionB: PlannedDirectionSpec = {
+    ...baseDirection,
+    titleIntegrationMode: pickRound2TitleIntegrationModeVariation({
+      runSeed: params.runSeed,
+      primaryDirection: baseDirection
+    })
+  };
+
+  const optionC: PlannedDirectionSpec = {
+    ...baseDirection,
+    motifFocus: pickRound2MotifFocusVariation({
+      runSeed: params.runSeed,
+      primaryDirection: baseDirection,
+      motifPool: params.motifPool
+    })
+  };
+
+  return [optionA, optionB, optionC].slice(0, count).map((spec, optionIndex) => ({
+    ...spec,
+    optionIndex,
+    optionLabel: optionLabel(optionIndex)
+  }));
+}
+
 function buildRound1ReferenceAssignments(params: {
   runSeed: string;
   optionCount: number;
@@ -1956,6 +2123,7 @@ function buildRound1ReferenceAssignments(params: {
 
   const usedTemplateKeys = new Set<string>();
   const usedLockupPresetIds = new Set<string>();
+  const usedTitleIntegrationModes = new Set<TitleIntegrationMode>();
 
   return Array.from({ length: params.optionCount }, (_, optionIndex) => {
     const reference = optionReferenceSequence[optionIndex];
@@ -1985,12 +2153,19 @@ function buildRound1ReferenceAssignments(params: {
       fallbackLockupPresetId,
       usedLockupPresetIds
     });
+    const titleIntegrationMode = pickRound1TitleIntegrationMode({
+      runSeed: params.runSeed,
+      optionIndex,
+      referenceId: reference.id,
+      usedTitleIntegrationModes
+    });
 
     return {
       referenceId: reference.id,
       referenceCluster: reference.cluster,
       referenceTier: reference.tier,
       variationTemplateKey: variationTemplateKey || undefined,
+      titleIntegrationMode,
       referenceToneHint: profile.toneHints[0],
       referenceMediumHint: profile.mediumHints[0],
       lockupLayoutFamily: profile.lockupLayoutFamily,
@@ -2302,6 +2477,7 @@ export function planDirectionSet(params: {
     referenceCluster: referenceAssignment?.referenceCluster,
     referenceTier: referenceAssignment?.referenceTier,
     variationTemplateKey: referenceAssignment?.variationTemplateKey,
+    titleIntegrationMode: referenceAssignment?.titleIntegrationMode,
     referenceToneHint: referenceAssignment?.referenceToneHint,
     referenceMediumHint: referenceAssignment?.referenceMediumHint,
     lockupLayoutFamily: referenceAssignment?.lockupLayoutFamily

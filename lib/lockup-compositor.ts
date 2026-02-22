@@ -19,7 +19,7 @@ const LIGHT_BACKGROUND_LUMINANCE_THRESHOLD = 0.6;
 const DARK_BACKGROUND_LUMINANCE_THRESHOLD = 0.4;
 const MIN_MULTIPLY_CONTRAST_FOR_STAMP = 0.06;
 
-type LockupSafeRegionRatio = {
+export type LockupSafeRegionRatio = {
   left: number;
   top: number;
   width: number;
@@ -72,8 +72,13 @@ function clamp(value: number, min: number, max: number): number {
   return value;
 }
 
-function lockupSafeRegion(shape: PreviewShape, width: number, height: number) {
-  const ratio = LOCKUP_SAFE_REGION_RATIOS[shape];
+function lockupSafeRegion(
+  shape: PreviewShape,
+  width: number,
+  height: number,
+  safeRegionOverride?: LockupSafeRegionRatio
+) {
+  const ratio = safeRegionOverride || LOCKUP_SAFE_REGION_RATIOS[shape];
   return {
     left: Math.round(width * ratio.left),
     top: Math.round(height * ratio.top),
@@ -484,8 +489,9 @@ export async function composeLockupOnBackground(params: {
   height: number;
   align?: LockupAlign;
   integrationMode?: LockupIntegrationMode;
+  safeRegionOverride?: LockupSafeRegionRatio;
 }): Promise<Buffer> {
-  const safeRegion = lockupSafeRegion(params.shape, params.width, params.height);
+  const safeRegion = lockupSafeRegion(params.shape, params.width, params.height, params.safeRegionOverride);
   const backgroundCanvas = await sharp(params.backgroundPng, { failOn: "none" })
     .ensureAlpha()
     .resize({
