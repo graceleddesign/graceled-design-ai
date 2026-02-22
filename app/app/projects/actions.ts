@@ -4572,8 +4572,8 @@ type GenerationOutputPayload = {
         referenceId: string;
         referenceCluster: string | null;
         referenceTier: string | null;
-        anchorRefSrc: string;
-        anchorThumbSrc: string;
+        backgroundAnchorSrc: string;
+        lockupAnchorSrc: string;
       };
     };
     toneCheck?: ToneCheckSummary;
@@ -4721,22 +4721,14 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     normalizedAnchorReferenceId.length > 0
       ? dedupedReferenceItems.find((reference) => normalizeReferenceId(reference.id) === normalizedAnchorReferenceId) || null
       : dedupedReferenceItems[0] || null;
+  const fallbackOriginalSrc = resolveReferenceOriginalSrc(fallbackAnchorReference);
+  const fallbackStyleAnchorSrc = resolveReferenceStyleAnchorSrc(fallbackAnchorReference);
   const referenceAnchorDebugMeta = buildReferenceAnchorDebugMeta({
     referenceId: fallbackAnchorReference?.id || directionSpec?.referenceId || null,
     referenceCluster: directionSpec?.referenceCluster || null,
     referenceTier: directionSpec?.referenceTier || null,
-    anchorRefSrc:
-      fallbackAnchorReference?.rawPath ||
-      fallbackAnchorReference?.path ||
-      fallbackAnchorReference?.normalizedPath ||
-      fallbackAnchorReference?.thumbPath ||
-      null,
-    anchorThumbSrc:
-      fallbackAnchorReference?.thumbPath ||
-      fallbackAnchorReference?.rawPath ||
-      fallbackAnchorReference?.path ||
-      fallbackAnchorReference?.normalizedPath ||
-      null,
+    backgroundAnchorSrc: fallbackStyleAnchorSrc || fallbackOriginalSrc,
+    lockupAnchorSrc: fallbackOriginalSrc || fallbackStyleAnchorSrc,
     optionIndex: params.optionIndex
   });
   const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(
@@ -5302,9 +5294,21 @@ function toReferenceThumbPublicUrl(referencePath: string): string | null {
   return `/reference_library/thumbs/${encodeURIComponent(fileName)}`;
 }
 
+function toReferenceStyleAnchorPublicUrl(referencePath: string): string | null {
+  const normalizedPath = referencePath.trim().replaceAll("\\", "/");
+  const fileName = path.posix.basename(normalizedPath);
+  if (!fileName) {
+    return null;
+  }
+  return `/reference_library/style_anchors/${encodeURIComponent(fileName)}`;
+}
+
 type ReferenceAnchorDebugMeta = NonNullable<NonNullable<GenerationOutputPayload["meta"]["debug"]>["referenceAnchor"]>;
 
-function normalizeReferencePublicUrl(referencePath: string | null | undefined, kind: "original" | "thumb"): string | null {
+function normalizeReferencePublicUrl(
+  referencePath: string | null | undefined,
+  kind: "original" | "thumb" | "style-anchor"
+): string | null {
   if (typeof referencePath !== "string") {
     return null;
   }
@@ -5318,38 +5322,70 @@ function normalizeReferencePublicUrl(referencePath: string | null | undefined, k
   if (kind === "thumb" && normalizedPath.startsWith("/reference_library/thumbs/")) {
     return normalizedPath;
   }
-  return kind === "original" ? toReferenceOriginalPublicUrl(normalizedPath) : toReferenceThumbPublicUrl(normalizedPath);
+  if (kind === "style-anchor" && normalizedPath.startsWith("/reference_library/style_anchors/")) {
+    return normalizedPath;
+  }
+  if (kind === "original") {
+    return toReferenceOriginalPublicUrl(normalizedPath);
+  }
+  if (kind === "thumb") {
+    return toReferenceThumbPublicUrl(normalizedPath);
+  }
+  return toReferenceStyleAnchorPublicUrl(normalizedPath);
+}
+
+function resolveReferenceOriginalSrc(reference: ReferenceLibraryItem | null | undefined): string | null {
+  if (!reference) {
+    return null;
+  }
+  return (
+    normalizeReferencePublicUrl(reference.rawPath, "original") ||
+    normalizeReferencePublicUrl(reference.path, "original") ||
+    normalizeReferencePublicUrl(reference.normalizedPath, "original") ||
+    normalizeReferencePublicUrl(reference.thumbPath, "original")
+  );
+}
+
+function resolveReferenceStyleAnchorSrc(reference: ReferenceLibraryItem | null | undefined): string | null {
+  if (!reference) {
+    return null;
+  }
+  return normalizeReferencePublicUrl(reference.styleAnchorPath, "style-anchor");
 }
 
 function buildReferenceAnchorDebugMeta(params: {
   referenceId: string | null | undefined;
   referenceCluster: string | null;
   referenceTier: string | null;
-  anchorRefSrc: string | null | undefined;
-  anchorThumbSrc: string | null | undefined;
+  backgroundAnchorSrc: string | null | undefined;
+  lockupAnchorSrc: string | null | undefined;
   optionIndex: number;
 }): ReferenceAnchorDebugMeta | null {
   const referenceId = typeof params.referenceId === "string" ? params.referenceId.trim() : "";
   if (!referenceId) {
     return null;
   }
-  const anchorRefSrc = normalizeReferencePublicUrl(params.anchorRefSrc, "original");
-  if (!anchorRefSrc) {
+  const backgroundAnchorSrc =
+    normalizeReferencePublicUrl(params.backgroundAnchorSrc, "style-anchor") ||
+    normalizeReferencePublicUrl(params.backgroundAnchorSrc, "original");
+  const lockupAnchorSrc =
+    normalizeReferencePublicUrl(params.lockupAnchorSrc, "original") ||
+    normalizeReferencePublicUrl(params.lockupAnchorSrc, "style-anchor");
+  if (!backgroundAnchorSrc || !lockupAnchorSrc) {
     if (process.env.NODE_ENV === "development") {
-      console.warn("[MISSING ANCHORREFSRC]", {
+      console.warn("[MISSING REFERENCE ANCHOR SOURCES]", {
         referenceId,
         optionIndex: params.optionIndex
       });
     }
     return null;
   }
-  const anchorThumbSrc = normalizeReferencePublicUrl(params.anchorThumbSrc, "thumb") || anchorRefSrc;
   return {
     referenceId,
     referenceCluster: params.referenceCluster,
     referenceTier: params.referenceTier,
-    anchorRefSrc,
-    anchorThumbSrc
+    backgroundAnchorSrc,
+    lockupAnchorSrc
   };
 }
 
@@ -5425,8 +5461,11 @@ function referenceFileCandidates(reference: ReferenceLibraryItem): string[] {
   ]);
 }
 
-async function loadReferenceDataUrl(reference: ReferenceLibraryItem): Promise<LoadedReferenceDataUrl | null> {
-  const candidates = referenceFileCandidates(reference);
+async function loadReferenceDataUrl(
+  reference: ReferenceLibraryItem,
+  preferredSourcePaths: Array<string | null | undefined> = []
+): Promise<LoadedReferenceDataUrl | null> {
+  const candidates = dedupeReferencePaths([...preferredSourcePaths, ...referenceFileCandidates(reference)]);
   for (const relativePath of candidates) {
     const mime = mimeTypeFromPath(relativePath);
     if (!mime) {
@@ -5446,8 +5485,18 @@ async function loadReferenceDataUrl(reference: ReferenceLibraryItem): Promise<Lo
   return null;
 }
 
-async function buildReferenceDataUrls(references: ReferenceLibraryItem[]): Promise<LoadedReferenceDataUrl[]> {
-  const refs = await Promise.all(references.map((reference) => loadReferenceDataUrl(reference)));
+async function buildReferenceDataUrls(
+  references: ReferenceLibraryItem[],
+  options?: {
+    preferredSourcePathsByReferenceId?: ReadonlyMap<string, ReadonlyArray<string | null | undefined>>;
+  }
+): Promise<LoadedReferenceDataUrl[]> {
+  const refs = await Promise.all(
+    references.map((reference) => {
+      const preferredSourcePaths = options?.preferredSourcePathsByReferenceId?.get(normalizeReferenceId(reference.id)) || [];
+      return loadReferenceDataUrl(reference, [...preferredSourcePaths]);
+    })
+  );
   return refs.filter((reference): reference is LoadedReferenceDataUrl => Boolean(reference));
 }
 
@@ -6254,36 +6303,53 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const references = anchorReference
         ? dedupeReferencesById([anchorReference, ...sampledReferences]).slice(0, 3)
         : sampledReferences;
-      const styleRefs = await buildReferenceDataUrls(references);
+      const anchorOriginalSrc = resolveReferenceOriginalSrc(anchorReference);
+      const anchorStyleAnchorSrc = resolveReferenceStyleAnchorSrc(anchorReference);
+      const backgroundAnchorSrc = anchorStyleAnchorSrc || anchorOriginalSrc;
+      const lockupAnchorSrc = anchorOriginalSrc || anchorStyleAnchorSrc;
+      const backgroundPreferredSourcePathsByReferenceId = new Map<string, ReadonlyArray<string | null | undefined>>();
+      if (anchorReferenceId && backgroundAnchorSrc) {
+        backgroundPreferredSourcePathsByReferenceId.set(anchorReferenceId, [backgroundAnchorSrc]);
+      }
+      const backgroundStyleRefs = await buildReferenceDataUrls(references, {
+        preferredSourcePathsByReferenceId: backgroundPreferredSourcePathsByReferenceId
+      });
+      const lockupStyleRefs = anchorReference
+        ? await (async () => {
+            const lockupPreferredSourcePathsByReferenceId = new Map<
+              string,
+              ReadonlyArray<string | null | undefined>
+            >();
+            if (anchorReferenceId && lockupAnchorSrc) {
+              lockupPreferredSourcePathsByReferenceId.set(anchorReferenceId, [lockupAnchorSrc, anchorStyleAnchorSrc]);
+            }
+            return buildReferenceDataUrls(references, {
+              preferredSourcePathsByReferenceId: lockupPreferredSourcePathsByReferenceId
+            });
+          })()
+        : backgroundStyleRefs;
       if (anchorReference) {
-        const firstStyleRef = styleRefs[0];
+        const firstStyleRef = backgroundStyleRefs[0];
         if (!firstStyleRef || normalizeReferenceId(firstStyleRef.referenceId) !== normalizeReferenceId(anchorReference.id)) {
           throw new Error(`Anchor reference ${anchorReference.id} was not resolved as style ref #1.`);
         }
       }
-      const anchorStyleRef = anchorReference ? styleRefs[0] || null : null;
-      const anchorRefSrc =
-        anchorStyleRef?.sourcePath
-          ? toReferenceOriginalPublicUrl(anchorStyleRef.sourcePath)
-          : curatedAnchorReference?.rawPath
-            ? toReferenceOriginalPublicUrl(curatedAnchorReference.rawPath)
-            : anchorReference?.rawPath
-              ? toReferenceOriginalPublicUrl(anchorReference.rawPath)
-              : null;
-      const anchorThumbSrc =
-        curatedAnchorReference?.thumbPath
-          ? toReferenceThumbPublicUrl(curatedAnchorReference.thumbPath)
-          : anchorReference?.thumbPath
-            ? toReferenceThumbPublicUrl(anchorReference.thumbPath)
-            : null;
+      const anchorBackgroundStyleRef = anchorReference ? backgroundStyleRefs[0] || null : null;
+      const anchorLockupStyleRef = anchorReference ? lockupStyleRefs[0] || null : null;
       const resolvedReferenceCluster = curatedAnchorReference?.cluster || directionSpec?.referenceCluster || null;
       const resolvedReferenceTier = curatedAnchorReference?.tier || directionSpec?.referenceTier || null;
       const referenceAnchorDebug = buildReferenceAnchorDebugMeta({
         referenceId: anchorReference?.id || directionSpec?.referenceId || null,
         referenceCluster: resolvedReferenceCluster,
         referenceTier: resolvedReferenceTier,
-        anchorRefSrc,
-        anchorThumbSrc,
+        backgroundAnchorSrc:
+          backgroundAnchorSrc ||
+          normalizeReferencePublicUrl(anchorBackgroundStyleRef?.sourcePath, "style-anchor") ||
+          normalizeReferencePublicUrl(anchorBackgroundStyleRef?.sourcePath, "original"),
+        lockupAnchorSrc:
+          lockupAnchorSrc ||
+          normalizeReferencePublicUrl(anchorLockupStyleRef?.sourcePath, "original") ||
+          normalizeReferencePublicUrl(anchorLockupStyleRef?.sourcePath, "style-anchor"),
         optionIndex: plannedGeneration.optionIndex
       });
       const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug);
@@ -6296,7 +6362,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         };
       }
-      const referenceDataUrls = styleRefs.map((reference) => reference.dataUrl);
+      const referenceDataUrls = backgroundStyleRefs.map((reference) => reference.dataUrl);
       const lockupStyleMode = resolveLockupStyleMode({
         directionSpec,
         styleFamily: optionStyleFamily,
@@ -7359,13 +7425,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         width: PREVIEW_DIMENSIONS[shape].width,
         height: PREVIEW_DIMENSIONS[shape].height
       }));
-      const usedReferenceIds = [...new Set(styleRefs.map((reference) => reference.referenceId))];
+      const usedReferenceIds = [...new Set(backgroundStyleRefs.map((reference) => reference.referenceId))];
       const debugMeta = mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug);
       if (process.env.NODE_ENV === "development") {
         console.log("[REFERENCE ANCHOR DEBUG META]", {
           optionIndex: plannedGeneration.optionIndex,
           referenceId: directionSpec?.referenceId,
-          anchorRefSrc,
+          backgroundAnchorSrc: referenceAnchorDebug?.backgroundAnchorSrc || null,
+          lockupAnchorSrc: referenceAnchorDebug?.lockupAnchorSrc || null,
           referenceAnchorDebug
         });
       }
@@ -7377,8 +7444,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         notes: "ai+split-background-lockup",
         promptUsed,
         meta: {
-          styleRefCount: styleRefs.length,
-          usedStylePaths: styleRefs.map((reference) => reference.sourcePath),
+          styleRefCount: backgroundStyleRefs.length,
+          usedStylePaths: backgroundStyleRefs.map((reference) => reference.sourcePath),
           usedReferenceIds,
           lockupValidation: {
             ok: lockupTextValidation?.valid ?? true,

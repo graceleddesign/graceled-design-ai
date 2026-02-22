@@ -38,8 +38,8 @@ type OptionDesignSpecSummary = {
   referenceId: string | null;
   referenceCluster: string | null;
   variationTemplateKey: string | null;
-  debugAnchorRefSrc: string | null;
-  debugAnchorThumbSrc: string | null;
+  debugBackgroundAnchorSrc: string | null;
+  debugLockupAnchorSrc: string | null;
 };
 
 const OPTION_TINTS = [
@@ -141,8 +141,8 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     referenceId: null,
     referenceCluster: null,
     variationTemplateKey: null,
-    debugAnchorRefSrc: null,
-    debugAnchorThumbSrc: null
+    debugBackgroundAnchorSrc: null,
+    debugLockupAnchorSrc: null
   };
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return fallback;
@@ -158,29 +158,31 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     debug && typeof debug === "object" && !Array.isArray(debug)
       ? (debug as { referenceAnchor?: unknown }).referenceAnchor
       : null;
-  const debugAnchorRefSrcCandidate =
+  const debugBackgroundAnchorSrcCandidate =
     debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
-      ? (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc
+      ? ((debugReferenceAnchor as { backgroundAnchorSrc?: unknown }).backgroundAnchorSrc ??
+        (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc)
       : null;
-  const debugAnchorThumbSrcCandidate =
+  const debugLockupAnchorSrcCandidate =
     debugReferenceAnchor && typeof debugReferenceAnchor === "object" && !Array.isArray(debugReferenceAnchor)
-      ? (debugReferenceAnchor as { anchorThumbSrc?: unknown }).anchorThumbSrc
+      ? ((debugReferenceAnchor as { lockupAnchorSrc?: unknown }).lockupAnchorSrc ??
+        (debugReferenceAnchor as { anchorRefSrc?: unknown }).anchorRefSrc)
       : null;
-  const debugAnchorRefSrc =
-    typeof debugAnchorRefSrcCandidate === "string" && debugAnchorRefSrcCandidate.trim()
-      ? debugAnchorRefSrcCandidate.trim()
+  const debugBackgroundAnchorSrc =
+    typeof debugBackgroundAnchorSrcCandidate === "string" && debugBackgroundAnchorSrcCandidate.trim()
+      ? debugBackgroundAnchorSrcCandidate.trim()
       : null;
-  const debugAnchorThumbSrc =
-    typeof debugAnchorThumbSrcCandidate === "string" && debugAnchorThumbSrcCandidate.trim()
-      ? debugAnchorThumbSrcCandidate.trim()
+  const debugLockupAnchorSrc =
+    typeof debugLockupAnchorSrcCandidate === "string" && debugLockupAnchorSrcCandidate.trim()
+      ? debugLockupAnchorSrcCandidate.trim()
       : null;
 
   const designSpec = (meta as { designSpec?: unknown }).designSpec;
   if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
     return {
       ...fallback,
-      debugAnchorRefSrc,
-      debugAnchorThumbSrc
+      debugBackgroundAnchorSrc,
+      debugLockupAnchorSrc
     };
   }
 
@@ -303,8 +305,8 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     referenceCluster: referenceClusterCandidate && referenceClusterCandidate.trim() ? referenceClusterCandidate.trim() : null,
     variationTemplateKey:
       variationTemplateKeyCandidate && variationTemplateKeyCandidate.trim() ? variationTemplateKeyCandidate.trim() : null,
-    debugAnchorRefSrc,
-    debugAnchorThumbSrc
+    debugBackgroundAnchorSrc,
+    debugLockupAnchorSrc
   };
 }
 
@@ -525,8 +527,8 @@ export default async function ProjectGenerationsPage({
                       debugReferenceId={designSpecSummary.referenceId}
                       debugReferenceCluster={designSpecSummary.referenceCluster}
                       debugVariationTemplateKey={designSpecSummary.variationTemplateKey}
-                      debugAnchorRefSrc={designSpecSummary.debugAnchorRefSrc}
-                      debugAnchorThumbSrc={designSpecSummary.debugAnchorThumbSrc}
+                      debugBackgroundAnchorSrc={designSpecSummary.debugBackgroundAnchorSrc}
+                      debugLockupAnchorSrc={designSpecSummary.debugLockupAnchorSrc}
                       showDebugChips={debugStageEnabled}
                       previewUrls={previewUrls}
                       finalizeAction={finalizeAction}

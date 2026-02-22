@@ -55,8 +55,8 @@ type DirectionOptionCardProps = {
   debugReferenceId?: string | null;
   debugReferenceCluster?: string | null;
   debugVariationTemplateKey?: string | null;
-  debugAnchorRefSrc?: string | null;
-  debugAnchorThumbSrc?: string | null;
+  debugBackgroundAnchorSrc?: string | null;
+  debugLockupAnchorSrc?: string | null;
   showDebugChips?: boolean;
   previewUrls: Record<DirectionPreviewFormat, string>;
   finalizeAction: () => Promise<void>;
@@ -83,8 +83,8 @@ export function DirectionOptionCard({
   debugReferenceId = null,
   debugReferenceCluster = null,
   debugVariationTemplateKey = null,
-  debugAnchorRefSrc = null,
-  debugAnchorThumbSrc = null,
+  debugBackgroundAnchorSrc = null,
+  debugLockupAnchorSrc = null,
   showDebugChips = false,
   previewUrls,
   finalizeAction
@@ -109,7 +109,7 @@ export function DirectionOptionCard({
     showDebugChips && debugReferenceId ? `Ref ID: ${debugReferenceId}` : null,
     showDebugChips && debugReferenceCluster ? `Ref cluster: ${debugReferenceCluster}` : null,
     showDebugChips && debugVariationTemplateKey ? `Template: ${debugVariationTemplateKey}` : null,
-    showDebugChips && debugAnchorRefSrc ? "Anchor source attached" : null
+    showDebugChips && (debugBackgroundAnchorSrc || debugLockupAnchorSrc) ? "Anchor sources attached" : null
   ].filter((chip): chip is string => Boolean(chip));
 
   useEffect(() => {
@@ -188,19 +188,37 @@ export function DirectionOptionCard({
         </div>
       </div>
 
-      {showDebugChips && debugAnchorRefSrc ? (
+      {showDebugChips && (debugBackgroundAnchorSrc || debugLockupAnchorSrc) ? (
         <div className="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-2.5">
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Anchor Ref Src</p>
-          <a
-            href={debugAnchorRefSrc}
-            target="_blank"
-            rel="noreferrer"
-            className="block break-all text-[11px] text-slate-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900"
-          >
-            {debugAnchorRefSrc}
-          </a>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Reference Anchors</p>
+          {debugBackgroundAnchorSrc ? (
+            <div className="space-y-1">
+              <p className="text-[11px] font-medium text-slate-600">Background anchor src</p>
+              <a
+                href={debugBackgroundAnchorSrc}
+                target="_blank"
+                rel="noreferrer"
+                className="block break-all text-[11px] text-slate-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900"
+              >
+                {debugBackgroundAnchorSrc}
+              </a>
+            </div>
+          ) : null}
+          {debugLockupAnchorSrc ? (
+            <div className="space-y-1">
+              <p className="text-[11px] font-medium text-slate-600">Lockup anchor src</p>
+              <a
+                href={debugLockupAnchorSrc}
+                target="_blank"
+                rel="noreferrer"
+                className="block break-all text-[11px] text-slate-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900"
+              >
+                {debugLockupAnchorSrc}
+              </a>
+            </div>
+          ) : null}
           <Image
-            src={debugAnchorThumbSrc || debugAnchorRefSrc}
+            src={debugBackgroundAnchorSrc || debugLockupAnchorSrc || ""}
             alt={`${optionLabel} reference anchor thumbnail`}
             width={160}
             height={80}
