@@ -5252,7 +5252,10 @@ function dedupeReferencePaths(paths: Array<string | null | undefined>): string[]
     if (typeof rawPath !== "string") {
       continue;
     }
-    const normalized = rawPath.trim().replaceAll("\\", "/").replace(/^\/+/, "");
+    const slashNormalized = rawPath.trim().replaceAll("\\", "/");
+    const normalized = slashNormalized.startsWith("/")
+      ? `/${slashNormalized.replace(/^\/+/, "")}`
+      : slashNormalized.replace(/^\.\/+/, "");
     if (!normalized) {
       continue;
     }
@@ -5388,6 +5391,7 @@ function buildReferenceItemFromCurated(params: {
     dHash: params.curated.dHash || fallback?.dHash,
     styleTag,
     styleTags,
+    styleAnchorPath: params.curated.styleAnchorPath || fallback?.styleAnchorPath,
     sourceZip: fallback?.sourceZip,
     originalName: fallback?.originalName,
     rawPath: params.curated.rawPath || fallback?.rawPath || params.curated.normalizedPath,
@@ -5397,7 +5401,13 @@ function buildReferenceItemFromCurated(params: {
 }
 
 function referenceFileCandidates(reference: ReferenceLibraryItem): string[] {
-  return dedupeReferencePaths([reference.path, reference.rawPath, reference.normalizedPath, reference.thumbPath]);
+  return dedupeReferencePaths([
+    reference.styleAnchorPath,
+    reference.path,
+    reference.rawPath,
+    reference.normalizedPath,
+    reference.thumbPath
+  ]);
 }
 
 async function loadReferenceDataUrl(reference: ReferenceLibraryItem): Promise<LoadedReferenceDataUrl | null> {
