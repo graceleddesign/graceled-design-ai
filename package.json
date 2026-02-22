@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "refs:index": "node scripts/index-reference-library.ts",
+    "refs:style-anchors": "node --import tsx scripts/build-style-anchors.ts",
     "ingest:refs": "node scripts/ingest-reference-library.js",
     "refs:ingest": "node scripts/ingest-reference-library.js",
     "debug:ruth": "tsx scripts/debug-ruth-abcs.ts",

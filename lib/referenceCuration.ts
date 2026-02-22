@@ -36,6 +36,7 @@ export type ReferenceIndexItem = {
   rawPath: string;
   normalizedPath: string;
   thumbPath: string;
+  styleAnchorPath?: string;
   width: number;
   height: number;
   aspect: number;
@@ -135,6 +136,7 @@ function normalizeIndexItem(value: unknown): ReferenceIndexItem | null {
   const rawPath = normalizePath(value.rawPath);
   const normalizedPath = normalizePath(value.normalizedPath);
   const thumbPath = normalizePath(value.thumbPath);
+  const styleAnchorPath = normalizePath(value.styleAnchorPath);
   if (!rawPath || !normalizedPath || !thumbPath) {
     return null;
   }
@@ -149,6 +151,7 @@ function normalizeIndexItem(value: unknown): ReferenceIndexItem | null {
     rawPath,
     normalizedPath,
     thumbPath,
+    styleAnchorPath: styleAnchorPath || undefined,
     width,
     height,
     aspect: aspect > 0 ? aspect : width / height,

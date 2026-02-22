@@ -15,6 +15,7 @@ export type ReferenceLibraryItem = {
   dHash?: string;
   styleTag: ReferenceLibraryStyleTag;
   styleTags: string[];
+  styleAnchorPath?: string;
   sourceZip?: string;
   originalName?: string;
   rawPath: string;
@@ -42,6 +43,14 @@ function normalizePathValue(input: unknown): string {
     return "";
   }
   return toPosixPath(input.trim().replace(/^\/+/, ""));
+}
+
+function normalizeOptionalPathValue(input: unknown): string | undefined {
+  if (typeof input !== "string") {
+    return undefined;
+  }
+  const normalized = toPosixPath(input.trim());
+  return normalized || undefined;
 }
 
 function toNumber(input: unknown, fallback = 0): number {
@@ -98,6 +107,7 @@ function normalizeItem(input: unknown): ReferenceLibraryItem | null {
   }
 
   const styleTag = normalizeStyleTag(input.styleTag);
+  const styleAnchorPath = normalizeOptionalPathValue(input.styleAnchorPath);
   const explicitTags = Array.isArray(input.styleTags)
     ? input.styleTags.filter((value): value is string => typeof value === "string")
     : [];
@@ -119,6 +129,7 @@ function normalizeItem(input: unknown): ReferenceLibraryItem | null {
     dHash: dHash || undefined,
     styleTag,
     styleTags,
+    styleAnchorPath,
     sourceZip,
     originalName,
     rawPath: legacyRaw || canonicalPath,
@@ -238,7 +249,11 @@ export async function loadIndex(): Promise<ReferenceLibraryItem[]> {
 }
 
 export function resolveReferenceAbsolutePath(relativePath: string): string {
-  return path.join(process.cwd(), relativePath.replace(/^\/+/, ""));
+  const normalized = toPosixPath(relativePath.trim());
+  if (normalized.startsWith("/reference_library/")) {
+    return path.join(process.cwd(), "public", normalized.slice(1));
+  }
+  return path.join(process.cwd(), normalized.replace(/^\/+/, ""));
 }
 
 export async function sampleRefs(seed: string, n: number): Promise<ReferenceLibraryItem[]> {
