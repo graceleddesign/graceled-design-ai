@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { GenerationPreviewPane } from "@/components/generation-preview-pane";
@@ -54,6 +55,8 @@ type DirectionOptionCardProps = {
   debugReferenceId?: string | null;
   debugReferenceCluster?: string | null;
   debugVariationTemplateKey?: string | null;
+  debugAnchorRefSrc?: string | null;
+  debugAnchorThumbSrc?: string | null;
   showDebugChips?: boolean;
   previewUrls: Record<DirectionPreviewFormat, string>;
   finalizeAction: () => Promise<void>;
@@ -80,6 +83,8 @@ export function DirectionOptionCard({
   debugReferenceId = null,
   debugReferenceCluster = null,
   debugVariationTemplateKey = null,
+  debugAnchorRefSrc = null,
+  debugAnchorThumbSrc = null,
   showDebugChips = false,
   previewUrls,
   finalizeAction
@@ -103,7 +108,8 @@ export function DirectionOptionCard({
     brandMode ? `Mode: ${brandMode === "brand" ? "Brand-aligned" : "Fresh"}` : null,
     showDebugChips && debugReferenceId ? `Ref ID: ${debugReferenceId}` : null,
     showDebugChips && debugReferenceCluster ? `Ref cluster: ${debugReferenceCluster}` : null,
-    showDebugChips && debugVariationTemplateKey ? `Template: ${debugVariationTemplateKey}` : null
+    showDebugChips && debugVariationTemplateKey ? `Template: ${debugVariationTemplateKey}` : null,
+    showDebugChips && debugAnchorRefSrc ? "Anchor source attached" : null
   ].filter((chip): chip is string => Boolean(chip));
 
   useEffect(() => {
@@ -181,6 +187,28 @@ export function DirectionOptionCard({
           })}
         </div>
       </div>
+
+      {showDebugChips && debugAnchorRefSrc ? (
+        <div className="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-2.5">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Anchor Ref Src</p>
+          <a
+            href={debugAnchorRefSrc}
+            target="_blank"
+            rel="noreferrer"
+            className="block break-all text-[11px] text-slate-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900"
+          >
+            {debugAnchorRefSrc}
+          </a>
+          <Image
+            src={debugAnchorThumbSrc || debugAnchorRefSrc}
+            alt={`${optionLabel} reference anchor thumbnail`}
+            width={160}
+            height={80}
+            unoptimized
+            className="h-20 w-auto max-w-full rounded border border-slate-200 bg-white object-contain"
+          />
+        </div>
+      ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
         <Link
