@@ -3949,6 +3949,7 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
   const designBrief = validatedDesignBrief.ok ? validatedDesignBrief.data : null;
   const lockupLayout = readLockupLayoutFromInput(params.input);
   const directionSpec = readDirectionSpecFromInput(params.input, params.optionIndex);
+  const dedupedReferenceItems = dedupeReferencesById(params.referenceItems || []);
   const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(params.input);
   const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
   const wantsTitleStage = directionSpec?.wantsTitleStage === true;
@@ -4014,6 +4015,42 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     fallbackDesignSpec.lockupLayout = lockupLayout;
   }
 
+  const normalizedAnchorReferenceId =
+    typeof directionSpec?.referenceId === "string" ? normalizeReferenceId(directionSpec.referenceId) : "";
+  const fallbackAnchorReference =
+    normalizedAnchorReferenceId.length > 0
+      ? dedupedReferenceItems.find((reference) => normalizeReferenceId(reference.id) === normalizedAnchorReferenceId) || null
+      : dedupedReferenceItems[0] || null;
+  const referenceAnchorDebugMeta = buildReferenceAnchorDebugMeta({
+    referenceId: fallbackAnchorReference?.id || directionSpec?.referenceId || null,
+    referenceCluster: directionSpec?.referenceCluster || null,
+    referenceTier: directionSpec?.referenceTier || null,
+    anchorRefSrc:
+      fallbackAnchorReference?.rawPath ||
+      fallbackAnchorReference?.path ||
+      fallbackAnchorReference?.normalizedPath ||
+      fallbackAnchorReference?.thumbPath ||
+      null,
+    anchorThumbSrc:
+      fallbackAnchorReference?.thumbPath ||
+      fallbackAnchorReference?.rawPath ||
+      fallbackAnchorReference?.path ||
+      fallbackAnchorReference?.normalizedPath ||
+      null,
+    optionIndex: params.optionIndex
+  });
+  const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(
+    !hasDesignNotes
+      ? {
+          styleFamilyFallback: {
+            usedCleanMinFallback,
+            resolvedStyleFamily
+          }
+        }
+      : undefined,
+    referenceAnchorDebugMeta
+  );
+
   return {
     designDoc: designDocByShape.square,
     designDocByShape,
@@ -4021,16 +4058,11 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     meta: {
       styleRefCount: params.referenceItems?.length || 0,
       usedStylePaths: (params.referenceItems || []).map((ref) => ref.path || ref.thumbPath),
-      usedReferenceIds: dedupeReferencesById(params.referenceItems || []).map((reference) => reference.id),
+      usedReferenceIds: dedupedReferenceItems.map((reference) => reference.id),
       revisedPrompt: params.revisedPrompt,
-      ...(!hasDesignNotes
+      ...(fallbackDebugMeta
         ? {
-            debug: {
-              styleFamilyFallback: {
-                usedCleanMinFallback,
-                resolvedStyleFamily
-              }
-            }
+            debug: fallbackDebugMeta
           }
         : {}),
       designSpec: fallbackDesignSpec
@@ -4435,6 +4467,70 @@ function toReferenceThumbPublicUrl(referencePath: string): string | null {
     return null;
   }
   return `/reference_library/thumbs/${encodeURIComponent(fileName)}`;
+}
+
+type ReferenceAnchorDebugMeta = NonNullable<NonNullable<GenerationOutputPayload["meta"]["debug"]>["referenceAnchor"]>;
+
+function normalizeReferencePublicUrl(referencePath: string | null | undefined, kind: "original" | "thumb"): string | null {
+  if (typeof referencePath !== "string") {
+    return null;
+  }
+  const normalizedPath = referencePath.trim().replaceAll("\\", "/");
+  if (!normalizedPath) {
+    return null;
+  }
+  if (kind === "original" && normalizedPath.startsWith("/reference_library/originals/")) {
+    return normalizedPath;
+  }
+  if (kind === "thumb" && normalizedPath.startsWith("/reference_library/thumbs/")) {
+    return normalizedPath;
+  }
+  return kind === "original" ? toReferenceOriginalPublicUrl(normalizedPath) : toReferenceThumbPublicUrl(normalizedPath);
+}
+
+function buildReferenceAnchorDebugMeta(params: {
+  referenceId: string | null | undefined;
+  referenceCluster: string | null;
+  referenceTier: string | null;
+  anchorRefSrc: string | null | undefined;
+  anchorThumbSrc: string | null | undefined;
+  optionIndex: number;
+}): ReferenceAnchorDebugMeta | null {
+  const referenceId = typeof params.referenceId === "string" ? params.referenceId.trim() : "";
+  if (!referenceId) {
+    return null;
+  }
+  const anchorRefSrc = normalizeReferencePublicUrl(params.anchorRefSrc, "original");
+  if (!anchorRefSrc) {
+    if (process.env.NODE_ENV === "development") {
+      console.warn("[MISSING ANCHORREFSRC]", {
+        referenceId,
+        optionIndex: params.optionIndex
+      });
+    }
+    return null;
+  }
+  const anchorThumbSrc = normalizeReferencePublicUrl(params.anchorThumbSrc, "thumb") || anchorRefSrc;
+  return {
+    referenceId,
+    referenceCluster: params.referenceCluster,
+    referenceTier: params.referenceTier,
+    anchorRefSrc,
+    anchorThumbSrc
+  };
+}
+
+function mergeReferenceAnchorDebugMeta(
+  existingDebug: GenerationOutputPayload["meta"]["debug"] | undefined,
+  referenceAnchorDebug: ReferenceAnchorDebugMeta | null
+): GenerationOutputPayload["meta"]["debug"] | undefined {
+  if (!referenceAnchorDebug) {
+    return existingDebug;
+  }
+  return {
+    ...(existingDebug || {}),
+    referenceAnchor: referenceAnchorDebug
+  };
 }
 
 function styleTagFromStyleTags(styleTags: string[]): ReferenceLibraryStyleTag {
@@ -5106,8 +5202,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   };
 
   for (const plannedGeneration of params.plannedGenerations) {
-    const fallbackOutput = plannedGeneration.fallbackOutput;
-    const fallbackStyleFamilyDebug = fallbackOutput.meta.debug?.styleFamilyFallback;
+    let fallbackOutput = plannedGeneration.fallbackOutput;
 
     if (!openAiEnabled) {
       await completeGenerationWithFallbackOutput({
@@ -5199,6 +5294,24 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             : null;
       const resolvedReferenceCluster = curatedAnchorReference?.cluster || directionSpec?.referenceCluster || null;
       const resolvedReferenceTier = curatedAnchorReference?.tier || directionSpec?.referenceTier || null;
+      const referenceAnchorDebug = buildReferenceAnchorDebugMeta({
+        referenceId: anchorReference?.id || directionSpec?.referenceId || null,
+        referenceCluster: resolvedReferenceCluster,
+        referenceTier: resolvedReferenceTier,
+        anchorRefSrc,
+        anchorThumbSrc,
+        optionIndex: plannedGeneration.optionIndex
+      });
+      const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug);
+      if (fallbackDebugMeta) {
+        fallbackOutput = {
+          ...fallbackOutput,
+          meta: {
+            ...fallbackOutput.meta,
+            debug: fallbackDebugMeta
+          }
+        };
+      }
       const referenceDataUrls = styleRefs.map((reference) => reference.dataUrl);
       const lockupStyleMode = resolveLockupStyleMode({
         directionSpec,
@@ -6153,27 +6266,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         height: PREVIEW_DIMENSIONS[shape].height
       }));
       const usedReferenceIds = [...new Set(styleRefs.map((reference) => reference.referenceId))];
-      const referenceAnchorDebug =
-        anchorReference && anchorRefSrc
-          ? {
-              referenceId: anchorReference.id,
-              referenceCluster: resolvedReferenceCluster,
-              referenceTier: resolvedReferenceTier,
-              anchorRefSrc,
-              anchorThumbSrc: anchorThumbSrc || anchorRefSrc
-            }
-          : null;
-      const debugMeta =
-        !hasDesignNotes && fallbackStyleFamilyDebug
-          ? {
-              styleFamilyFallback: fallbackStyleFamilyDebug,
-              ...(referenceAnchorDebug ? { referenceAnchor: referenceAnchorDebug } : {})
-            }
-          : referenceAnchorDebug
-            ? {
-                referenceAnchor: referenceAnchorDebug
-              }
-            : undefined;
+      const debugMeta = mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug);
+      if (process.env.NODE_ENV === "development") {
+        console.log("[REFERENCE ANCHOR DEBUG META]", {
+          optionIndex: plannedGeneration.optionIndex,
+          referenceId: directionSpec?.referenceId,
+          anchorRefSrc,
+          referenceAnchorDebug
+        });
+      }
 
       const completedOutput: GenerationOutputPayload = {
         ...fallbackOutput,
@@ -6267,6 +6368,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           vertical_main: byShape.tall.finalPath
         }
       };
+      if (process.env.NODE_ENV === "development") {
+        console.log("[REFERENCE ANCHOR PERSISTED META.DEBUG]", {
+          optionIndex: plannedGeneration.optionIndex,
+          debug: completedOutput.meta?.debug
+        });
+      }
 
       await prisma.$transaction([
         prisma.asset.deleteMany({
