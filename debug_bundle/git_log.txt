@@ -1,0 +1,43 @@
+09e77d5 Fix lockup ghosting: remove title shadow/outline layers; add localized scrim plate
+cb47fa9 Fix lockup ghosting: disable forced title/subtitle shadows; rely on scrim + contrast
+4896eea Reference-first: refs highest authority (no ignore-refs / no hard constraints)
+49dd4c8 Fix: persist referenceAnchor debug (anchorRefSrc/thumb) into generation meta
+0ab6f5c Reference-first: show anchorRefSrc and prepend reference image to style refs
+212a103 Reference-first Round 1 selection with recency avoidance and originality templates
+67a8df1 Add telemetry for clean-min styleFamily fallbacks in exploration
+0507955 Lockup validation: ban filters/blur/shadow/duplicate text layers
+6492bb4 Round 1 multi-sample rerank with quality floor and fallback
+305cad8 Treat full-book chapter ranges (e.g. John 1-21) as whole_book scope
+6213f5f Add exploration sets, lane shuffle, and novelty scoring for Round 1 variety
+1436071 Add lockup text integrity checks and typographic recipes
+18c761e Improve dark/mono lane readability with midtone + structure checks
+97539c2 Fix motifScope inference for whole-book series
+e8a31c9 Round 1 hero lanes + text-free backgrounds; whole-book motif scope
+eba6765 Add 5 playful style families to deterministic style-family system
+e36a023 Catch up: sermon graphic builder updates
+db2c33c Cache Google Fonts woff2 and update manifest
+69f6a11 Enforce preset font profile hints for stronger A/B/C contrast
+f7bc2a4 Add vendored local font manifest and deterministic fallback pipeline
+53a0c90 Add validated design brief schema and lockup-driven typography
+4e31da6 Fix sermon graphic rendering policy and aspect coherence
+88bb52d Improve type_clean_min_v1 with reference library + composited typography previews
+0b15275 Generate real AI preview backgrounds and store as generation assets
+0bdf95f Add AI-generated backgrounds for generation previews
+169de44 Add AI-generated backgrounds for generation previews
+464e8d1 Add AI preview generation assets
+0c1433a Hybrid AI backgrounds + real preview PNG assets
+ce7158a Fix generation previews to render real images
+c504b02 Render real previews for generations via preview PNG route
+705051c Render real previews in existing frames
+04e49ff Fix auth membership organization include for build
+4b3eea4 Add PNG/PDF exports for final designs
+8990821 Add final design approval and PPTX/SVG/ZIP exports
+6c7a7ed Initial app scaffold + generation workflow
+193c487 Fix generation option labels and hide Presets nav
+ae28365 Validate BrandKit websiteUrl and fix option labels
+2e451b2 Add app icons and manifest
+b2600cf Add Apple touch icons
+8d3b65a Add GraceLed favicon
+b6d0b80 Stop tracking .DS_Store
+c1b6737 Ignore macOS .DS_Store
+1aa9da3 Initial specs + preset seed

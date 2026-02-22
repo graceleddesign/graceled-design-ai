@@ -83,6 +83,7 @@ import {
   renderTrimmedLockupPngFromSvg,
   type PreviewShape
 } from "@/lib/lockup-compositor";
+import { resolvePromptProfile } from "@/lib/prompt-profiles";
 
 export type ProjectActionState = {
   error?: string;
@@ -2020,6 +2021,17 @@ function buildVariationTemplateHardInstruction(params: {
   return `${templateDefinitionLine} HARD TEMPLATE APPLICATION: ${targetInstruction}`;
 }
 
+function buildVariationTemplateCompositionGoalInstruction(params: {
+  variationTemplate: NonNullable<ReturnType<typeof resolveVariationTemplateFromDirectionSpec>>;
+  target: "background" | "lockup";
+}): string {
+  const targetInstruction =
+    params.target === "background"
+      ? params.variationTemplate.backgroundLayoutInstruction
+      : params.variationTemplate.lockupLayoutInstruction;
+  return `Variation template composition goal (${params.variationTemplate.key}): ${targetInstruction} Treat this as a composition goal, not a hard template application.`;
+}
+
 function referenceFirstDefaultBiasGuardLine(directionSpec?: PlannedDirectionSpec | null): string {
   return isReferenceFirstDirection(directionSpec)
     ? "Do not use the default left-text/right-art layout unless the template says so."
@@ -2413,6 +2425,7 @@ function buildLockupGenerationPrompt(params: {
   subtitle: string;
   styleMode: LockupStyleMode;
   lockupLayout: LockupLayoutArchetype;
+  explorationMode?: boolean;
   directionSpec?: PlannedDirectionSpec | null;
   references: ReferenceLibraryItem[];
   bibleCreativeBrief?: BibleCreativeBrief | null;
@@ -2425,28 +2438,45 @@ function buildLockupGenerationPrompt(params: {
     ? `Series subtitle (must be secondary): ${truncateForPrompt(params.subtitle, 140)}`
     : "Series subtitle: none (render only the title).";
   const isReferenceFirst = Boolean(params.directionSpec?.referenceId);
+  const promptProfileSelection = resolvePromptProfile({
+    explorationMode: params.explorationMode,
+    referenceId: params.directionSpec?.referenceId
+  });
+  const promptProfile = promptProfileSelection.profile;
+  const isRound1ReferenceFirst = promptProfileSelection.key === "round1_reference_first";
   const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionLine = params.directionSpec
     ? `Direction context: ${params.directionSpec.styleFamily || "unassigned"} / ${params.directionSpec.laneFamily} / ${
         params.directionSpec.compositionType
       } / ${params.directionSpec.backgroundMode}.`
     : "";
-  const hardStyleConstraintLine = styleFamily && !isReferenceFirst
+  const hardStyleConstraintLine = styleFamily && promptProfile.includeFlags.includeBucketRules && !isReferenceFirst
     ? `HARD STYLE CONSTRAINT: Bucket = ${styleFamily.bucket}. Follow bucket rules strictly.`
     : "";
-  const bucketRulesLine = styleFamily ? `Bucket rules: ${styleFamily.bucketRules}` : "";
-  const hardToneConstraintLine = styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
-  const toneRulesLine = styleFamily ? `Tone rules: ${styleFamily.toneRules}` : "";
+  const bucketRulesLine =
+    styleFamily && promptProfile.includeFlags.includeBucketRules ? `Bucket rules: ${styleFamily.bucketRules}` : "";
+  const hardToneConstraintLine =
+    styleFamily && promptProfile.includeFlags.includeToneRules && !isReferenceFirst
+      ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.`
+      : "";
+  const toneRulesLine = styleFamily && promptProfile.includeFlags.includeToneRules ? `Tone rules: ${styleFamily.toneRules}` : "";
   const hardMediumConstraintLine =
-    styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
-  const mediumRulesLine = styleFamily ? `Medium rules: ${styleFamily.mediumRules}` : "";
-  const styleFamilyLockupRulesLine = styleFamily
+    styleFamily && promptProfile.includeFlags.includeMediumRules && !isReferenceFirst
+      ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.`
+      : "";
+  const mediumRulesLine =
+    styleFamily && promptProfile.includeFlags.includeMediumRules ? `Medium rules: ${styleFamily.mediumRules}` : "";
+  const styleFamilyLockupRulesLine = styleFamily && promptProfile.includeFlags.includeStyleFamilyRules
     ? `Style family: ${styleFamily.name}. Follow these rules strongly: ${styleFamily.lockupRules.join(" ")}`
     : "";
-  const styleFamilyForbidsLine = styleFamily ? `Style family forbids: ${styleFamily.forbids.join("; ")}.` : "";
+  const styleFamilyForbidsLine =
+    styleFamily && promptProfile.includeFlags.includeStyleFamilyRules ? `Style family forbids: ${styleFamily.forbids.join("; ")}.` : "";
   const compatibleLayouts = styleFamily ? STYLE_FAMILY_LOCKUP_LAYOUT_BIAS[styleFamily.key] : null;
   const styleFamilyLayoutBiasLine =
-    styleFamily && compatibleLayouts && !compatibleLayouts.includes(params.lockupLayout)
+    styleFamily &&
+    promptProfile.includeFlags.includeStyleFamilyRules &&
+    compatibleLayouts &&
+    !compatibleLayouts.includes(params.lockupLayout)
       ? `Style family/layout bias note: keep ${params.lockupLayout} authoritative, but use ${styleFamily.name} detailing with restraint because this family usually fits ${compatibleLayouts.join(
           ", "
         )}.`
@@ -2459,12 +2489,13 @@ function buildLockupGenerationPrompt(params: {
     typeof params.directionSpec?.variationTemplateKey === "string" && params.directionSpec.variationTemplateKey.trim()
       ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
       : null;
-  const variationTemplateLine = variationTemplate
-    ? buildVariationTemplateHardInstruction({
-        variationTemplate,
-        target: "lockup"
-      })
-    : "";
+  const variationTemplateLine =
+    variationTemplate && promptProfile.includeFlags.includeVariationTemplate && !isRound1ReferenceFirst
+      ? buildVariationTemplateHardInstruction({
+          variationTemplate,
+          target: "lockup"
+        })
+      : "";
   const titleIntegrationMode = resolveTitleIntegrationMode(params.directionSpec);
   const titleIntegrationModeLine = titleIntegrationMode
     ? `Title integration mode: ${titleIntegrationMode}.`
@@ -2488,16 +2519,16 @@ function buildLockupGenerationPrompt(params: {
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
     : "";
-  const referenceAnchorPriorityLine = isReferenceFirst
+  const referenceAnchorPriorityLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
     : "";
-  const referenceSecondaryGuardrailLine = isReferenceFirst
+  const referenceSecondaryGuardrailLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "Bucket/tone/medium are secondary guardrails; use them only if they do not contradict the reference."
     : "";
-  const originalityRuleLine = params.directionSpec?.referenceId
+  const originalityRuleLine = params.directionSpec?.referenceId && !isRound1ReferenceFirst
     ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
     : "";
-  const motifRecompositionLine = params.directionSpec?.referenceId
+  const motifRecompositionLine = params.directionSpec?.referenceId && !isRound1ReferenceFirst
     ? "Use the sermon motif/themes (from our motif system) to create a new focal element."
     : "";
   const referenceLockupLayoutFamilyLine = params.directionSpec?.lockupLayoutFamily
@@ -2528,15 +2559,20 @@ function buildLockupGenerationPrompt(params: {
   const typographicRecipeLine = lockupTypographicRecipeInstructionForArchetype(params.lockupLayout);
   // Bible brief motifs/markIdeas provide symbolic lockup accents without introducing extra copy.
   const motifsLine =
-    params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
+    promptProfile.includeFlags.includeBibleBrief && params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
       ? `Motif cues (symbolic): ${params.bibleCreativeBrief.motifs.slice(0, 6).join(", ")}.`
       : "";
   const typographyMoodLine =
-    params.bibleCreativeBrief && params.bibleCreativeBrief.typographyMood.length > 0
+    promptProfile.includeFlags.includeBibleBrief &&
+    params.bibleCreativeBrief &&
+    params.bibleCreativeBrief.typographyMood.length > 0
       ? `Typography mood: ${params.bibleCreativeBrief.typographyMood.join(", ")}.`
       : "";
   const markIdeasLine =
-    params.wantsSeriesMark && params.bibleCreativeBrief && params.bibleCreativeBrief.markIdeas.length > 0
+    promptProfile.includeFlags.includeBibleBrief &&
+    params.wantsSeriesMark &&
+    params.bibleCreativeBrief &&
+    params.bibleCreativeBrief.markIdeas.length > 0
       ? `Series mark ideas (choose one): ${params.bibleCreativeBrief.markIdeas.slice(0, 4).join(" | ")}.`
       : "";
   const markIntentLine = params.wantsSeriesMark
@@ -2556,9 +2592,23 @@ function buildLockupGenerationPrompt(params: {
     params.brandMode === "brand" && (params.optionalMarkAccentHexes || []).length > 0
       ? `Optional mark accents may use brand palette sparingly: ${(params.optionalMarkAccentHexes || []).join(", ")}. Do not force the full lockup palette to match brand colors.`
       : "";
-  const titleStageLockupLine = params.directionSpec?.wantsTitleStage
+  const titleStageLockupLine = promptProfile.includeFlags.includeTitleStage && params.directionSpec?.wantsTitleStage
     ? "Assume the background will provide a clean title stage; do not add panels/frames behind the text."
     : "";
+  const profileSoftGuidanceLines = promptProfile.softGuidance
+    .map((line) => {
+      if (!line.includes("variation template")) {
+        return line;
+      }
+      if (!variationTemplate) {
+        return "";
+      }
+      return buildVariationTemplateCompositionGoalInstruction({
+        variationTemplate,
+        target: "lockup"
+      });
+    })
+    .filter(Boolean);
 
   return [
     "Generate ONLY the SERIES TITLE and optional SERIES SUBTITLE as a crafted typographic lockup.",
@@ -2582,6 +2632,7 @@ function buildLockupGenerationPrompt(params: {
     referenceAnchorDirectiveLine,
     referenceAnchorPriorityLine,
     referenceSecondaryGuardrailLine,
+    ...profileSoftGuidanceLines,
     originalityRuleLine,
     motifRecompositionLine,
     referenceLockupLayoutFamilyLine,
@@ -5426,6 +5477,7 @@ async function createStyleBrief(params: {
     subtitle: params.project.series_subtitle || "",
     styleMode: lockupStyleMode,
     lockupLayout: defaultLockupLayoutForStyleMode(lockupStyleMode),
+    explorationMode: params.round === 1 && !hasDesignNotes,
     directionSpec: params.directionSpec,
     references: params.references,
     brandMode: params.project.brandMode,
@@ -5495,6 +5547,12 @@ function buildTemplateBackgroundPrompt(params: {
   toneComplianceBoost?: string;
 }): string {
   const isReferenceFirst = Boolean(params.directionSpec?.referenceId);
+  const promptProfileSelection = resolvePromptProfile({
+    explorationMode: params.explorationMode,
+    referenceId: params.directionSpec?.referenceId
+  });
+  const promptProfile = promptProfileSelection.profile;
+  const isRound1ReferenceFirst = promptProfileSelection.key === "round1_reference_first";
   const styleFamily = resolveDirectionStyleFamily(params.directionSpec);
   const directionHint = params.directionSpec
     ? [
@@ -5507,16 +5565,23 @@ function buildTemplateBackgroundPrompt(params: {
         params.directionSpec.lanePrompt
       ].join(" ")
     : "";
-  const hardStyleConstraintLine = styleFamily && !isReferenceFirst
+  const hardStyleConstraintLine = styleFamily && promptProfile.includeFlags.includeBucketRules && !isReferenceFirst
     ? `HARD STYLE CONSTRAINT: Bucket = ${styleFamily.bucket}. Follow bucket rules strictly.`
     : "";
-  const bucketRulesLine = styleFamily ? `Bucket rules: ${styleFamily.bucketRules}` : "";
-  const hardToneConstraintLine = styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.` : "";
-  const toneRulesLine = styleFamily ? `Tone rules: ${styleFamily.toneRules}` : "";
+  const bucketRulesLine =
+    styleFamily && promptProfile.includeFlags.includeBucketRules ? `Bucket rules: ${styleFamily.bucketRules}` : "";
+  const hardToneConstraintLine =
+    styleFamily && promptProfile.includeFlags.includeToneRules && !isReferenceFirst
+      ? `HARD STYLE CONSTRAINT: Tone = ${styleFamily.tone}.`
+      : "";
+  const toneRulesLine = styleFamily && promptProfile.includeFlags.includeToneRules ? `Tone rules: ${styleFamily.toneRules}` : "";
   const hardMediumConstraintLine =
-    styleFamily && !isReferenceFirst ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.` : "";
-  const mediumRulesLine = styleFamily ? `Medium rules: ${styleFamily.mediumRules}` : "";
-  const styleFamilyBackgroundRulesLine = styleFamily
+    styleFamily && promptProfile.includeFlags.includeMediumRules && !isReferenceFirst
+      ? `HARD STYLE CONSTRAINT: Medium = ${styleFamily.medium}.`
+      : "";
+  const mediumRulesLine =
+    styleFamily && promptProfile.includeFlags.includeMediumRules ? `Medium rules: ${styleFamily.mediumRules}` : "";
+  const styleFamilyBackgroundRulesLine = styleFamily && promptProfile.includeFlags.includeStyleFamilyRules
     ? `Style family: ${styleFamily.name}. Follow these rules strongly: ${styleFamily.backgroundRules.join(
         " "
       )} Forbids: ${styleFamily.forbids.join("; ")}.`
@@ -5525,12 +5590,13 @@ function buildTemplateBackgroundPrompt(params: {
     typeof params.directionSpec?.variationTemplateKey === "string" && params.directionSpec.variationTemplateKey.trim()
       ? getRound1VariationTemplateByKey(params.directionSpec.variationTemplateKey)
       : null;
-  const variationTemplateLine = variationTemplate
-    ? buildVariationTemplateHardInstruction({
-        variationTemplate,
-        target: "background"
-      })
-    : "";
+  const variationTemplateLine =
+    variationTemplate && promptProfile.includeFlags.includeVariationTemplate && !isRound1ReferenceFirst
+      ? buildVariationTemplateHardInstruction({
+          variationTemplate,
+          target: "background"
+        })
+      : "";
   const titleIntegrationMode = resolveTitleIntegrationMode(params.directionSpec);
   const titleIntegrationModeLine = titleIntegrationMode
     ? `Title integration mode: ${titleIntegrationMode}.`
@@ -5554,30 +5620,34 @@ function buildTemplateBackgroundPrompt(params: {
   const referenceAnchorDirectiveLine = params.directionSpec?.referenceId
     ? "REFERENCE ANCHOR: match palette logic, texture, typographic energy, composition style."
     : "";
-  const referenceAnchorPriorityLine = isReferenceFirst
+  const referenceAnchorPriorityLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
     : "";
-  const referenceSecondaryGuardrailLine = isReferenceFirst
+  const referenceSecondaryGuardrailLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "Bucket/tone/medium are secondary guardrails; use them only if they do not contradict the reference."
     : "";
-  const originalityRuleLine = params.directionSpec?.referenceId
+  const originalityRuleLine = params.directionSpec?.referenceId && !isRound1ReferenceFirst
     ? "ORIGINALITY RULE: do NOT copy the reference layout; do NOT reuse the same motif; recomposition required."
     : "";
-  const motifRecompositionLine = params.directionSpec?.referenceId
+  const motifRecompositionLine = params.directionSpec?.referenceId && !isRound1ReferenceFirst
     ? "Use the sermon motif/themes (from our motif system) to create a new focal element."
     : "";
   const styleAuthorityOverrideLine = isReferenceFirst
     ? ""
     : "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const backgroundTextFreeRuleLine =
-    titleIntegrationMode === "TYPE_AS_TEXTURE"
-      ? "BACKGROUND TEXT RULE: no readable words, no readable letters, no logos, no watermarks, no signage. Abstract non-readable letterform fragments are allowed only as subtle texture."
-      : "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos.";
+    !isRound1ReferenceFirst
+      ? titleIntegrationMode === "TYPE_AS_TEXTURE"
+        ? "BACKGROUND TEXT RULE: no readable words, no readable letters, no logos, no watermarks, no signage. Abstract non-readable letterform fragments are allowed only as subtle texture."
+        : "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos."
+      : "";
   const ignoreTypographyRefLine =
-    titleIntegrationMode === "TYPE_AS_TEXTURE"
-      ? "If style refs show typography, only borrow abstract texture rhythm; never reproduce readable words or signage."
-      : "If style refs show typography, ignore it completely and output only the graphical background style.";
-  const explorationTextInvalidLine = params.explorationMode
+    !isRound1ReferenceFirst
+      ? titleIntegrationMode === "TYPE_AS_TEXTURE"
+        ? "If style refs show typography, only borrow abstract texture rhythm; never reproduce readable words or signage."
+        : "If style refs show typography, ignore it completely and output only the graphical background style."
+      : "";
+  const explorationTextInvalidLine = params.explorationMode && !isRound1ReferenceFirst
     ? titleIntegrationMode === "TYPE_AS_TEXTURE"
       ? "If any readable text appears, the result is invalid. Keep any letterform texture fragmentary, non-readable, and secondary."
       : "If ANY text appears, the result is invalid. Prioritize removing/avoiding text over all other style cues."
@@ -5587,28 +5657,52 @@ function buildTemplateBackgroundPrompt(params: {
       ? "If brand mode, express playfulness via shapes/composition/texture only; DO NOT introduce forbidden hues."
       : "";
   // Bible creative brief fields are used as symbolic visual guidance for background generation.
-  const bibleSummaryLine = params.bibleCreativeBrief ? `Bible brief summary: ${params.bibleCreativeBrief.summary}` : "";
+  const bibleSummaryLine =
+    promptProfile.includeFlags.includeBibleBrief && params.bibleCreativeBrief
+      ? `Bible brief summary: ${params.bibleCreativeBrief.summary}`
+      : "";
   const bibleThemeLine =
-    params.bibleCreativeBrief && params.bibleCreativeBrief.themes.length > 0
+    promptProfile.includeFlags.includeBibleBrief &&
+    params.bibleCreativeBrief &&
+    params.bibleCreativeBrief.themes.length > 0
       ? `Themes: ${params.bibleCreativeBrief.themes.join(", ")}.`
       : "";
   const bibleMotifLine =
-    params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
+    promptProfile.includeFlags.includeBibleBrief &&
+    params.bibleCreativeBrief &&
+    params.bibleCreativeBrief.motifs.length > 0
       ? `Motifs (symbolic cues): ${params.bibleCreativeBrief.motifs.slice(0, 8).join(", ")}.`
       : "";
   const motifFocus = safeArrayOfStrings(params.directionSpec?.motifFocus, []).slice(0, 2);
   const motifFocusLine =
     motifFocus.length > 0 ? `Primary motifs for this direction: ${motifFocus.join(", ")}. Incorporate these subtly.` : "";
-  const designCompletenessLine =
-    isReferenceFirst && params.explorationMode
-      ? [
-          "DESIGN COMPLETENESS: This must look like a finished sermon series graphic, not a wireframe or layout scaffold.",
-          motifFocus.length > 0
-            ? `Include a clear focal motif tied to motifFocus (${motifFocus.join(", ")}).`
-            : "Include a clear focal motif tied to motifFocus.",
-          "Do not output placeholder rectangles, empty frames, or generic borders."
-        ].join(" ")
-      : "";
+  const profileHardRuleLines = promptProfile.hardRules
+    .map((line) => {
+      if (!isRound1ReferenceFirst) {
+        return line;
+      }
+      if (!line.includes("motifFocus")) {
+        return line;
+      }
+      return motifFocus.length > 0
+        ? `Include a clear focal motif tied to motifFocus (${motifFocus.join(", ")}).`
+        : "Include a clear focal motif tied to motifFocus.";
+    })
+    .filter(Boolean);
+  const profileSoftGuidanceLines = promptProfile.softGuidance
+    .map((line) => {
+      if (!line.includes("variation template")) {
+        return line;
+      }
+      if (!variationTemplate) {
+        return "";
+      }
+      return buildVariationTemplateCompositionGoalInstruction({
+        variationTemplate,
+        target: "background"
+      });
+    })
+    .filter(Boolean);
   const motifScopeLine = params.directionSpec?.motifScope
     ? `Motif scope: ${params.directionSpec.motifScope}.`
     : "";
@@ -5626,11 +5720,13 @@ function buildTemplateBackgroundPrompt(params: {
     ", "
   )}) unless explicitly listed in allowedGenericMotifs or motifFocus.`;
   const bibleDoNotUseLine =
-    params.bibleCreativeBrief && params.bibleCreativeBrief.doNotUse.length > 0
+    promptProfile.includeFlags.includeBibleBrief &&
+    params.bibleCreativeBrief &&
+    params.bibleCreativeBrief.doNotUse.length > 0
       ? `Do not use: ${params.bibleCreativeBrief.doNotUse.join("; ")}.`
       : "";
   const titleStageInstructions =
-    params.directionSpec?.wantsTitleStage === true
+    promptProfile.includeFlags.includeTitleStage && params.directionSpec?.wantsTitleStage === true
       ? buildTitleStageInstructions({
           format: params.shape,
           placementHint: resolveSafeAreaAnchor(params.directionSpec),
@@ -5638,9 +5734,21 @@ function buildTemplateBackgroundPrompt(params: {
           directionSpec: params.directionSpec
         })
       : "";
+  const shapeCompositionHintLine = isRound1ReferenceFirst
+    ? ""
+    : shapeCompositionHint({
+        shape: params.shape,
+        directionSpec: params.directionSpec,
+        variationTemplate
+      });
+  const lockupSafeAreaInstructionsLine = isRound1ReferenceFirst ? "" : buildLockupSafeAreaInstructions(params.directionSpec);
+  const lockupSafeAreaDetailLine = isRound1ReferenceFirst
+    ? ""
+    : "Avoid busy details in the lockup safe area; keep that region low-detail and low-contrast.";
 
   return [
     params.brandPaletteHardConstraint || "",
+    ...profileHardRuleLines,
     hardStyleConstraintLine,
     bucketRulesLine,
     hardToneConstraintLine,
@@ -5652,6 +5760,7 @@ function buildTemplateBackgroundPrompt(params: {
     referenceAnchorDirectiveLine,
     referenceAnchorPriorityLine,
     referenceSecondaryGuardrailLine,
+    ...profileSoftGuidanceLines,
     originalityRuleLine,
     motifRecompositionLine,
     variationTemplateLine,
@@ -5672,19 +5781,14 @@ function buildTemplateBackgroundPrompt(params: {
     motifScopeLine,
     motifScopeRuleLine,
     motifFocusLine,
-    designCompletenessLine,
     allowedGenericLine,
     genericMotifBanLine,
     params.seriesPreferenceGuidance || "",
-    shapeCompositionHint({
-      shape: params.shape,
-      directionSpec: params.directionSpec,
-      variationTemplate
-    }),
+    shapeCompositionHintLine,
     "Incorporate 1-2 motifs subtly and symbolically; avoid literal portraits or face-centric depictions.",
-    buildLockupSafeAreaInstructions(params.directionSpec),
+    lockupSafeAreaInstructionsLine,
     titleStageInstructions,
-    "Avoid busy details in the lockup safe area; keep that region low-detail and low-contrast.",
+    lockupSafeAreaDetailLine,
     bibleDoNotUseLine,
     "Keep hierarchy disciplined and leave the lockup lane clean.",
     params.paletteComplianceBoost || "",
@@ -6182,6 +6286,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         subtitle: content.subtitle,
         styleMode: lockupStyleMode,
         lockupLayout,
+        explorationMode: shouldRunExplorationToneCheck,
         directionSpec,
         references,
         bibleCreativeBrief,
@@ -6877,6 +6982,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         subtitle: content.subtitle,
         styleMode: lockupStyleMode,
         lockupLayout,
+        explorationMode: shouldRunExplorationToneCheck,
         directionSpec: backgroundDirectionSpec || directionSpec,
         references,
         bibleCreativeBrief,
