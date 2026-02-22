@@ -1761,6 +1761,43 @@ export function buildLockupDesignLayers(params: {
     });
   }
 
+  const needsLocalizedTextScrim =
+    params.palette.forceTitleShadow || params.palette.forceTitleOutline || params.palette.forceSubtitleShadow;
+  if (needsLocalizedTextScrim) {
+    const titleSubtitleBounds = boundsFromRects(
+      params.layout.blocks
+        .filter((block) => !block.isOverprint && (block.key === "title" || block.key === "subtitle"))
+        .map((block) => ({
+          x: block.x,
+          y: block.y,
+          w: block.w,
+          h: block.h
+        }))
+    );
+    if (titleSubtitleBounds) {
+      const padding = Math.round(Math.max(params.layout.width, params.layout.height) * 0.018);
+      const scrimX = clamp(Math.round(titleSubtitleBounds.left - padding), 0, params.layout.width);
+      const scrimY = clamp(Math.round(titleSubtitleBounds.top - padding), 0, params.layout.height);
+      const scrimRight = clamp(Math.round(titleSubtitleBounds.right + padding), 0, params.layout.width);
+      const scrimBottom = clamp(Math.round(titleSubtitleBounds.bottom + padding), 0, params.layout.height);
+      const scrimW = Math.max(1, scrimRight - scrimX);
+      const scrimH = Math.max(1, scrimBottom - scrimY);
+      const localizedScrim = params.palette.scrimTint === "#000000" ? "rgba(0,0,0,0.28)" : "rgba(255,255,255,0.22)";
+
+      layers.push({
+        type: "shape",
+        x: scrimX,
+        y: scrimY,
+        w: scrimW,
+        h: scrimH,
+        shape: "rect",
+        fill: localizedScrim,
+        stroke: localizedScrim,
+        strokeWidth: 0
+      });
+    }
+  }
+
   for (const block of params.layout.blocks) {
     const color = blockColorForLayer(block, params.palette);
     const textOpacityFloor = !block.isOverprint && !block.isOutline && !block.inlineStroke
@@ -1773,24 +1810,6 @@ export function buildLockupDesignLayers(params: {
     const contentOpacity = textOpacityFloor > 0
       ? Math.max(typeof block.opacity === "number" ? block.opacity : 1, textOpacityFloor)
       : block.opacity;
-
-    if (!block.isOverprint && block.key === "title" && params.palette.forceTitleShadow) {
-      layers.push({
-        type: "text",
-        x: block.x + Math.max(1, Math.round(params.layout.width * 0.0028)),
-        y: block.y + Math.max(1, Math.round(params.layout.height * 0.0022)),
-        w: block.w,
-        h: block.h,
-        text: block.lines.join("\n"),
-        fontSize: block.fontSize,
-        fontFamily: block.fontFamily,
-        fontWeight: block.fontWeight,
-        letterSpacing: block.letterSpacing,
-        color: params.palette.tertiary,
-        align: block.align,
-        opacity: 0.24
-      });
-    }
 
     if (!block.isOverprint && block.key === "subtitle" && params.palette.forceSubtitleShadow) {
       layers.push({
@@ -1808,32 +1827,6 @@ export function buildLockupDesignLayers(params: {
         align: block.align,
         opacity: 0.2
       });
-    }
-
-    if (!block.isOverprint && !block.isOutline && block.key === "title" && params.palette.forceTitleOutline) {
-      const assistOutlineOffsets: Array<[number, number]> = [
-        [-1, 0],
-        [1, 0],
-        [0, -1],
-        [0, 1]
-      ];
-      for (const [dx, dy] of assistOutlineOffsets) {
-        layers.push({
-          type: "text",
-          x: block.x + dx,
-          y: block.y + dy,
-          w: block.w,
-          h: block.h,
-          text: block.lines.join("\n"),
-          fontSize: block.fontSize,
-          fontFamily: block.fontFamily,
-          fontWeight: block.fontWeight,
-          letterSpacing: block.letterSpacing,
-          color: params.palette.rule,
-          align: block.align,
-          opacity: 0.92
-        });
-      }
     }
 
     if (block.isOutline) {
