@@ -368,8 +368,8 @@ export async function chooseTextPaletteForBackground(params: {
   let titleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(primary));
   let subtitleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(secondary));
   let forceTitleOutline = titleContrast < titleThreshold;
-  let forceTitleShadow = titleContrast < titleThreshold;
-  let forceSubtitleShadow = subtitleContrast < subtitleThreshold;
+  let forceTitleShadow = false;
+  let forceSubtitleShadow = false;
 
   if (titleContrast + (forceTitleOutline ? 0.6 : 0) < titleThreshold) {
     primary = adjustLightnessForContrast({
@@ -380,7 +380,7 @@ export async function chooseTextPaletteForBackground(params: {
     titleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(primary));
   }
 
-  if (subtitleContrast + (forceSubtitleShadow ? 0.45 : 0) < subtitleThreshold) {
+  if (subtitleContrast < subtitleThreshold) {
     secondary = adjustLightnessForContrast({
       color: secondary,
       backgroundLuminance,
@@ -399,13 +399,11 @@ export async function chooseTextPaletteForBackground(params: {
     rule = useDarkText ? "#0F172A" : "#F8FAFC";
     accent = useDarkText ? "#0F172A" : "#F8FAFC";
     forceTitleOutline = true;
-    forceTitleShadow = true;
-    forceSubtitleShadow = true;
     titleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(primary));
     subtitleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(secondary));
   }
 
-  const autoScrim = Math.min(titleContrast, subtitleContrast) < 4.8;
+  const autoScrim = safeVariantApplied || Math.min(titleContrast, subtitleContrast) < 5.2;
 
   return {
     primary,
