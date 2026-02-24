@@ -28,3 +28,10 @@ public/debug/
 .cache/
 
 reference_assets_v1.zip
+
+.cache/
+reference_library/raw/
+reference_library/normalized/
+public/reference_library/
+public/reference-thumbs/
+reference_assets_v1.zip
