@@ -24,3 +24,5 @@ reference_zips/*.zip
 !.env.example
 
 public/debug/
+
+.cache/
