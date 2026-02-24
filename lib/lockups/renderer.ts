@@ -82,6 +82,8 @@ export type LockupRenderResult = {
   overlaySvg: string;
 };
 
+export type LockupTitleIntegrationMode = "PLATE" | "MASK" | "GRID_LOCK" | "TYPE_AS_TEXTURE" | "CUTOUT" | "NONE";
+
 function clamp(value: number, min: number, max: number): number {
   if (value < min) {
     return min;
@@ -881,6 +883,93 @@ function enforceBackdropGuardrails(params: {
   }
 }
 
+function applyGridLockAlignment(layout: LockupLayout): void {
+  const visibleBlocks = layout.blocks.filter((block) => !block.isOverprint);
+  if (visibleBlocks.length <= 0) {
+    return;
+  }
+
+  const titleAndSubtitle = visibleBlocks.filter((block) => block.key === "title" || block.key === "subtitle");
+  const anchorBounds = boundsFromRects(
+    (titleAndSubtitle.length > 0 ? titleAndSubtitle : visibleBlocks).map((block) => ({
+      x: block.x,
+      y: block.y,
+      w: block.w,
+      h: block.h
+    }))
+  );
+  if (!anchorBounds) {
+    return;
+  }
+
+  const grid = Math.max(8, Math.round(Math.min(layout.width, layout.height) * 0.012));
+  const snap = (value: number) => Math.round(value / grid) * grid;
+  const anchorX = snap(anchorBounds.left);
+
+  for (const block of visibleBlocks) {
+    if (block.align === "left") {
+      block.x = anchorX;
+    } else if (block.align === "center") {
+      block.x = snap(layout.width / 2 - block.w / 2);
+    } else {
+      const right = snap(anchorBounds.right);
+      block.x = right - block.w;
+    }
+    block.y = snap(block.y);
+    block.w = Math.max(1, snap(block.w));
+    block.h = Math.max(1, snap(block.h));
+  }
+
+  for (const shape of layout.shapes) {
+    shape.x = snap(shape.x);
+    shape.y = snap(shape.y);
+    shape.w = Math.max(1, snap(shape.w));
+    shape.h = Math.max(1, snap(shape.h));
+  }
+}
+
+function applyTitleIntegrationBackdrop(layout: LockupLayout, mode: LockupTitleIntegrationMode): void {
+  const titleSubtitleBlocks = layout.blocks.filter(
+    (block) => !block.isOverprint && (block.key === "title" || block.key === "subtitle")
+  );
+  const bounds = boundsFromRects(
+    titleSubtitleBlocks.map((block) => ({
+      x: block.x,
+      y: block.y,
+      w: block.w,
+      h: block.h
+    }))
+  );
+  if (!bounds) {
+    return;
+  }
+
+  const basePad = Math.max(10, Math.round(Math.min(layout.width, layout.height) * 0.02));
+  const pad = mode === "PLATE" ? basePad : Math.round(basePad * 1.15);
+  const left = clamp(bounds.left - pad, 0, Math.max(0, layout.width - 1));
+  const top = clamp(bounds.top - pad, 0, Math.max(0, layout.height - 1));
+  const right = clamp(bounds.right + pad, left + 1, layout.width);
+  const bottom = clamp(bounds.bottom + pad, top + 1, layout.height);
+  const shape: LockupShape = {
+    x: left,
+    y: top,
+    w: Math.max(1, right - left),
+    h: Math.max(1, bottom - top),
+    fillRole: mode === "PLATE" ? "scrim" : "accent",
+    opacity: mode === "PLATE" ? 0.22 : 0.86,
+    radius: Math.max(6, Math.round(Math.min(layout.width, layout.height) * 0.014)),
+    purpose: "box_fill"
+  };
+
+  layout.shapes.unshift(shape);
+
+  if (mode === "MASK" || mode === "CUTOUT") {
+    for (const block of titleSubtitleBlocks) {
+      block.isKnockout = true;
+    }
+  }
+}
+
 export function normalizeRecipeForAspect(recipe: LockupRecipe, aspect: Aspect): LockupRecipe {
   const placement = {
     ...recipe.placement
@@ -1470,6 +1559,7 @@ export function renderLockup(params: {
   fontPairing: FontPairing;
   palette: LockupTextPalette;
   lockupPresetId?: string | null;
+  integrationMode?: LockupTitleIntegrationMode;
 }): LockupRenderResult {
   const layout = computeLockupLayout({
     backgroundSize: params.backgroundSize,
@@ -1479,6 +1569,13 @@ export function renderLockup(params: {
     fontPairing: params.fontPairing,
     lockupPresetId: params.lockupPresetId
   });
+  const integrationMode = params.integrationMode || "PLATE";
+  if (integrationMode === "GRID_LOCK" || integrationMode === "TYPE_AS_TEXTURE") {
+    applyGridLockAlignment(layout);
+  }
+  if (integrationMode === "PLATE" || integrationMode === "MASK" || integrationMode === "CUTOUT") {
+    applyTitleIntegrationBackdrop(layout, integrationMode);
+  }
 
   const parts: string[] = [];
   parts.push(

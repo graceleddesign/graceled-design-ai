@@ -488,125 +488,9 @@ const TEMPLATE_REGISTRY: Record<TemplateStyleFamily, TemplateRenderer> = {
   "illustrated-heritage": illustratedHeritageTemplate
 };
 
-function normalizeKeywords(keywords: string[] | null | undefined): string[] {
-  if (!Array.isArray(keywords)) {
-    return [];
-  }
-
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-
-  for (const raw of keywords) {
-    if (typeof raw !== "string") {
-      continue;
-    }
-    const keyword = raw
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (!keyword || seen.has(keyword)) {
-      continue;
-    }
-    seen.add(keyword);
-    normalized.push(keyword);
-    if (normalized.length >= 14) {
-      break;
-    }
-  }
-
-  return normalized;
-}
-
-const SCENE_WORDS = new Set([
-  "wheat",
-  "barley",
-  "harvest",
-  "field",
-  "vine",
-  "river",
-  "mountain",
-  "valley",
-  "desert",
-  "light",
-  "water",
-  "stone",
-  "flock",
-  "shepherd",
-  "bread",
-  "scroll",
-  "crown",
-  "olive",
-  "tree",
-  "fire",
-  "wind",
-  "rain",
-  "dove",
-  "home",
-  "path",
-  "grain"
-]);
-
-const TOKEN_STOP_WORDS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "this",
-  "that",
-  "series",
-  "sermon",
-  "church",
-  "title",
-  "subtitle",
-  "verse",
-  "chapter",
-  "from",
-  "into",
-  "your",
-  "our",
-  "you"
-]);
-
-function extractSceneTerms(brief: TemplateBrief): string[] {
-  const source = [
-    brief.title,
-    typeof brief.subtitle === "string" ? brief.subtitle : "",
-    typeof brief.scripture === "string" ? brief.scripture : "",
-    ...normalizeKeywords(brief.keywords)
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  const tokens = source
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 3)
-    .filter((token) => !TOKEN_STOP_WORDS.has(token));
-
-  const seen = new Set<string>();
-  const sceneTerms: string[] = [];
-
-  for (const token of tokens) {
-    if (!SCENE_WORDS.has(token) || seen.has(token)) {
-      continue;
-    }
-    seen.add(token);
-    sceneTerms.push(token);
-    if (sceneTerms.length >= 8) {
-      break;
-    }
-  }
-
-  return sceneTerms;
-}
-
 export function buildBackgroundPrompt(brief: TemplateBrief, styleFamily: StyleFamily): string {
+  void brief;
   const templateFamily = canonicalizeStyleFamily(styleFamily);
-  const content = normalizedContent(brief);
-  const keywords = normalizeKeywords(brief.keywords);
-  const sceneTerms = extractSceneTerms(brief);
 
   const styleLine =
     templateFamily === "editorial-photo"
@@ -614,23 +498,16 @@ export function buildBackgroundPrompt(brief: TemplateBrief, styleFamily: StyleFa
       : templateFamily === "modern-collage"
         ? "Style direction: modern collage with bold cut-paper geometry, layered composition, paper fibers, and tasteful grain."
         : templateFamily === "illustrated-heritage"
-          ? "Style direction: illustrated heritage with hand-inked etched linework, archival texture, restrained ornamental rhythm."
+        ? "Style direction: illustrated heritage with hand-inked etched linework, archival texture, restrained ornamental rhythm."
           : "Style direction: clean minimal with disciplined hierarchy, quiet texture, and generous negative space.";
-
-  const motifLine =
-    sceneTerms.length > 0
-      ? `Concrete motif vocabulary: ${sceneTerms.join(", ")}. Use only these concrete nouns for any literal motif.`
-      : "No concrete scene vocabulary is present. Use abstract textures, patterns, and tonal forms instead of literal scenery.";
-
-  const sourceTerms = [content.title, content.subtitle, content.scripture, ...keywords].filter(Boolean).join(" | ");
 
   return [
     "Create ORIGINAL background artwork only.",
     "No text, no letters, no words, no logos, no watermarks, no signage.",
-    "Do not introduce concrete scene objects that are absent from the source terms.",
+    "Do not render any words, labels, or letterforms, not even single words like 'incarnation'. Use symbols only.",
     styleLine,
-    motifLine,
-    sourceTerms ? `Source terms: ${sourceTerms}.` : "Source terms are minimal; keep treatment abstract.",
+    "Use symbolic, non-verbal forms only: silhouettes, radiance bursts, branch/leaf shapes, stone-circle forms, and abstract wave marks.",
+    "Never echo scripture references, source terms, or motif words as visible text.",
     "Preserve clear negative space for lockup typography overlays."
   ].join(" ");
 }

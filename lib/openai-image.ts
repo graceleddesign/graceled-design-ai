@@ -1,5 +1,6 @@
 import "server-only";
 
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
 import { openai } from "@/lib/openai";
 
 export type OpenAiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
@@ -59,6 +60,12 @@ export async function generatePngFromPrompt(params: {
   size: OpenAiImageSize;
   quality?: OpenAiImageQuality;
   references?: OpenAiImageReference[];
+  disable429Retry?: boolean;
+  meta?: {
+    debug?: {
+      rateLimitWaitMs?: number;
+    };
+  };
 }): Promise<Buffer> {
   if (!process.env.OPENAI_API_KEY?.trim()) {
     throw new Error("OPENAI_API_KEY is not configured");
@@ -85,19 +92,27 @@ export async function generatePngFromPrompt(params: {
             ]
           : params.prompt;
 
-      const response = await openai.responses.create({
-        model,
-        input,
-        tool_choice: { type: "image_generation" },
-        tools: [
-          {
-            type: "image_generation",
-            size: params.size,
-            quality,
-            background: "opaque"
-          }
-        ]
-      });
+      const runImageCall = () =>
+        runWithGptImageBudget(
+          () =>
+            openai.responses.create({
+              model,
+              input,
+              tool_choice: { type: "image_generation" },
+              tools: [
+                {
+                  type: "image_generation",
+                  size: params.size,
+                  quality,
+                  background: "opaque"
+                }
+              ]
+            }),
+          params.meta
+        );
+      const response = params.disable429Retry
+        ? await runImageCall()
+        : await runWithGptImage429Retry(runImageCall, params.meta);
 
       const b64 = extractGeneratedImageB64(response);
       return Buffer.from(b64, "base64");

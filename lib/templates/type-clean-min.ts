@@ -7,6 +7,7 @@ import { getLockupPresetById } from "@/lib/lockups/presets";
 import {
   buildLockupDesignLayers,
   computeLockupLayout,
+  type LockupTitleIntegrationMode,
   type LockupTextPalette,
   renderLockup
 } from "@/lib/lockups/renderer";
@@ -368,8 +369,8 @@ export async function chooseTextPaletteForBackground(params: {
   let titleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(primary));
   let subtitleContrast = contrastRatio(backgroundLuminance, relativeLuminanceFromHex(secondary));
   let forceTitleOutline = titleContrast < titleThreshold;
-  let forceTitleShadow = false;
-  let forceSubtitleShadow = false;
+  const forceTitleShadow = false;
+  const forceSubtitleShadow = false;
 
   if (titleContrast + (forceTitleOutline ? 0.6 : 0) < titleThreshold) {
     primary = adjustLightnessForContrast({
@@ -429,6 +430,7 @@ export function buildCleanMinimalOverlaySvg(params: {
   lockupPresetId?: string | null;
   styleFamily?: StyleFamily;
   fontSeed?: string | null;
+  integrationMode?: LockupTitleIntegrationMode;
 }): string {
   const shape = shapeFromDimensions(params.width, params.height);
   const displayContent = buildOverlayDisplayContent({
@@ -458,7 +460,8 @@ export function buildCleanMinimalOverlaySvg(params: {
     lockupRecipe: renderConfig.recipe,
     fontPairing: renderConfig.fontPairing,
     palette: params.palette,
-    lockupPresetId: renderConfig.lockupPresetId
+    lockupPresetId: renderConfig.lockupPresetId,
+    integrationMode: params.integrationMode
   }).overlaySvg;
 }
 

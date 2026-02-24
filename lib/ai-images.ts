@@ -3,6 +3,7 @@ import "server-only";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 import OpenAI from "openai";
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
 
 export type AiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
 export type AiImageQuality = "low" | "medium" | "high" | "auto";
@@ -107,13 +108,17 @@ export async function generateBackgroundPng(params: {
   quality?: AiImageQuality;
 }): Promise<Buffer> {
   const client = getOpenAiClient();
-  const response = await client.images.generate({
-    model: "gpt-image-1",
-    prompt: params.prompt,
-    size: params.size,
-    quality: normalizeAiImageQuality(params.quality ?? process.env.AI_IMAGE_QUALITY?.trim()),
-    response_format: "b64_json"
-  } as never);
+  const response = await runWithGptImage429Retry(() =>
+    runWithGptImageBudget(() =>
+      client.images.generate({
+        model: "gpt-image-1",
+        prompt: params.prompt,
+        size: params.size,
+        quality: normalizeAiImageQuality(params.quality ?? process.env.AI_IMAGE_QUALITY?.trim()),
+        response_format: "b64_json"
+      } as never)
+    )
+  );
 
   const b64 = response.data?.[0]?.b64_json;
   if (!b64) {

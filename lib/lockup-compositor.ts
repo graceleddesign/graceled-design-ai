@@ -10,7 +10,7 @@ export const PREVIEW_DIMENSIONS: Record<PreviewShape, { width: number; height: n
 };
 
 type LockupAlign = "left" | "center" | "right";
-export type LockupIntegrationMode = "clean" | "stamp";
+export type LockupIntegrationMode = "clean" | "stamp" | "plate" | "mask" | "cutout" | "grid_lock";
 
 const LOCKUP_RENDER_SCALE = 2;
 const LOCKUP_TRIM_MARGIN_PCT = 0.03;
@@ -113,6 +113,92 @@ function averageRegionLuminance(raw: RawRgba, region: { left: number; top: numbe
   }
 
   return total / count;
+}
+
+function integrationPlateTint(isLightBackground: boolean): string {
+  return isLightBackground ? "#0F172A" : "#F8FAFC";
+}
+
+function integrationPlateOpacity(mode: LockupIntegrationMode, isLightBackground: boolean): number {
+  if (mode === "cutout") {
+    return isLightBackground ? 0.74 : 0.84;
+  }
+  if (mode === "mask") {
+    return isLightBackground ? 0.42 : 0.54;
+  }
+  return isLightBackground ? 0.24 : 0.32;
+}
+
+function integrationPlateBounds(params: {
+  canvasWidth: number;
+  canvasHeight: number;
+  lockupBounds: AlphaBounds;
+  lockupLeft: number;
+  lockupTop: number;
+  mode: LockupIntegrationMode;
+}): { left: number; top: number; width: number; height: number; radius: number } {
+  const padScale = params.mode === "cutout" ? 0.26 : params.mode === "mask" ? 0.22 : 0.18;
+  const padX = clamp(Math.round(params.lockupBounds.width * padScale), 10, Math.round(params.canvasWidth * 0.09));
+  const padY = clamp(Math.round(params.lockupBounds.height * (padScale + 0.05)), 10, Math.round(params.canvasHeight * 0.09));
+  const anchorLeft = params.lockupLeft + params.lockupBounds.left;
+  const anchorTop = params.lockupTop + params.lockupBounds.top;
+  const anchorRight = anchorLeft + params.lockupBounds.width;
+  const anchorBottom = anchorTop + params.lockupBounds.height;
+  const left = clamp(anchorLeft - padX, 0, Math.max(0, params.canvasWidth - 1));
+  const top = clamp(anchorTop - padY, 0, Math.max(0, params.canvasHeight - 1));
+  const right = clamp(anchorRight + padX, left + 1, params.canvasWidth);
+  const bottom = clamp(anchorBottom + padY, top + 1, params.canvasHeight);
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
+  const radius = clamp(Math.round(Math.min(width, height) * 0.16), 8, 64);
+  return { left, top, width, height, radius };
+}
+
+async function buildTitleIntegrationOverlay(params: {
+  canvasWidth: number;
+  canvasHeight: number;
+  lockupPng: Buffer;
+  lockupLeft: number;
+  lockupTop: number;
+  mode: "plate" | "mask" | "cutout";
+  isLightBackground: boolean;
+}): Promise<Buffer | null> {
+  const bounds = await findAlphaBounds(params.lockupPng);
+  if (!bounds) {
+    return null;
+  }
+  const plate = integrationPlateBounds({
+    canvasWidth: params.canvasWidth,
+    canvasHeight: params.canvasHeight,
+    lockupBounds: bounds,
+    lockupLeft: params.lockupLeft,
+    lockupTop: params.lockupTop,
+    mode: params.mode
+  });
+  const fill = integrationPlateTint(params.isLightBackground);
+  const opacity = integrationPlateOpacity(params.mode, params.isLightBackground);
+  const plateSvg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${params.canvasWidth}" height="${params.canvasHeight}" viewBox="0 0 ${params.canvasWidth} ${params.canvasHeight}">`,
+    `<rect x="${plate.left}" y="${plate.top}" width="${plate.width}" height="${plate.height}" rx="${plate.radius}" ry="${plate.radius}" fill="${fill}" fill-opacity="${opacity.toFixed(3)}" />`,
+    "</svg>"
+  ].join("");
+  const platePng = await sharp(Buffer.from(plateSvg), { failOn: "none" })
+    .png()
+    .toBuffer();
+  if (params.mode === "mask" || params.mode === "cutout") {
+    return sharp(platePng, { failOn: "none" })
+      .composite([
+        {
+          input: params.lockupPng,
+          left: params.lockupLeft,
+          top: params.lockupTop,
+          blend: "dest-out"
+        }
+      ])
+      .png()
+      .toBuffer();
+  }
+  return platePng;
 }
 
 function estimateMultiplyContrast(params: { backgroundRaw: RawRgba; lockupRaw: RawRgba; left: number; top: number }): number {
@@ -525,9 +611,14 @@ export async function composeLockupOnBackground(params: {
         ? safeRegion.left + (safeWidth - targetWidth)
         : safeRegion.left;
   const top = safeRegion.top + Math.round((safeHeight - targetHeight) / 2);
-  const safeLeft = clamp(left, 0, Math.max(0, params.width - targetWidth));
-  const safeTop = clamp(top, 0, Math.max(0, params.height - targetHeight));
+  let safeLeft = clamp(left, 0, Math.max(0, params.width - targetWidth));
+  let safeTop = clamp(top, 0, Math.max(0, params.height - targetHeight));
   const integrationMode = params.integrationMode || "clean";
+  if (integrationMode === "grid_lock") {
+    const gridUnit = Math.max(8, Math.round(Math.min(safeWidth, safeHeight) * 0.05));
+    safeLeft = clamp(Math.round(safeLeft / gridUnit) * gridUnit, 0, Math.max(0, params.width - targetWidth));
+    safeTop = clamp(Math.round(safeTop / gridUnit) * gridUnit, 0, Math.max(0, params.height - targetHeight));
+  }
   const averageBackgroundLuminance = averageRegionLuminance(backgroundRaw, {
     left: safeLeft,
     top: safeTop,
@@ -537,6 +628,26 @@ export async function composeLockupOnBackground(params: {
   const isLightBackground = averageBackgroundLuminance > LIGHT_BACKGROUND_LUMINANCE_THRESHOLD;
   const isDarkBackground = averageBackgroundLuminance < DARK_BACKGROUND_LUMINANCE_THRESHOLD;
   const overlays: sharp.OverlayOptions[] = [];
+  let usesKnockoutIntegration = false;
+
+  if (integrationMode === "plate" || integrationMode === "mask" || integrationMode === "cutout") {
+    const integrationOverlay = await buildTitleIntegrationOverlay({
+      canvasWidth: params.width,
+      canvasHeight: params.height,
+      lockupPng: resizedLockup,
+      lockupLeft: safeLeft,
+      lockupTop: safeTop,
+      mode: integrationMode,
+      isLightBackground
+    });
+    if (integrationOverlay) {
+      overlays.push({
+        input: integrationOverlay,
+        blend: "over"
+      });
+      usesKnockoutIntegration = integrationMode === "mask" || integrationMode === "cutout";
+    }
+  }
 
   const applyLegibleNormalBlend = async (sourceLockupPng: Buffer) => {
     if (isDarkBackground) {
@@ -589,6 +700,10 @@ export async function composeLockupOnBackground(params: {
         top: safeTop,
         blend: "multiply"
       });
+    }
+  } else if (integrationMode === "mask" || integrationMode === "cutout") {
+    if (!usesKnockoutIntegration) {
+      await applyLegibleNormalBlend(resizedLockup);
     }
   } else {
     await applyLegibleNormalBlend(resizedLockup);

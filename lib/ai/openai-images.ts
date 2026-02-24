@@ -1,6 +1,7 @@
 import "server-only";
 
 import OpenAI from "openai";
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
 
 const DEFAULT_IMAGE_MODEL = "gpt-image-1.5";
 
@@ -48,14 +49,18 @@ export async function generateBackgroundPng(params: {
   const model = process.env.OPENAI_IMAGE_MODEL?.trim() || DEFAULT_IMAGE_MODEL;
   const style = process.env.OPENAI_IMAGE_STYLE?.trim() || "";
 
-  const response = await client.images.generate({
-    model,
-    prompt: params.prompt,
-    size: params.size,
-    quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? "high"),
-    response_format: "b64_json",
-    ...(style ? { style } : {})
-  } as never);
+  const response = await runWithGptImage429Retry(() =>
+    runWithGptImageBudget(() =>
+      client.images.generate({
+        model,
+        prompt: params.prompt,
+        size: params.size,
+        quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? "high"),
+        response_format: "b64_json",
+        ...(style ? { style } : {})
+      } as never)
+    )
+  );
 
   const b64 = response.data?.[0]?.b64_json;
   if (!b64) {

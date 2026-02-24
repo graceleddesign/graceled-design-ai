@@ -247,15 +247,8 @@ function promptPalette(palette: string[]): string {
 
 function buildBackgroundPrompt(params: {
   presetKey: string | null;
-  seriesTitle: string;
-  seriesSubtitle: string | null;
-  scripturePassages: string | null;
   palette: string[];
 }): string {
-  const thematicHints = [params.seriesTitle, params.seriesSubtitle, params.scripturePassages]
-    .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
-    .join(" | ");
-
   return [
     "Design a premium sermon series background artwork in the style of modern church media.",
     "Clean, minimal, high-end.",
@@ -265,7 +258,8 @@ function buildBackgroundPrompt(params: {
     "Default to abstract textures and geometric motifs unless a literal photo scene was explicitly requested.",
     "Negative scene list: highway, road, cars, city, skyscraper, traffic, street signs, billboards.",
     presetStyleHint(params.presetKey),
-    thematicHints ? `Theme inspiration: ${thematicHints}.` : "Theme inspiration: modern worship campaign.",
+    "Use symbol-only visual cues such as light bursts, branch silhouettes, stone-circle forms, and abstract wave marks.",
+    "Do not render any words, labels, or letterforms, not even single words like 'incarnation'.",
     "NO TEXT, NO LETTERS, NO WORDS, NO TYPOGRAPHY, NO SIGNAGE, NO LOGOS, NO WATERMARKS."
   ].join(" ");
 }
@@ -326,9 +320,6 @@ export async function createGenerationPreviewAssets(params: {
   const palette = parsePaletteJson(effectiveBrandKit?.paletteJson);
   const backgroundPrompt = buildBackgroundPrompt({
     presetKey: generation.preset?.key || null,
-    seriesTitle: generation.project.series_title,
-    seriesSubtitle: generation.project.series_subtitle,
-    scripturePassages: generation.project.scripture_passages,
     palette
   });
   const masterBackgroundPng = await generateBackgroundPng({
