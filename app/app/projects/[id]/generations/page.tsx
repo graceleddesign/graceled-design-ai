@@ -18,6 +18,12 @@ type PreviewFields = {
   wide: string;
   tall: string;
 };
+type AspectAssetStatus = "ok" | "missing" | "placeholder";
+type DebugAspectAssets = {
+  widescreen: AspectAssetStatus;
+  square: AspectAssetStatus;
+  vertical: AspectAssetStatus;
+};
 
 type GenerationAssetRecord = {
   kind: "IMAGE" | "BACKGROUND" | "LOCKUP" | "ZIP" | "OTHER";
@@ -53,7 +59,16 @@ type OptionDesignSpecSummary = {
   debugLockupAnchorSrc: string | null;
   debugBackgroundSource: "generated" | "reused" | "fallback" | null;
   debugLockupSource: "generated" | "reused" | "fallback" | null;
-  debugBackgroundFailureReason: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+  debugBackgroundFailureReason:
+    | "ALL_TEXT"
+    | "ALL_SCAFFOLD"
+    | "API_ERROR"
+    | "RATE_LIMIT"
+    | "BUDGET"
+    | "MISSING_ASPECT_ASSET"
+    | "UNKNOWN"
+    | null;
+  debugAspectAssets: DebugAspectAssets | null;
   debugWarning: string | null;
   debugImageCalls: {
     total: number;
@@ -78,7 +93,15 @@ type OptionDesignSpecSummary = {
     imageUrl: string;
     score: number | null;
     failedChecks: Array<"textOk" | "scaffoldOk" | "motifOk" | "toneOk">;
-    failureReason: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+    failureReason:
+      | "ALL_TEXT"
+      | "ALL_SCAFFOLD"
+      | "API_ERROR"
+      | "RATE_LIMIT"
+      | "BUDGET"
+      | "MISSING_ASPECT_ASSET"
+      | "UNKNOWN"
+      | null;
     eligibleCount: number;
     totalCandidates: number;
     failureCounts: {
@@ -99,10 +122,19 @@ const OPTION_TINTS = [
   "from-slate-300 to-slate-100"
 ];
 
-const BACKGROUND_FAILURE_REASONS = ["ALL_TEXT", "ALL_SCAFFOLD", "API_ERROR", "RATE_LIMIT", "BUDGET", "UNKNOWN"] as const;
+const BACKGROUND_FAILURE_REASONS = [
+  "ALL_TEXT",
+  "ALL_SCAFFOLD",
+  "API_ERROR",
+  "RATE_LIMIT",
+  "BUDGET",
+  "MISSING_ASPECT_ASSET",
+  "UNKNOWN"
+] as const;
 const BACKGROUND_CHECK_KEYS = ["textOk", "scaffoldOk", "motifOk", "toneOk"] as const;
 const ROUND1_IMAGE_CALL_CAP_WARNING = "Image call cap reached; returning best available.";
 const REQUIRED_COMPLETED_OPTIONS_PER_ROUND = 3;
+const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 
 type BackgroundFailureReason = (typeof BACKGROUND_FAILURE_REASONS)[number];
 type BackgroundCheckKey = (typeof BACKGROUND_CHECK_KEYS)[number];
@@ -115,10 +147,117 @@ function isRoundStatus(value: unknown): value is "COMPLETED" | "PARTIAL" | "FAIL
   return value === "COMPLETED" || value === "PARTIAL" || value === "FAILED";
 }
 
+function isAspectAssetStatus(value: unknown): value is AspectAssetStatus {
+  return value === "ok" || value === "missing" || value === "placeholder";
+}
+
+function normalizeAssetPathForCompletenessCheck(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed.split("?")[0]?.trim() || null;
+}
+
+function parseDebugAspectAssets(output: unknown): DebugAspectAssets | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+
+  const debug = (meta as { debug?: unknown }).debug;
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+
+  const aspectAssets = (debug as { aspectAssets?: unknown }).aspectAssets;
+  if (!aspectAssets || typeof aspectAssets !== "object" || Array.isArray(aspectAssets)) {
+    return null;
+  }
+
+  const value = aspectAssets as Record<string, unknown>;
+  const widescreen = value.widescreen;
+  const square = value.square;
+  const vertical = value.vertical;
+  if (!isAspectAssetStatus(widescreen) || !isAspectAssetStatus(square) || !isAspectAssetStatus(vertical)) {
+    return null;
+  }
+
+  return {
+    widescreen,
+    square,
+    vertical
+  };
+}
+
+function deriveAspectAssetsFromPreview(output: unknown): DebugAspectAssets | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const preview = (output as { preview?: unknown }).preview;
+  if (!preview || typeof preview !== "object" || Array.isArray(preview)) {
+    return null;
+  }
+
+  const previewRecord = preview as Record<string, unknown>;
+  const rawByAspect = {
+    widescreen: normalizeAssetPathForCompletenessCheck(previewRecord.widescreen_main),
+    square: normalizeAssetPathForCompletenessCheck(previewRecord.square_main),
+    vertical: normalizeAssetPathForCompletenessCheck(previewRecord.vertical_main)
+  } as const;
+  const nonNullPaths = Object.values(rawByAspect).filter((value): value is string => Boolean(value));
+  const normalizedPathCounts = new Map<string, number>();
+  for (const pathValue of nonNullPaths) {
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    normalizedPathCounts.set(normalized, (normalizedPathCounts.get(normalized) || 0) + 1);
+  }
+
+  const classify = (pathValue: string | null): AspectAssetStatus => {
+    if (!pathValue) {
+      return "missing";
+    }
+    if (ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN.test(pathValue)) {
+      return "placeholder";
+    }
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    if ((normalizedPathCounts.get(normalized) || 0) > 1) {
+      return "placeholder";
+    }
+    return "ok";
+  };
+
+  return {
+    widescreen: classify(rawByAspect.widescreen),
+    square: classify(rawByAspect.square),
+    vertical: classify(rawByAspect.vertical)
+  };
+}
+
+function hasCompleteAspectAssets(output: unknown): boolean {
+  const aspectAssets = parseDebugAspectAssets(output) || deriveAspectAssetsFromPreview(output);
+  if (!aspectAssets) {
+    return false;
+  }
+  return aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
+}
+
 function resolveOptionGenerationStatus(output: unknown, dbStatus?: string): "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
   if (output && typeof output === "object" && !Array.isArray(output)) {
     const directStatus = (output as { status?: unknown }).status;
     if (isOptionGenerationStatus(directStatus)) {
+      if (directStatus === "COMPLETED" && !hasCompleteAspectAssets(output)) {
+        return "FAILED_GENERATION";
+      }
       return directStatus;
     }
     const meta = (output as { meta?: unknown }).meta;
@@ -136,7 +275,7 @@ function resolveOptionGenerationStatus(output: unknown, dbStatus?: string): "COM
     return "FAILED_GENERATION";
   }
   if (dbStatus === "COMPLETED") {
-    return "COMPLETED";
+    return hasCompleteAspectAssets(output) ? "COMPLETED" : "FAILED_GENERATION";
   }
   if (dbStatus === "RUNNING" || dbStatus === "QUEUED") {
     return "FAILED_GENERATION";
@@ -144,7 +283,7 @@ function resolveOptionGenerationStatus(output: unknown, dbStatus?: string): "COM
   if (!output) {
     return "FAILED_GENERATION";
   }
-  return "COMPLETED";
+  return hasCompleteAspectAssets(output) ? "COMPLETED" : "FAILED_GENERATION";
 }
 
 function isBackgroundFailureReason(value: unknown): value is BackgroundFailureReason {
@@ -257,6 +396,7 @@ function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesign
     debugBackgroundSource: null,
     debugLockupSource: null,
     debugBackgroundFailureReason: null,
+    debugAspectAssets: null,
     debugWarning: null,
     debugImageCalls: null,
     debugRateLimitWaitMs: null,
@@ -293,6 +433,24 @@ function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesign
   const debugBackgroundFailureReasonCandidate = debugObject
     ? (debugObject as { backgroundFailureReason?: unknown }).backgroundFailureReason
     : null;
+  const debugAspectAssetsCandidate = debugObject ? (debugObject as { aspectAssets?: unknown }).aspectAssets : null;
+  const debugAspectAssets =
+    debugAspectAssetsCandidate && typeof debugAspectAssetsCandidate === "object" && !Array.isArray(debugAspectAssetsCandidate)
+      ? (() => {
+          const aspectAssetsObject = debugAspectAssetsCandidate as Record<string, unknown>;
+          const widescreen = aspectAssetsObject.widescreen;
+          const square = aspectAssetsObject.square;
+          const vertical = aspectAssetsObject.vertical;
+          if (!isAspectAssetStatus(widescreen) || !isAspectAssetStatus(square) || !isAspectAssetStatus(vertical)) {
+            return null;
+          }
+          return {
+            widescreen,
+            square,
+            vertical
+          } satisfies DebugAspectAssets;
+        })()
+      : deriveAspectAssetsFromPreview(output);
   const warningsCandidate = debugObject ? (debugObject as { warnings?: unknown }).warnings : null;
   const warnings = Array.isArray(warningsCandidate)
     ? warningsCandidate.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -551,6 +709,7 @@ function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesign
           : null,
       debugBackgroundFailureReason:
         isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+      debugAspectAssets,
       debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
       debugImageCalls,
       debugRateLimitWaitMs,
@@ -789,6 +948,7 @@ function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesign
         : null,
     debugBackgroundFailureReason:
       isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+    debugAspectAssets,
     debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
     debugImageCalls,
     debugRateLimitWaitMs,
@@ -1134,6 +1294,7 @@ export default async function ProjectGenerationsPage({
                       debugBackgroundSource={designSpecSummary.debugBackgroundSource}
                       debugLockupSource={designSpecSummary.debugLockupSource}
                       debugBackgroundFailureReason={designSpecSummary.debugBackgroundFailureReason}
+                      debugAspectAssets={designSpecSummary.debugAspectAssets}
                       debugWarning={designSpecSummary.debugWarning}
                       debugImageCalls={designSpecSummary.debugImageCalls}
                       debugRateLimitWaitMs={designSpecSummary.debugRateLimitWaitMs}

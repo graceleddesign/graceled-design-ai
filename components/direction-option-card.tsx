@@ -6,6 +6,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { GenerationPreviewPane } from "@/components/generation-preview-pane";
 
 type DirectionPreviewFormat = "wide" | "square" | "tall";
+type AspectAssetStatus = "ok" | "missing" | "placeholder";
 
 const PREVIEW_FORMATS: readonly DirectionPreviewFormat[] = ["wide", "square", "tall"];
 
@@ -64,7 +65,20 @@ type DirectionOptionCardProps = {
   debugLockupAnchorSrc?: string | null;
   debugBackgroundSource?: "generated" | "reused" | "fallback" | null;
   debugLockupSource?: "generated" | "reused" | "fallback" | null;
-  debugBackgroundFailureReason?: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+  debugBackgroundFailureReason?:
+    | "ALL_TEXT"
+    | "ALL_SCAFFOLD"
+    | "API_ERROR"
+    | "RATE_LIMIT"
+    | "BUDGET"
+    | "MISSING_ASPECT_ASSET"
+    | "UNKNOWN"
+    | null;
+  debugAspectAssets?: {
+    widescreen: AspectAssetStatus;
+    square: AspectAssetStatus;
+    vertical: AspectAssetStatus;
+  } | null;
   debugWarning?: string | null;
   debugImageCalls?: {
     total: number;
@@ -89,7 +103,15 @@ type DirectionOptionCardProps = {
     imageUrl: string;
     score: number | null;
     failedChecks: Array<"textOk" | "scaffoldOk" | "motifOk" | "toneOk">;
-    failureReason: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+    failureReason:
+      | "ALL_TEXT"
+      | "ALL_SCAFFOLD"
+      | "API_ERROR"
+      | "RATE_LIMIT"
+      | "BUDGET"
+      | "MISSING_ASPECT_ASSET"
+      | "UNKNOWN"
+      | null;
     eligibleCount: number;
     totalCandidates: number;
     failureCounts: {
@@ -135,6 +157,7 @@ export function DirectionOptionCard({
   debugBackgroundSource = null,
   debugLockupSource = null,
   debugBackgroundFailureReason = null,
+  debugAspectAssets = null,
   debugWarning = null,
   debugImageCalls = null,
   debugRateLimitWaitMs = null,
@@ -201,6 +224,10 @@ export function DirectionOptionCard({
   ].filter((chip): chip is string => Boolean(chip));
   const canShowBestEffortBackground =
     showDebugChips && debugBackgroundSource === "fallback" && Boolean(debugBestEffortBackground?.imageUrl);
+  const aspectCompletenessLine =
+    showDebugChips && debugAspectAssets
+      ? `Aspect completeness: wide ${debugAspectAssets.widescreen}, square ${debugAspectAssets.square}, vertical ${debugAspectAssets.vertical}`
+      : null;
 
   useEffect(() => {
     if (!isConfirmOpen) {
@@ -252,6 +279,7 @@ export function DirectionOptionCard({
             </span>
           ))}
         </div>
+        {aspectCompletenessLine ? <p className="mt-1 text-xs text-slate-600">{aspectCompletenessLine}</p> : null}
       </div>
 
       <div className="space-y-2">

@@ -626,7 +626,8 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
           width,
           height,
           align: "left",
-          integrationMode
+          integrationMode,
+          renderDebugGuides: false
         });
         const composited = debugStageEnabled
           ? await applyStageDebugOverlay({

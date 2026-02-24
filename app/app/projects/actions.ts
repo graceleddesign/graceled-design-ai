@@ -487,6 +487,7 @@ const PREVIEW_ASSET_SLOTS_TO_CLEAR: readonly string[] = [
   ...Object.values(BACKGROUND_ASSET_SLOT_BY_SHAPE),
   LOCKUP_ASSET_SLOT
 ];
+const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -3868,7 +3869,11 @@ async function loadReusableAssetsFromGeneration(params: {
     const reusableDesignDoc = parseReusableMasterDesignDoc(generation.output);
     if (reusableDesignDoc) {
       const [derivedBackgroundPng, derivedLockupPng] = await Promise.all([
-        masterBackgroundPng ? Promise.resolve(null) : renderBackgroundOnlyPreviewPng(reusableDesignDoc),
+        masterBackgroundPng
+          ? Promise.resolve(null)
+          : renderBackgroundOnlyPreviewPng(reusableDesignDoc, {
+              renderDebugGuides: false
+            }),
         lockupPng
           ? Promise.resolve(null)
           : (async () => {
@@ -4049,17 +4054,122 @@ function readGenerationOptionStatusFromOutput(output: unknown): GenerationOption
   return null;
 }
 
+function isAspectAssetStatus(value: unknown): value is AspectAssetStatus {
+  return value === "ok" || value === "missing" || value === "placeholder";
+}
+
+function normalizeAssetPathForCompletenessCheck(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed.split("?")[0]?.trim() || null;
+}
+
+function readAspectAssetsFromOutput(output: unknown): AspectAssetStatusByOutputAspect | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const debug = (meta as { debug?: unknown }).debug;
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+  const aspectAssets = (debug as { aspectAssets?: unknown }).aspectAssets;
+  if (!aspectAssets || typeof aspectAssets !== "object" || Array.isArray(aspectAssets)) {
+    return null;
+  }
+
+  const value = aspectAssets as Record<string, unknown>;
+  const widescreen = value.widescreen;
+  const square = value.square;
+  const vertical = value.vertical;
+  if (!isAspectAssetStatus(widescreen) || !isAspectAssetStatus(square) || !isAspectAssetStatus(vertical)) {
+    return null;
+  }
+
+  return {
+    widescreen,
+    square,
+    vertical
+  };
+}
+
+function deriveAspectAssetsFromPreview(output: unknown): AspectAssetStatusByOutputAspect | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const preview = (output as { preview?: unknown }).preview;
+  if (!preview || typeof preview !== "object" || Array.isArray(preview)) {
+    return null;
+  }
+
+  const previewRecord = preview as Record<string, unknown>;
+  const rawByAspect = {
+    widescreen: normalizeAssetPathForCompletenessCheck(previewRecord.widescreen_main),
+    square: normalizeAssetPathForCompletenessCheck(previewRecord.square_main),
+    vertical: normalizeAssetPathForCompletenessCheck(previewRecord.vertical_main)
+  } as const;
+  const nonNullPaths = Object.values(rawByAspect).filter((value): value is string => Boolean(value));
+  const normalizedPathCounts = new Map<string, number>();
+  for (const pathValue of nonNullPaths) {
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    normalizedPathCounts.set(normalized, (normalizedPathCounts.get(normalized) || 0) + 1);
+  }
+
+  const classify = (pathValue: string | null): AspectAssetStatus => {
+    if (!pathValue) {
+      return "missing";
+    }
+    if (ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN.test(pathValue)) {
+      return "placeholder";
+    }
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    if ((normalizedPathCounts.get(normalized) || 0) > 1) {
+      return "placeholder";
+    }
+    return "ok";
+  };
+
+  return {
+    widescreen: classify(rawByAspect.widescreen),
+    square: classify(rawByAspect.square),
+    vertical: classify(rawByAspect.vertical)
+  };
+}
+
+function hasCompletedAspectAssetsFromOutput(output: unknown): boolean {
+  const aspectAssets = readAspectAssetsFromOutput(output) || deriveAspectAssetsFromPreview(output);
+  if (!aspectAssets) {
+    return false;
+  }
+  return aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
+}
+
 function resolveGenerationOptionStatus(params: {
   output: unknown;
   dbStatus?: string | null;
 }): GenerationOptionStatus {
   const parsed = readGenerationOptionStatusFromOutput(params.output);
   if (parsed) {
+    if (parsed === "COMPLETED" && !hasCompletedAspectAssetsFromOutput(params.output)) {
+      return "FAILED_GENERATION";
+    }
     return parsed;
   }
 
   if (params.dbStatus === "COMPLETED") {
-    return "COMPLETED";
+    return hasCompletedAspectAssetsFromOutput(params.output) ? "COMPLETED" : "FAILED_GENERATION";
   }
   if (params.dbStatus === "FAILED") {
     return "FAILED_GENERATION";
@@ -4070,7 +4180,7 @@ function resolveGenerationOptionStatus(params: {
   if (!params.output) {
     return "FAILED_GENERATION";
   }
-  return "COMPLETED";
+  return hasCompletedAspectAssetsFromOutput(params.output) ? "COMPLETED" : "FAILED_GENERATION";
 }
 
 function isCompletedGenerationOption(params: { output: unknown; dbStatus?: string | null }): boolean {
@@ -5771,12 +5881,25 @@ type BackgroundRerankFallbackDebug = {
 };
 
 type DebugAssetSource = "generated" | "reused" | "fallback";
-type BackgroundAttemptFailureReason = "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN";
+type BackgroundAttemptFailureReason =
+  | "ALL_TEXT"
+  | "ALL_SCAFFOLD"
+  | "API_ERROR"
+  | "RATE_LIMIT"
+  | "BUDGET"
+  | "MISSING_ASPECT_ASSET"
+  | "UNKNOWN";
 type ImageCallStage = "background" | "lockup";
 type ImageCallAspect = "wide" | "square" | "vertical";
 type GenerationOptionStatus = "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
 type GenerationRoundStatus = "COMPLETED" | "PARTIAL" | "FAILED";
 type GenerationRoundFailureReason = "INSUFFICIENT_NONFALLBACK_OPTIONS" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN";
+type AspectAssetStatus = "ok" | "missing" | "placeholder";
+type AspectAssetStatusByOutputAspect = {
+  widescreen: AspectAssetStatus;
+  square: AspectAssetStatus;
+  vertical: AspectAssetStatus;
+};
 
 type TextScrubDebug = {
   attempted: boolean;
@@ -5888,6 +6011,7 @@ type GenerationOutputPayload = {
       warnings?: string[];
       imageCalls?: ImageCallDebugSummary;
       rateLimitWaitMs?: number;
+      aspectAssets?: AspectAssetStatusByOutputAspect;
       roundHasFallback?: boolean;
       roundStatus?: GenerationRoundStatus;
       roundCompletedCount?: number;
@@ -7583,7 +7707,14 @@ function findClosestReferenceDistance(hash: string, references: ReferenceLibrary
   return closest;
 }
 
-async function renderCompositedPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
+async function renderCompositedPreviewPng(
+  designDoc: DesignDoc,
+  options: {
+    renderDebugGuides?: boolean;
+  } = {}
+): Promise<Buffer> {
+  const renderDebugGuides = options.renderDebugGuides ?? false;
+  void renderDebugGuides;
   const svg = await buildFinalSvg(designDoc);
   return sharp(Buffer.from(svg))
     .resize({
@@ -7603,7 +7734,14 @@ function toBackgroundOnlyDesignDoc(designDoc: DesignDoc): DesignDoc {
   };
 }
 
-async function renderBackgroundOnlyPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
+async function renderBackgroundOnlyPreviewPng(
+  designDoc: DesignDoc,
+  options: {
+    renderDebugGuides?: boolean;
+  } = {}
+): Promise<Buffer> {
+  const renderDebugGuides = options.renderDebugGuides ?? false;
+  void renderDebugGuides;
   const svg = await buildFinalSvg(toBackgroundOnlyDesignDoc(designDoc));
   return sharp(Buffer.from(svg))
     .resize({
@@ -7616,6 +7754,87 @@ async function renderBackgroundOnlyPreviewPng(designDoc: DesignDoc): Promise<Buf
     .toBuffer();
 }
 
+function outputAspectForShape(shape: PreviewShape): keyof AspectAssetStatusByOutputAspect {
+  if (shape === "wide") {
+    return "widescreen";
+  }
+  if (shape === "square") {
+    return "square";
+  }
+  return "vertical";
+}
+
+async function evaluateAspectAssetsForCompletion(params: {
+  pathsByShape: Record<PreviewShape, string | null>;
+}): Promise<AspectAssetStatusByOutputAspect> {
+  const normalizedByShape = Object.fromEntries(
+    PREVIEW_SHAPES.map((shape) => [shape, normalizeAssetPathForCompletenessCheck(params.pathsByShape[shape])])
+  ) as Record<PreviewShape, string | null>;
+  const duplicatePathCount = new Map<string, number>();
+  for (const shape of PREVIEW_SHAPES) {
+    const pathValue = normalizedByShape[shape];
+    if (!pathValue) {
+      continue;
+    }
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    duplicatePathCount.set(normalized, (duplicatePathCount.get(normalized) || 0) + 1);
+  }
+
+  const classify = async (shape: PreviewShape): Promise<AspectAssetStatus> => {
+    const pathValue = normalizedByShape[shape];
+    if (!pathValue) {
+      return "missing";
+    }
+    if (ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN.test(pathValue)) {
+      return "placeholder";
+    }
+    const normalizedPath = pathValue.replace(/^\/+/, "").toLowerCase();
+    if ((duplicatePathCount.get(normalizedPath) || 0) > 1) {
+      return "placeholder";
+    }
+
+    if (/^https?:\/\//i.test(pathValue) || /^data:/i.test(pathValue)) {
+      return "ok";
+    }
+
+    const localBuffer = await readAssetBufferFromPublicPath(pathValue);
+    if (!localBuffer) {
+      return "missing";
+    }
+    if (localBuffer.byteLength < 1024) {
+      return "placeholder";
+    }
+
+    try {
+      const metadata = await sharp(localBuffer, { failOn: "none" }).metadata();
+      const expected = PREVIEW_DIMENSIONS[shape];
+      const width = Math.round(metadata.width || 0);
+      const height = Math.round(metadata.height || 0);
+      if (width <= 0 || height <= 0) {
+        return "placeholder";
+      }
+      if (Math.abs(width - expected.width) > 1 || Math.abs(height - expected.height) > 1) {
+        return "placeholder";
+      }
+      return "ok";
+    } catch {
+      return "placeholder";
+    }
+  };
+
+  const statuses = await Promise.all(PREVIEW_SHAPES.map((shape) => classify(shape)));
+  const byOutputAspect: AspectAssetStatusByOutputAspect = {
+    widescreen: "missing",
+    square: "missing",
+    vertical: "missing"
+  };
+  for (const [index, shape] of PREVIEW_SHAPES.entries()) {
+    byOutputAspect[outputAspectForShape(shape)] = statuses[index];
+  }
+
+  return byOutputAspect;
+}
+
 async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
@@ -7624,9 +7843,15 @@ async function completeGenerationWithFallbackOutput(params: {
 }): Promise<GenerationOptionStatus> {
   const designDocByShape = params.output.designDocByShape;
   const [squarePng, widePng, tallPng, lockupResult] = await Promise.all([
-    renderCompositedPreviewPng(designDocByShape.square),
-    renderCompositedPreviewPng(designDocByShape.wide),
-    renderCompositedPreviewPng(designDocByShape.tall),
+    renderCompositedPreviewPng(designDocByShape.square, {
+      renderDebugGuides: false
+    }),
+    renderCompositedPreviewPng(designDocByShape.wide, {
+      renderDebugGuides: false
+    }),
+    renderCompositedPreviewPng(designDocByShape.tall, {
+      renderDebugGuides: false
+    }),
     (async () =>
       renderTrimmedLockupPngFromSvg(
         await buildFinalSvg(designDocByShape.wide, {
@@ -7658,6 +7883,11 @@ async function completeGenerationWithFallbackOutput(params: {
   const fallbackDebugMeta = mergeGenerationDebugMeta(outputWithStatus.meta.debug, {
     backgroundSource: "fallback",
     lockupSource: "fallback",
+    aspectAssets: {
+      widescreen: "placeholder",
+      square: "placeholder",
+      vertical: "placeholder"
+    },
     ...(params.failureReason
       ? {
           backgroundFailureReason: params.failureReason
@@ -9364,7 +9594,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             height: dimensions.height,
             align: templateAlign || titleBlock?.align || "left",
             integrationMode: lockupIntegrationMode,
-            safeRegionOverride: shapeSafeBox
+            safeRegionOverride: shapeSafeBox,
+            renderDebugGuides: false
           });
           const backgroundPath = await writeGenerationPreviewFiles({
             fileName: `${plannedGeneration.id}-${shape}-bg.png`,
@@ -9438,7 +9669,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         masterAttempt.toneRetryCount > 0 ? `[retry: tone-compliance x${masterAttempt.toneRetryCount}]` : "",
         masterAttempt.textArtifactRetryCount > 0 ? `[retry: text-artifact x${masterAttempt.textArtifactRetryCount}]` : "",
         shouldUseCheapRound1Mode
-          ? "cheap mode: widescreen-only output for round 1."
+          ? "cheap mode: widescreen-first generation with derived square/tall composites for round 1."
           : "derived variants: square/wide/tall from one shared background + one shared lockup."
       ]
         .filter(Boolean)
@@ -9471,12 +9702,38 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             wide: wideShapeResult.designDoc,
             tall: tallShapeResult?.designDoc || wideShapeResult.designDoc
           };
-      const squarePreviewPath = shouldUseCheapRound1Mode
-        ? wideShapeResult.finalPath
-        : squareShapeResult?.finalPath || wideShapeResult.finalPath;
-      const tallPreviewPath = shouldUseCheapRound1Mode
-        ? wideShapeResult.finalPath
-        : tallShapeResult?.finalPath || wideShapeResult.finalPath;
+      const previewPathByShape: Record<PreviewShape, string | null> = {
+        square: shouldUseCheapRound1Mode ? null : squareShapeResult?.finalPath || null,
+        wide: wideShapeResult.finalPath,
+        tall: shouldUseCheapRound1Mode ? null : tallShapeResult?.finalPath || null
+      };
+      if (shouldUseCheapRound1Mode) {
+        const [derivedSquarePng, derivedTallPng] = await Promise.all([
+          renderCompositedPreviewPng(designDocByShape.square, {
+            renderDebugGuides: false
+          }),
+          renderCompositedPreviewPng(designDocByShape.tall, {
+            renderDebugGuides: false
+          })
+        ]);
+        const [derivedSquarePath, derivedTallPath] = await Promise.all([
+          writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-square-derived.png`,
+            png: derivedSquarePng
+          }),
+          writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-tall-derived.png`,
+            png: derivedTallPng
+          })
+        ]);
+        previewPathByShape.square = derivedSquarePath;
+        previewPathByShape.tall = derivedTallPath;
+      }
+      const aspectAssets = await evaluateAspectAssetsForCompletion({
+        pathsByShape: previewPathByShape
+      });
+      const hasCompleteAspectAssets =
+        aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
 
       const backgroundAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
         projectId: params.project.id,
@@ -9498,16 +9755,24 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         width: lockupRenderResult.width,
         height: lockupRenderResult.height
       };
-      const finalAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
-        projectId: params.project.id,
-        generationId: plannedGeneration.id,
-        kind: "IMAGE",
-        slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
-        file_path: byShape[shape]?.finalPath || wideShapeResult.finalPath,
-        mime_type: "image/png",
-        width: PREVIEW_DIMENSIONS[shape].width,
-        height: PREVIEW_DIMENSIONS[shape].height
-      }));
+      const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.flatMap((shape) => {
+        const filePath = previewPathByShape[shape];
+        if (!filePath) {
+          return [];
+        }
+        return [
+          {
+            projectId: params.project.id,
+            generationId: plannedGeneration.id,
+            kind: "IMAGE",
+            slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
+            file_path: filePath,
+            mime_type: "image/png",
+            width: PREVIEW_DIMENSIONS[shape].width,
+            height: PREVIEW_DIMENSIONS[shape].height
+          }
+        ];
+      });
       const usedReferenceIds = [...new Set(backgroundStyleRefs.map((reference) => reference.referenceId))];
       const warnings = imageCallCapReached
         ? appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, ROUND1_IMAGE_CALL_CAP_WARNING)
@@ -9530,6 +9795,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           warnings,
           imageCalls: imageCallSummary,
           rateLimitWaitMs: imageRateLimitDebugMeta.rateLimitWaitMs ?? 0,
+          aspectAssets,
           ...(shouldRunExplorationToneCheck
             ? {
                 backgroundAttempts: backgroundAttemptDiagnostics
@@ -9661,9 +9927,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         },
         preview: {
-          square_main: squarePreviewPath,
-          widescreen_main: wideShapeResult.finalPath,
-          vertical_main: tallPreviewPath
+          square_main: previewPathByShape.square || "",
+          widescreen_main: previewPathByShape.wide || "",
+          vertical_main: previewPathByShape.tall || ""
         }
       };
       if (process.env.NODE_ENV === "development") {
@@ -9671,6 +9937,58 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           optionIndex: plannedGeneration.optionIndex,
           debug: completedOutput.meta?.debug
         });
+      }
+      const persistedInputWithLockupPalette = withResolvedLockupPaletteInput(
+        plannedGeneration.input,
+        {
+          ...designBrief,
+          lockupRecipe: lockupRecipeForRender
+        },
+        resolvedLockupPalette
+      );
+      if (!hasCompleteAspectAssets) {
+        const failureReason: BackgroundAttemptFailureReason = "MISSING_ASPECT_ASSET";
+        const failedOutput: GenerationOutputPayload = {
+          ...completedOutput,
+          status: "FAILED_GENERATION",
+          notes: "missing_aspect_asset",
+          meta: {
+            ...completedOutput.meta,
+            debug: mergeGenerationDebugMeta(completedOutput.meta.debug, {
+              backgroundFailureReason: failureReason,
+              aspectAssets,
+              warnings: appendUniqueDebugWarning(
+                completedOutput.meta.debug?.warnings,
+                "Missing or placeholder aspect asset detected."
+              )
+            })
+          }
+        };
+        await prisma.$transaction([
+          prisma.asset.deleteMany({
+            where: {
+              generationId: plannedGeneration.id,
+              slot: {
+                in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+              }
+            }
+          }),
+          prisma.generation.update({
+            where: {
+              id: plannedGeneration.id
+            },
+            data: {
+              status: "FAILED",
+              output: failedOutput as Prisma.InputJsonValue,
+              input: persistedInputWithLockupPalette
+            }
+          })
+        ]);
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus: "FAILED_GENERATION",
+          failureReason
+        };
       }
 
       await prisma.$transaction([
@@ -9692,14 +10010,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           data: {
             status: "COMPLETED",
             output: completedOutput as Prisma.InputJsonValue,
-            input: withResolvedLockupPaletteInput(
-              plannedGeneration.input,
-              {
-                ...designBrief,
-                lockupRecipe: lockupRecipeForRender
-              },
-              resolvedLockupPalette
-            )
+            input: persistedInputWithLockupPalette
           }
         })
       ]);
@@ -9746,6 +10057,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               backgroundSource: "fallback",
               lockupSource: "fallback",
               backgroundFailureReason: failureReason,
+              aspectAssets: {
+                widescreen: "missing",
+                square: "missing",
+                vertical: "missing"
+              },
               warnings: appendUniqueDebugWarning(warnings, `Fallback error: ${fallbackMessage}`)
             })
           }
