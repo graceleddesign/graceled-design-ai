@@ -26,3 +26,5 @@ reference_zips/*.zip
 public/debug/
 
 .cache/
+
+reference_assets_v1.zip
