@@ -576,7 +576,10 @@ export async function composeLockupOnBackground(params: {
   align?: LockupAlign;
   integrationMode?: LockupIntegrationMode;
   safeRegionOverride?: LockupSafeRegionRatio;
+  renderDebugGuides?: boolean;
 }): Promise<Buffer> {
+  const renderDebugGuides = params.renderDebugGuides ?? false;
+  void renderDebugGuides;
   const safeRegion = lockupSafeRegion(params.shape, params.width, params.height, params.safeRegionOverride);
   const backgroundCanvas = await sharp(params.backgroundPng, { failOn: "none" })
     .ensureAlpha()
