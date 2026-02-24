@@ -3,6 +3,7 @@ import "server-only";
 import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
 import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
 import { openai } from "@/lib/openai";
 
@@ -142,19 +143,23 @@ async function generatePngWithOpenAi(params: {
 
   for (const model of models) {
     try {
-      const response = await openai.responses.create({
-        model,
-        input: params.prompt,
-        tool_choice: { type: "image_generation" },
-        tools: [
-          {
-            type: "image_generation",
-            size: params.size,
-            quality: params.quality,
-            background: "opaque"
-          }
-        ]
-      });
+      const response = await runWithGptImage429Retry(() =>
+        runWithGptImageBudget(() =>
+          openai.responses.create({
+            model,
+            input: params.prompt,
+            tool_choice: { type: "image_generation" },
+            tools: [
+              {
+                type: "image_generation",
+                size: params.size,
+                quality: params.quality,
+                background: "opaque"
+              }
+            ]
+          })
+        )
+      );
       const b64 = extractGeneratedImageB64(response);
       return Buffer.from(b64, "base64");
     } catch (error) {

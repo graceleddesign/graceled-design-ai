@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
 
 type Shape = "square" | "wide" | "tall";
 
@@ -67,13 +68,17 @@ export async function generateBackgroundPng(params: {
 
   const client = new OpenAI({ apiKey });
   const prompt = buildPrompt(params);
-  const result = await client.images.generate({
-    model: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1-mini",
-    prompt,
-    size: SIZE_BY_SHAPE[params.shape],
-    quality: (process.env.OPENAI_IMAGE_QUALITY as "low" | "medium" | "high" | "auto") ?? "medium",
-    response_format: "b64_json"
-  });
+  const result = await runWithGptImage429Retry(() =>
+    runWithGptImageBudget(() =>
+      client.images.generate({
+        model: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1-mini",
+        prompt,
+        size: SIZE_BY_SHAPE[params.shape],
+        quality: (process.env.OPENAI_IMAGE_QUALITY as "low" | "medium" | "high" | "auto") ?? "medium",
+        response_format: "b64_json"
+      })
+    )
+  );
 
   const b64 = result.data?.[0]?.b64_json;
   if (!b64) {

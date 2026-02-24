@@ -81,6 +81,34 @@ export type PlannedDirectionSpec = DirectionTemplate & {
   referenceToneHint?: StyleToneKey;
   referenceMediumHint?: StyleMediumKey;
   lockupLayoutFamily?: string;
+  refinementMutationAxis?: RefinementMutationAxis;
+  refinementVariantFingerprint?: string;
+  refinementMotifEmphasisProfile?: "primary_large" | "distributed_balance" | "foreground_cluster" | "edge_repeat";
+  refinementTypographyEnergyProfile?: "tight" | "balanced" | "airy";
+};
+
+export type RefinementMutationAxis = "composition" | "motif_emphasis" | "typography_energy";
+
+export type RefinementLockedStyleInvariants = {
+  toneLane: StyleToneKey | null;
+  styleFamily: StyleFamilyKey | null;
+  templateFamily: string | null;
+  referenceAnchorIds: string[];
+  motifPrimitives: string[];
+};
+
+export type PlannedRefinementVariant = {
+  optionIndex: number;
+  optionLabel: "A" | "B" | "C";
+  axis: RefinementMutationAxis;
+  fingerprint: string;
+  noveltyRetryApplied: boolean;
+};
+
+export type PlannedRefinementSet = {
+  directions: PlannedDirectionSpec[];
+  variants: PlannedRefinementVariant[];
+  lockedInvariants: RefinementLockedStyleInvariants;
 };
 
 const OPTION_LABELS: Array<"A" | "B" | "C"> = ["A", "B", "C"];
@@ -1938,71 +1966,277 @@ function normalizeMotifPool(motifs?: readonly string[]): string[] {
   return normalized;
 }
 
-function pickRound2BackgroundVariationTemplateKey(params: {
+function normalizeReferenceAnchorIds(input?: readonly string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input || []) {
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function normalizeTemplateFamilyKey(value?: string | null): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim().toLowerCase();
+  return trimmed || null;
+}
+
+function deriveTemplateFamilyFromVariationTemplateKey(variationTemplateKey?: string): string | null {
+  const key = typeof variationTemplateKey === "string" ? variationTemplateKey.trim() : "";
+  if (!key) {
+    return null;
+  }
+  const template = getRound1VariationTemplateByKey(key);
+  if (template?.cluster && template.cluster !== "other") {
+    return `cluster:${template.cluster}`;
+  }
+  const normalized = key.toLowerCase();
+  const parts = normalized.split("_").filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0]}_${parts[1]}`;
+  }
+  return normalized || null;
+}
+
+function normalizeRefinementLockedStyleInvariants(params: {
+  primaryDirection: PlannedDirectionSpec;
+  lockedInvariants?: RefinementLockedStyleInvariants;
+}): RefinementLockedStyleInvariants {
+  const primaryStyleFamily = isStyleFamilyKey(params.primaryDirection.styleFamily) ? params.primaryDirection.styleFamily : null;
+  const primaryStyleTone = isStyleToneKey(params.primaryDirection.styleTone)
+    ? params.primaryDirection.styleTone
+    : primaryStyleFamily
+      ? STYLE_FAMILY_BANK[primaryStyleFamily].tone
+      : null;
+  const styleFamily = isStyleFamilyKey(params.lockedInvariants?.styleFamily) ? params.lockedInvariants.styleFamily : primaryStyleFamily;
+  const toneLane = isStyleToneKey(params.lockedInvariants?.toneLane) ? params.lockedInvariants.toneLane : primaryStyleTone;
+  const templateFamily =
+    normalizeTemplateFamilyKey(params.lockedInvariants?.templateFamily) ||
+    deriveTemplateFamilyFromVariationTemplateKey(params.primaryDirection.variationTemplateKey);
+  const referenceAnchorIds = normalizeReferenceAnchorIds([
+    ...(params.lockedInvariants?.referenceAnchorIds || []),
+    ...(params.primaryDirection.referenceId ? [params.primaryDirection.referenceId] : [])
+  ]);
+  const motifPrimitives = normalizeMotifPool([
+    ...(params.lockedInvariants?.motifPrimitives || []),
+    ...normalizeMotifPool(params.primaryDirection.motifFocus).slice(0, 2)
+  ]).slice(0, 2);
+  return {
+    toneLane: toneLane || null,
+    styleFamily: styleFamily || null,
+    templateFamily,
+    referenceAnchorIds,
+    motifPrimitives
+  };
+}
+
+function withLockedInvariants(params: {
+  primaryDirection: PlannedDirectionSpec;
+  lockedInvariants: RefinementLockedStyleInvariants;
+}): PlannedDirectionSpec {
+  const locked = params.lockedInvariants;
+  const next: PlannedDirectionSpec = {
+    ...params.primaryDirection,
+    motifFocus: locked.motifPrimitives.slice(0, 2)
+  };
+  if (locked.referenceAnchorIds.length > 0) {
+    next.referenceId = locked.referenceAnchorIds[0];
+  }
+  if (locked.styleFamily) {
+    const record = STYLE_FAMILY_BANK[locked.styleFamily];
+    next.styleFamily = locked.styleFamily;
+    next.styleBucket = record.bucket;
+    next.styleTone = record.tone;
+    next.styleMedium = record.medium;
+  }
+  if (locked.toneLane) {
+    next.styleTone = locked.toneLane;
+  }
+  next.refinementMutationAxis = undefined;
+  next.refinementVariantFingerprint = undefined;
+  next.refinementMotifEmphasisProfile = undefined;
+  next.refinementTypographyEnergyProfile = undefined;
+  return next;
+}
+
+function refinementTemplatePoolByFamily(params: {
+  templateFamily: string | null;
+  fallbackKey?: string;
+}): string[] {
+  const templates = listRound1VariationTemplates();
+  if (templates.length <= 0) {
+    return params.fallbackKey ? [params.fallbackKey] : [];
+  }
+  const family = normalizeTemplateFamilyKey(params.templateFamily);
+  if (!family) {
+    return templates.map((template) => template.key);
+  }
+  const matched = templates
+    .filter((template) => normalizeTemplateFamilyKey(deriveTemplateFamilyFromVariationTemplateKey(template.key)) === family)
+    .map((template) => template.key);
+  if (matched.length > 0) {
+    return matched;
+  }
+  return templates.map((template) => template.key);
+}
+
+function pickRefinementCompositionTemplateKey(params: {
   runSeed: string;
   primaryDirection: PlannedDirectionSpec;
+  templateFamily: string | null;
+  attempt: number;
 }): string | undefined {
   const currentKey = params.primaryDirection.variationTemplateKey?.trim() || "";
-  const currentTemplate = currentKey ? getRound1VariationTemplateByKey(currentKey) : null;
-  const cluster =
-    params.primaryDirection.referenceCluster ||
-    (currentTemplate?.cluster && currentTemplate.cluster !== "other" ? currentTemplate.cluster : null);
-  const templatePool = cluster ? getRound1ClusterProfile(cluster).variationTemplates : listRound1VariationTemplates();
-  if (templatePool.length <= 0) {
+  const pool = refinementTemplatePoolByFamily({
+    templateFamily: params.templateFamily,
+    fallbackKey: currentKey || undefined
+  });
+  if (pool.length <= 0) {
     return currentKey || undefined;
   }
-
-  const ordered = [...templatePool].sort((a, b) => {
-    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|background-variation|${cluster || "global"}|${a.key}`);
-    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|background-variation|${cluster || "global"}|${b.key}`);
+  const ordered = [...pool].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|refinement-composition|${params.templateFamily || "any"}|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|refinement-composition|${params.templateFamily || "any"}|${b}`);
     return aHash - bHash;
   });
-  const alternative = ordered.find((template) => template.key !== currentKey);
-  return (alternative || ordered[0])?.key || currentKey || undefined;
+  const alternatives = ordered.filter((key) => key !== currentKey);
+  if (alternatives.length <= 0) {
+    return currentKey || ordered[0];
+  }
+  const index = Math.max(0, Math.min(params.attempt, alternatives.length - 1));
+  return alternatives[index] || alternatives[0];
 }
 
-function pickRound2TitleIntegrationModeVariation(params: {
+function pickRefinementMotifEmphasisVariation(params: {
   runSeed: string;
   primaryDirection: PlannedDirectionSpec;
-}): TitleIntegrationMode | undefined {
-  const currentMode = params.primaryDirection.titleIntegrationMode;
-  const ordered = [...ROUND1_TITLE_INTEGRATION_MODES].sort((a, b) => {
-    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|title-mode|${a}`);
-    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|title-mode|${b}`);
+  lockedInvariants: RefinementLockedStyleInvariants;
+  attempt: number;
+}): {
+  motifFocus: string[];
+  emphasisProfile: "primary_large" | "distributed_balance" | "foreground_cluster" | "edge_repeat";
+} {
+  const base = normalizeMotifPool(params.lockedInvariants.motifPrimitives);
+  const motifPermutations =
+    base.length >= 2
+      ? [
+          [base[0], base[1]],
+          [base[1], base[0]]
+        ]
+      : [base.slice(0, 1)];
+  const profiles: Array<"primary_large" | "distributed_balance" | "foreground_cluster" | "edge_repeat"> = [
+    "primary_large",
+    "distributed_balance",
+    "foreground_cluster",
+    "edge_repeat"
+  ];
+  const combinations = motifPermutations.flatMap((motifFocus) =>
+    profiles.map((profile) => ({
+      motifFocus,
+      emphasisProfile: profile
+    }))
+  );
+  const ordered = [...combinations].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|refinement-motif|${a.motifFocus.join(",")}|${a.emphasisProfile}`);
+    const bHash = hashToSeed(`${params.runSeed}|refinement-motif|${b.motifFocus.join(",")}|${b.emphasisProfile}`);
     return aHash - bHash;
   });
-  const alternative = ordered.find((mode) => mode !== currentMode);
-  return alternative || currentMode || ordered[0];
+  const selected = ordered[Math.max(0, Math.min(params.attempt, ordered.length - 1))] || ordered[0];
+  return {
+    motifFocus: selected?.motifFocus || base.slice(0, 1),
+    emphasisProfile: selected?.emphasisProfile || "primary_large"
+  };
 }
 
-function pickRound2MotifFocusVariation(params: {
+const REFINEMENT_TYPOGRAPHY_ENERGY_PROFILES: Array<"tight" | "balanced" | "airy"> = ["tight", "balanced", "airy"];
+
+function pickRefinementTypographyVariation(params: {
   runSeed: string;
   primaryDirection: PlannedDirectionSpec;
-  motifPool?: readonly string[];
-}): string[] {
-  const currentFocus = normalizeMotifPool(params.primaryDirection.motifFocus).slice(0, 2);
-  const pool = normalizeMotifPool([...(params.motifPool || []), ...currentFocus]);
-
-  if (currentFocus.length >= 2) {
-    return [currentFocus[1], currentFocus[0]];
-  }
-
-  if (currentFocus.length === 1) {
-    const primary = currentFocus[0];
-    const alternative = pool.find((motif) => normalizeMotifKey(motif) !== normalizeMotifKey(primary));
-    return alternative ? [alternative, primary] : [primary];
-  }
-
-  if (pool.length <= 0) {
-    return [];
-  }
-
-  const orderedPool = [...pool].sort((a, b) => {
-    const aHash = hashToSeed(`${params.runSeed}|round2-refinement|motif-emphasis|${a}`);
-    const bHash = hashToSeed(`${params.runSeed}|round2-refinement|motif-emphasis|${b}`);
+  attempt: number;
+}): {
+  lockupPresetId: string;
+  energyProfile: "tight" | "balanced" | "airy";
+} {
+  const currentPreset = params.primaryDirection.lockupPresetId;
+  const pool = dedupe([
+    ...DIRECTION_TEMPLATES.filter(
+      (template) =>
+        template.laneFamily === params.primaryDirection.laneFamily &&
+        template.templateStyleFamily === params.primaryDirection.templateStyleFamily
+    ).map((template) => template.lockupPresetId),
+    currentPreset
+  ]).filter((preset): preset is string => typeof preset === "string" && preset.trim().length > 0);
+  const ordered = [...pool].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|refinement-typography|${params.primaryDirection.laneFamily}|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|refinement-typography|${params.primaryDirection.laneFamily}|${b}`);
     return aHash - bHash;
   });
-  return orderedPool.slice(0, 2);
+  const alternatives = ordered.filter((preset) => preset !== currentPreset);
+  const lockupPresetId =
+    alternatives[Math.max(0, Math.min(params.attempt, alternatives.length - 1))] || currentPreset || ordered[0] || "split_title_dynamic";
+  const profileOrder = [...REFINEMENT_TYPOGRAPHY_ENERGY_PROFILES].sort((a, b) => {
+    const aHash = hashToSeed(`${params.runSeed}|refinement-typography-profile|${a}`);
+    const bHash = hashToSeed(`${params.runSeed}|refinement-typography-profile|${b}`);
+    return aHash - bHash;
+  });
+  const energyProfile = profileOrder[Math.max(0, Math.min(params.attempt, profileOrder.length - 1))] || profileOrder[0] || "balanced";
+  return {
+    lockupPresetId,
+    energyProfile
+  };
+}
+
+function normalizeSeenVariantFingerprints(values?: readonly string[]): Set<string> {
+  const normalized = new Set<string>();
+  for (const value of values || []) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    normalized.add(trimmed);
+  }
+  return normalized;
+}
+
+export function createRefinementVariantFingerprint(params: {
+  direction: PlannedDirectionSpec;
+  referenceAnchorIds?: readonly string[];
+}): string {
+  const referenceIds = normalizeReferenceAnchorIds([...(params.referenceAnchorIds || []), params.direction.referenceId || ""]).join(",");
+  const motifSymbols = normalizeMotifPool(params.direction.motifFocus).slice(0, 2).join(",");
+  const templateKey = params.direction.variationTemplateKey?.trim() || params.direction.presetKey;
+  const typographyRecipe = [
+    params.direction.lockupPresetId,
+    params.direction.typeProfile,
+    params.direction.refinementTypographyEnergyProfile || "base",
+    params.direction.refinementMotifEmphasisProfile || "base",
+    params.direction.titleIntegrationMode || "auto"
+  ]
+    .filter(Boolean)
+    .join("|");
+  const paletteFamily = [params.direction.styleFamily || "", params.direction.styleBucket || "", params.direction.styleTone || ""].join("|");
+  const source = [templateKey, motifSymbols, typographyRecipe, paletteFamily, referenceIds].join("||");
+  const hashA = hashToSeed(source).toString(16).padStart(8, "0");
+  const hashB = hashToSeed(`refinement|${source}`).toString(16).padStart(8, "0");
+  return `${hashA}${hashB}`;
 }
 
 export function planRoundTwoRefinementSet(params: {
@@ -2010,45 +2244,116 @@ export function planRoundTwoRefinementSet(params: {
   primaryDirection: PlannedDirectionSpec;
   motifPool?: readonly string[];
   optionCount?: number;
+  lockedInvariants?: RefinementLockedStyleInvariants;
+  seenVariantFingerprints?: readonly string[];
 }): PlannedDirectionSpec[] {
+  return planRefinementDirectionSet(params).directions;
+}
+
+export function planRefinementDirectionSet(params: {
+  runSeed: string;
+  primaryDirection: PlannedDirectionSpec;
+  motifPool?: readonly string[];
+  optionCount?: number;
+  lockedInvariants?: RefinementLockedStyleInvariants;
+  seenVariantFingerprints?: readonly string[];
+}): PlannedRefinementSet {
   const count = Math.max(1, Math.min(params.optionCount || 3, 3));
+  const lockedInvariants = normalizeRefinementLockedStyleInvariants({
+    primaryDirection: params.primaryDirection,
+    lockedInvariants: params.lockedInvariants
+  });
   const baseDirection: PlannedDirectionSpec = {
-    ...params.primaryDirection,
+    ...withLockedInvariants({
+      primaryDirection: params.primaryDirection,
+      lockedInvariants
+    }),
     optionIndex: 0,
-    optionLabel: "A",
-    motifFocus: normalizeMotifPool(params.primaryDirection.motifFocus).slice(0, 2)
+    optionLabel: "A"
   };
+  const seenFingerprints = normalizeSeenVariantFingerprints(params.seenVariantFingerprints);
+  const variants: PlannedRefinementVariant[] = [];
+  const directions: PlannedDirectionSpec[] = [];
+  const axisOrder: RefinementMutationAxis[] = ["composition", "motif_emphasis", "typography_energy"];
 
-  const optionA: PlannedDirectionSpec = {
-    ...baseDirection,
-    variationTemplateKey: pickRound2BackgroundVariationTemplateKey({
-      runSeed: params.runSeed,
-      primaryDirection: baseDirection
-    })
-  };
-
-  const optionB: PlannedDirectionSpec = {
-    ...baseDirection,
-    titleIntegrationMode: pickRound2TitleIntegrationModeVariation({
-      runSeed: params.runSeed,
-      primaryDirection: baseDirection
-    })
-  };
-
-  const optionC: PlannedDirectionSpec = {
-    ...baseDirection,
-    motifFocus: pickRound2MotifFocusVariation({
+  const buildCandidateForAxis = (axis: RefinementMutationAxis, attempt: number): PlannedDirectionSpec => {
+    if (axis === "composition") {
+      return {
+        ...baseDirection,
+        variationTemplateKey: pickRefinementCompositionTemplateKey({
+          runSeed: params.runSeed,
+          primaryDirection: baseDirection,
+          templateFamily: lockedInvariants.templateFamily,
+          attempt
+        }),
+        refinementMutationAxis: "composition"
+      };
+    }
+    if (axis === "motif_emphasis") {
+      const motifVariation = pickRefinementMotifEmphasisVariation({
+        runSeed: params.runSeed,
+        primaryDirection: baseDirection,
+        lockedInvariants,
+        attempt
+      });
+      return {
+        ...baseDirection,
+        motifFocus: motifVariation.motifFocus,
+        refinementMutationAxis: "motif_emphasis",
+        refinementMotifEmphasisProfile: motifVariation.emphasisProfile
+      };
+    }
+    const typographyVariation = pickRefinementTypographyVariation({
       runSeed: params.runSeed,
       primaryDirection: baseDirection,
-      motifPool: params.motifPool
-    })
+      attempt
+    });
+    return {
+      ...baseDirection,
+      lockupPresetId: typographyVariation.lockupPresetId,
+      refinementMutationAxis: "typography_energy",
+      refinementTypographyEnergyProfile: typographyVariation.energyProfile
+    };
   };
 
-  return [optionA, optionB, optionC].slice(0, count).map((spec, optionIndex) => ({
-    ...spec,
-    optionIndex,
-    optionLabel: optionLabel(optionIndex)
-  }));
+  for (let optionIndex = 0; optionIndex < count; optionIndex += 1) {
+    const axis = axisOrder[optionIndex] || "typography_energy";
+    let noveltyRetryApplied = false;
+    let candidate = buildCandidateForAxis(axis, 0);
+    let fingerprint = createRefinementVariantFingerprint({
+      direction: candidate,
+      referenceAnchorIds: lockedInvariants.referenceAnchorIds
+    });
+    if (seenFingerprints.has(fingerprint)) {
+      noveltyRetryApplied = true;
+      candidate = buildCandidateForAxis(axis, 1);
+      fingerprint = createRefinementVariantFingerprint({
+        direction: candidate,
+        referenceAnchorIds: lockedInvariants.referenceAnchorIds
+      });
+    }
+    seenFingerprints.add(fingerprint);
+    const option = {
+      ...candidate,
+      optionIndex,
+      optionLabel: optionLabel(optionIndex),
+      refinementVariantFingerprint: fingerprint
+    };
+    directions.push(option);
+    variants.push({
+      optionIndex,
+      optionLabel: optionLabel(optionIndex),
+      axis,
+      fingerprint,
+      noveltyRetryApplied
+    });
+  }
+
+  return {
+    directions,
+    variants,
+    lockedInvariants
+  };
 }
 
 function buildRound1ReferenceAssignments(params: {

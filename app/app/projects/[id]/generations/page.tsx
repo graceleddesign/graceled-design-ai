@@ -26,6 +26,13 @@ type GenerationAssetRecord = {
 };
 
 type OptionDesignSpecSummary = {
+  optionStatus: "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
+  roundHasFallback: boolean;
+  roundStatus: "COMPLETED" | "PARTIAL" | "FAILED" | null;
+  roundCompletedCount: number | null;
+  roundAttemptCount: number | null;
+  roundRequiredCompletedCount: number | null;
+  roundFailureReason: "INSUFFICIENT_NONFALLBACK_OPTIONS" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
   wantsTitleStage: boolean;
   wantsSeriesMark: boolean;
   styleBucket: string | null;
@@ -38,8 +45,49 @@ type OptionDesignSpecSummary = {
   referenceId: string | null;
   referenceCluster: string | null;
   variationTemplateKey: string | null;
+  debugTemplateKey: string | null;
+  debugTypeRegion: string | null;
+  debugMotifRegion: string | null;
+  debugTitleIntegrationMode: string | null;
   debugBackgroundAnchorSrc: string | null;
   debugLockupAnchorSrc: string | null;
+  debugBackgroundSource: "generated" | "reused" | "fallback" | null;
+  debugLockupSource: "generated" | "reused" | "fallback" | null;
+  debugBackgroundFailureReason: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+  debugWarning: string | null;
+  debugImageCalls: {
+    total: number;
+    retries: number;
+    byStage: {
+      background: number;
+      lockup: number;
+    };
+    byAspect: {
+      wide: number;
+      square: number;
+      vertical: number;
+    };
+  } | null;
+  debugRateLimitWaitMs: number | null;
+  debugRefinementChainId: string | null;
+  debugAnchorDirectionFingerprint: string | null;
+  debugLockedInvariantsSummary: string | null;
+  debugVariantMutationAxis: "composition" | "motif_emphasis" | "typography_energy" | null;
+  debugEliminatedChecks: string[];
+  debugBestEffortBackground: {
+    imageUrl: string;
+    score: number | null;
+    failedChecks: Array<"textOk" | "scaffoldOk" | "motifOk" | "toneOk">;
+    failureReason: "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+    eligibleCount: number;
+    totalCandidates: number;
+    failureCounts: {
+      textOk: number;
+      scaffoldOk: number;
+      motifOk: number;
+      toneOk: number;
+    };
+  } | null;
 };
 
 const OPTION_TINTS = [
@@ -50,6 +98,58 @@ const OPTION_TINTS = [
   "from-violet-200 to-violet-50",
   "from-slate-300 to-slate-100"
 ];
+
+const BACKGROUND_FAILURE_REASONS = ["ALL_TEXT", "ALL_SCAFFOLD", "API_ERROR", "RATE_LIMIT", "BUDGET", "UNKNOWN"] as const;
+const BACKGROUND_CHECK_KEYS = ["textOk", "scaffoldOk", "motifOk", "toneOk"] as const;
+const ROUND1_IMAGE_CALL_CAP_WARNING = "Image call cap reached; returning best available.";
+const REQUIRED_COMPLETED_OPTIONS_PER_ROUND = 3;
+
+type BackgroundFailureReason = (typeof BACKGROUND_FAILURE_REASONS)[number];
+type BackgroundCheckKey = (typeof BACKGROUND_CHECK_KEYS)[number];
+
+function isOptionGenerationStatus(value: unknown): value is "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
+  return value === "COMPLETED" || value === "FAILED_GENERATION" || value === "FALLBACK";
+}
+
+function isRoundStatus(value: unknown): value is "COMPLETED" | "PARTIAL" | "FAILED" {
+  return value === "COMPLETED" || value === "PARTIAL" || value === "FAILED";
+}
+
+function resolveOptionGenerationStatus(output: unknown, dbStatus?: string): "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
+  if (output && typeof output === "object" && !Array.isArray(output)) {
+    const directStatus = (output as { status?: unknown }).status;
+    if (isOptionGenerationStatus(directStatus)) {
+      return directStatus;
+    }
+    const meta = (output as { meta?: unknown }).meta;
+    if (meta && typeof meta === "object" && !Array.isArray(meta)) {
+      const debug = (meta as { debug?: unknown }).debug;
+      if (debug && typeof debug === "object" && !Array.isArray(debug)) {
+        if ((debug as { backgroundSource?: unknown }).backgroundSource === "fallback") {
+          return "FALLBACK";
+        }
+      }
+    }
+  }
+
+  if (dbStatus === "FAILED") {
+    return "FAILED_GENERATION";
+  }
+  if (dbStatus === "COMPLETED") {
+    return "COMPLETED";
+  }
+  if (dbStatus === "RUNNING" || dbStatus === "QUEUED") {
+    return "FAILED_GENERATION";
+  }
+  if (!output) {
+    return "FAILED_GENERATION";
+  }
+  return "COMPLETED";
+}
+
+function isBackgroundFailureReason(value: unknown): value is BackgroundFailureReason {
+  return typeof value === "string" && BACKGROUND_FAILURE_REASONS.includes(value as BackgroundFailureReason);
+}
 
 function normalizeAssetUrl(filePath: string): string {
   const trimmed = filePath.trim();
@@ -127,8 +227,15 @@ function readAssetPreview(assets: GenerationAssetRecord[]): PreviewFields {
   };
 }
 
-function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
+function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesignSpecSummary {
   const fallback: OptionDesignSpecSummary = {
+    optionStatus: resolveOptionGenerationStatus(output, dbStatus),
+    roundHasFallback: false,
+    roundStatus: null,
+    roundCompletedCount: null,
+    roundAttemptCount: null,
+    roundRequiredCompletedCount: null,
+    roundFailureReason: null,
     wantsTitleStage: false,
     wantsSeriesMark: false,
     styleBucket: null,
@@ -141,8 +248,24 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     referenceId: null,
     referenceCluster: null,
     variationTemplateKey: null,
+    debugTemplateKey: null,
+    debugTypeRegion: null,
+    debugMotifRegion: null,
+    debugTitleIntegrationMode: null,
     debugBackgroundAnchorSrc: null,
-    debugLockupAnchorSrc: null
+    debugLockupAnchorSrc: null,
+    debugBackgroundSource: null,
+    debugLockupSource: null,
+    debugBackgroundFailureReason: null,
+    debugWarning: null,
+    debugImageCalls: null,
+    debugRateLimitWaitMs: null,
+    debugRefinementChainId: null,
+    debugAnchorDirectionFingerprint: null,
+    debugLockedInvariantsSummary: null,
+    debugVariantMutationAxis: null,
+    debugEliminatedChecks: [],
+    debugBestEffortBackground: null
   };
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return fallback;
@@ -154,6 +277,196 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   }
 
   const debug = (meta as { debug?: unknown }).debug;
+  const debugObject = debug && typeof debug === "object" && !Array.isArray(debug) ? debug : null;
+  const roundHasFallbackCandidate = debugObject ? (debugObject as { roundHasFallback?: unknown }).roundHasFallback : null;
+  const roundStatusCandidate = debugObject ? (debugObject as { roundStatus?: unknown }).roundStatus : null;
+  const roundCompletedCountCandidate = debugObject ? (debugObject as { roundCompletedCount?: unknown }).roundCompletedCount : null;
+  const roundAttemptCountCandidate = debugObject ? (debugObject as { roundAttemptCount?: unknown }).roundAttemptCount : null;
+  const roundRequiredCompletedCountCandidate = debugObject
+    ? (debugObject as { roundRequiredCompletedCount?: unknown }).roundRequiredCompletedCount
+    : null;
+  const roundFailureReasonCandidate = debugObject ? (debugObject as { roundFailureReason?: unknown }).roundFailureReason : null;
+  const debugBackgroundSourceCandidate = debugObject
+    ? (debugObject as { backgroundSource?: unknown }).backgroundSource
+    : null;
+  const debugLockupSourceCandidate = debugObject ? (debugObject as { lockupSource?: unknown }).lockupSource : null;
+  const debugBackgroundFailureReasonCandidate = debugObject
+    ? (debugObject as { backgroundFailureReason?: unknown }).backgroundFailureReason
+    : null;
+  const warningsCandidate = debugObject ? (debugObject as { warnings?: unknown }).warnings : null;
+  const warnings = Array.isArray(warningsCandidate)
+    ? warningsCandidate.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : [];
+  const debugWarning =
+    warnings.find((value) => value.trim().toLowerCase() === ROUND1_IMAGE_CALL_CAP_WARNING.toLowerCase()) ||
+    warnings[0] ||
+    null;
+  const imageCallsCandidate = debugObject ? (debugObject as { imageCalls?: unknown }).imageCalls : null;
+  const imageCallsObject =
+    imageCallsCandidate && typeof imageCallsCandidate === "object" && !Array.isArray(imageCallsCandidate)
+      ? (imageCallsCandidate as {
+          total?: unknown;
+          retries?: unknown;
+          byStage?: unknown;
+          byAspect?: unknown;
+        })
+      : null;
+  const byStageObject =
+    imageCallsObject?.byStage && typeof imageCallsObject.byStage === "object" && !Array.isArray(imageCallsObject.byStage)
+      ? (imageCallsObject.byStage as Record<string, unknown>)
+      : null;
+  const byAspectObject =
+    imageCallsObject?.byAspect && typeof imageCallsObject.byAspect === "object" && !Array.isArray(imageCallsObject.byAspect)
+      ? (imageCallsObject.byAspect as Record<string, unknown>)
+      : null;
+  const imageCallsTotalCandidate = imageCallsObject?.total;
+  const imageCallsRetriesCandidate = imageCallsObject?.retries;
+  const debugImageCalls =
+    typeof imageCallsTotalCandidate === "number" && Number.isFinite(imageCallsTotalCandidate)
+      ? {
+          total: imageCallsTotalCandidate,
+          retries:
+            typeof imageCallsRetriesCandidate === "number" && Number.isFinite(imageCallsRetriesCandidate)
+              ? imageCallsRetriesCandidate
+              : 0,
+          byStage: {
+            background:
+              typeof byStageObject?.background === "number" && Number.isFinite(byStageObject.background)
+                ? byStageObject.background
+                : 0,
+            lockup:
+              typeof byStageObject?.lockup === "number" && Number.isFinite(byStageObject.lockup)
+                ? byStageObject.lockup
+                : 0
+          },
+          byAspect: {
+            wide: typeof byAspectObject?.wide === "number" && Number.isFinite(byAspectObject.wide) ? byAspectObject.wide : 0,
+            square:
+              typeof byAspectObject?.square === "number" && Number.isFinite(byAspectObject.square) ? byAspectObject.square : 0,
+            vertical:
+              typeof byAspectObject?.vertical === "number" && Number.isFinite(byAspectObject.vertical)
+                ? byAspectObject.vertical
+                : 0
+          }
+        }
+      : null;
+  const debugRateLimitWaitMsCandidate = debugObject ? (debugObject as { rateLimitWaitMs?: unknown }).rateLimitWaitMs : null;
+  const debugRateLimitWaitMs =
+    typeof debugRateLimitWaitMsCandidate === "number" && Number.isFinite(debugRateLimitWaitMsCandidate)
+      ? debugRateLimitWaitMsCandidate
+      : null;
+  const debugRefinementCandidate = debugObject ? (debugObject as { refinement?: unknown }).refinement : null;
+  const debugRefinementObject =
+    debugRefinementCandidate && typeof debugRefinementCandidate === "object" && !Array.isArray(debugRefinementCandidate)
+      ? (debugRefinementCandidate as {
+          refinementChainId?: unknown;
+          anchorDirectionFingerprint?: unknown;
+          lockedInvariantsSummary?: unknown;
+          variantMutationAxis?: unknown;
+        })
+      : null;
+  const debugRefinementChainIdCandidate = debugRefinementObject?.refinementChainId;
+  const debugAnchorDirectionFingerprintCandidate = debugRefinementObject?.anchorDirectionFingerprint;
+  const debugLockedInvariantsSummaryCandidate = debugRefinementObject?.lockedInvariantsSummary;
+  const debugVariantMutationAxisCandidate = debugRefinementObject?.variantMutationAxis;
+  const backgroundAttemptsCandidate = debugObject ? (debugObject as { backgroundAttempts?: unknown }).backgroundAttempts : null;
+  const latestBackgroundAttempt =
+    Array.isArray(backgroundAttemptsCandidate) && backgroundAttemptsCandidate.length > 0
+      ? backgroundAttemptsCandidate[backgroundAttemptsCandidate.length - 1]
+      : null;
+  const latestAttemptObject =
+    latestBackgroundAttempt && typeof latestBackgroundAttempt === "object" && !Array.isArray(latestBackgroundAttempt)
+      ? latestBackgroundAttempt
+      : null;
+  const latestAttemptFailureReasonCandidate = latestAttemptObject
+    ? (latestAttemptObject as { failureReason?: unknown }).failureReason
+    : null;
+  const latestAttemptFailureReason = isBackgroundFailureReason(latestAttemptFailureReasonCandidate)
+    ? latestAttemptFailureReasonCandidate
+    : null;
+  const parsedAttemptCandidates = (() => {
+    const candidatesCandidate = latestAttemptObject ? (latestAttemptObject as { candidates?: unknown }).candidates : null;
+    if (!Array.isArray(candidatesCandidate) || candidatesCandidate.length === 0) {
+      return [] as Array<{
+        imageUrl: string | null;
+        score: number;
+        checks: Record<BackgroundCheckKey, boolean>;
+      }>;
+    }
+    return candidatesCandidate
+      .map((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+          return null;
+        }
+        const candidateObject = candidate as { checks?: unknown; scores?: unknown; url?: unknown };
+        const checksObject =
+          candidateObject.checks && typeof candidateObject.checks === "object" && !Array.isArray(candidateObject.checks)
+            ? (candidateObject.checks as Record<string, unknown>)
+            : null;
+        const scoresObject =
+          candidateObject.scores && typeof candidateObject.scores === "object" && !Array.isArray(candidateObject.scores)
+            ? (candidateObject.scores as Record<string, unknown>)
+            : null;
+        const scoreCandidate = scoresObject?.total;
+        const score = typeof scoreCandidate === "number" && Number.isFinite(scoreCandidate) ? scoreCandidate : Number.NEGATIVE_INFINITY;
+        const rawUrl = typeof candidateObject.url === "string" && candidateObject.url.trim() ? candidateObject.url : null;
+        return {
+          imageUrl: rawUrl ? normalizeAssetUrl(rawUrl) : null,
+          score,
+          checks: {
+            textOk: checksObject?.textOk === true,
+            scaffoldOk: checksObject?.scaffoldOk === true,
+            motifOk: checksObject?.motifOk === true,
+            toneOk: checksObject?.toneOk === true
+          } satisfies Record<BackgroundCheckKey, boolean>
+        };
+      })
+      .filter((candidate): candidate is { imageUrl: string | null; score: number; checks: Record<BackgroundCheckKey, boolean> } =>
+        Boolean(candidate)
+      );
+  })();
+  const debugEliminatedChecks =
+    parsedAttemptCandidates.length > 0
+      ? (() => {
+          const eliminated: string[] = [];
+          if (parsedAttemptCandidates.every((candidate) => !candidate.checks.textOk)) {
+            eliminated.push("text");
+          }
+          return eliminated;
+        })()
+      : [];
+  const bestEffortCandidate =
+    parsedAttemptCandidates.length > 0
+      ? parsedAttemptCandidates.reduce(
+          (best, candidate) => (candidate.score > best.score ? candidate : best),
+          parsedAttemptCandidates[0]
+        )
+      : null;
+  const debugBestEffortBackground =
+    debugBackgroundSourceCandidate === "fallback" &&
+    bestEffortCandidate?.imageUrl &&
+    parsedAttemptCandidates.length > 0
+      ? (() => {
+          const failureCounts = {
+            textOk: parsedAttemptCandidates.filter((candidate) => !candidate.checks.textOk).length,
+            scaffoldOk: parsedAttemptCandidates.filter((candidate) => !candidate.checks.scaffoldOk).length,
+            motifOk: parsedAttemptCandidates.filter((candidate) => !candidate.checks.motifOk).length,
+            toneOk: parsedAttemptCandidates.filter((candidate) => !candidate.checks.toneOk).length
+          };
+          const eligibleCount = parsedAttemptCandidates.filter((candidate) => candidate.checks.textOk).length;
+          return {
+            imageUrl: bestEffortCandidate.imageUrl,
+            score: Number.isFinite(bestEffortCandidate.score) ? bestEffortCandidate.score : null,
+            failedChecks: BACKGROUND_CHECK_KEYS.filter((checkKey) => !bestEffortCandidate.checks[checkKey]),
+            failureReason: latestAttemptFailureReason || (isBackgroundFailureReason(debugBackgroundFailureReasonCandidate)
+              ? debugBackgroundFailureReasonCandidate
+              : null),
+            eligibleCount,
+            totalCandidates: parsedAttemptCandidates.length,
+            failureCounts
+          };
+        })()
+      : null;
   const debugReferenceAnchor =
     debug && typeof debug === "object" && !Array.isArray(debug)
       ? (debug as { referenceAnchor?: unknown }).referenceAnchor
@@ -178,13 +491,75 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     typeof debugLockupAnchorSrcCandidate === "string" && debugLockupAnchorSrcCandidate.trim()
       ? debugLockupAnchorSrcCandidate.trim()
       : null;
+  const debugRefinementChainId =
+    typeof debugRefinementChainIdCandidate === "string" && debugRefinementChainIdCandidate.trim()
+      ? debugRefinementChainIdCandidate.trim()
+      : null;
+  const debugAnchorDirectionFingerprint =
+    typeof debugAnchorDirectionFingerprintCandidate === "string" && debugAnchorDirectionFingerprintCandidate.trim()
+      ? debugAnchorDirectionFingerprintCandidate.trim()
+      : null;
+  const debugLockedInvariantsSummary =
+    typeof debugLockedInvariantsSummaryCandidate === "string" && debugLockedInvariantsSummaryCandidate.trim()
+      ? debugLockedInvariantsSummaryCandidate.trim()
+      : null;
+  const debugVariantMutationAxis =
+    debugVariantMutationAxisCandidate === "composition" ||
+    debugVariantMutationAxisCandidate === "motif_emphasis" ||
+    debugVariantMutationAxisCandidate === "typography_energy"
+      ? debugVariantMutationAxisCandidate
+      : null;
 
   const designSpec = (meta as { designSpec?: unknown }).designSpec;
   if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
     return {
       ...fallback,
+      roundHasFallback: roundHasFallbackCandidate === true,
+      roundStatus: isRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
+      roundCompletedCount:
+        typeof roundCompletedCountCandidate === "number" && Number.isFinite(roundCompletedCountCandidate)
+          ? roundCompletedCountCandidate
+          : null,
+      roundAttemptCount:
+        typeof roundAttemptCountCandidate === "number" && Number.isFinite(roundAttemptCountCandidate)
+          ? roundAttemptCountCandidate
+          : null,
+      roundRequiredCompletedCount:
+        typeof roundRequiredCompletedCountCandidate === "number" && Number.isFinite(roundRequiredCompletedCountCandidate)
+          ? roundRequiredCompletedCountCandidate
+          : null,
+      roundFailureReason:
+        roundFailureReasonCandidate === "INSUFFICIENT_NONFALLBACK_OPTIONS" ||
+        roundFailureReasonCandidate === "RATE_LIMIT" ||
+        roundFailureReasonCandidate === "BUDGET" ||
+        roundFailureReasonCandidate === "UNKNOWN"
+          ? roundFailureReasonCandidate
+          : null,
       debugBackgroundAnchorSrc,
-      debugLockupAnchorSrc
+      debugLockupAnchorSrc,
+      debugBackgroundSource:
+        debugBackgroundSourceCandidate === "generated" ||
+        debugBackgroundSourceCandidate === "reused" ||
+        debugBackgroundSourceCandidate === "fallback"
+          ? debugBackgroundSourceCandidate
+          : null,
+      debugLockupSource:
+        debugLockupSourceCandidate === "generated" ||
+        debugLockupSourceCandidate === "reused" ||
+        debugLockupSourceCandidate === "fallback"
+          ? debugLockupSourceCandidate
+          : null,
+      debugBackgroundFailureReason:
+        isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+      debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
+      debugImageCalls,
+      debugRateLimitWaitMs,
+      debugRefinementChainId,
+      debugAnchorDirectionFingerprint,
+      debugLockedInvariantsSummary,
+      debugVariantMutationAxis,
+      debugEliminatedChecks,
+      debugBestEffortBackground
     };
   }
 
@@ -220,6 +595,45 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   const directReferenceId = (designSpec as { referenceId?: unknown }).referenceId;
   const directReferenceCluster = (designSpec as { referenceCluster?: unknown }).referenceCluster;
   const directVariationTemplateKey = (designSpec as { variationTemplateKey?: unknown }).variationTemplateKey;
+  const directTemplateKey = (designSpec as { templateKey?: unknown }).templateKey;
+  const directTypeRegion = (designSpec as { typeRegion?: unknown }).typeRegion;
+  const directMotifRegion = (designSpec as { motifRegion?: unknown }).motifRegion;
+  const directTitleIntegrationMode = (designSpec as { titleIntegrationMode?: unknown }).titleIntegrationMode;
+  const directRefinementChainId = (designSpec as { refinementChainId?: unknown }).refinementChainId;
+  const directAnchorDirectionFingerprint = (designSpec as { anchorDirectionFingerprint?: unknown }).anchorDirectionFingerprint;
+  const directLockedInvariantsSummary = (designSpec as { lockedInvariantsSummary?: unknown }).lockedInvariantsSummary;
+  const directVariantMutationAxis = (designSpec as { variantMutationAxis?: unknown }).variantMutationAxis;
+  const directRefinement = (designSpec as { refinement?: unknown }).refinement;
+  const directRefinementObject =
+    directRefinement && typeof directRefinement === "object" && !Array.isArray(directRefinement)
+      ? (directRefinement as {
+          refinementChainId?: unknown;
+          anchorDirectionFingerprint?: unknown;
+          lockedInvariantsSummary?: unknown;
+          variantMutationAxis?: unknown;
+        })
+      : null;
+  const nestedDesignSpec = (designSpec as { designSpec?: unknown }).designSpec;
+  const nestedComposition =
+    nestedDesignSpec && typeof nestedDesignSpec === "object" && !Array.isArray(nestedDesignSpec)
+      ? (nestedDesignSpec as { composition?: unknown }).composition
+      : null;
+  const nestedTemplateKey =
+    nestedComposition && typeof nestedComposition === "object" && !Array.isArray(nestedComposition)
+      ? (nestedComposition as { templateKey?: unknown }).templateKey
+      : null;
+  const nestedTypeRegion =
+    nestedComposition && typeof nestedComposition === "object" && !Array.isArray(nestedComposition)
+      ? (nestedComposition as { typeRegion?: unknown }).typeRegion
+      : null;
+  const nestedMotifRegion =
+    nestedComposition && typeof nestedComposition === "object" && !Array.isArray(nestedComposition)
+      ? (nestedComposition as { motifRegion?: unknown }).motifRegion
+      : null;
+  const nestedTitleIntegrationMode =
+    nestedDesignSpec && typeof nestedDesignSpec === "object" && !Array.isArray(nestedDesignSpec)
+      ? (nestedDesignSpec as { titleIntegrationMode?: unknown }).titleIntegrationMode
+      : null;
   const nestedWantsTitleStage = nestedDirectionSpec?.wantsTitleStage;
   const nestedWantsSeriesMark = nestedDirectionSpec?.wantsSeriesMark;
   const nestedStyleBucket = nestedDirectionSpec?.styleBucket;
@@ -232,6 +646,7 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
   const nestedReferenceId = nestedDirectionSpec?.referenceId;
   const nestedReferenceCluster = nestedDirectionSpec?.referenceCluster;
   const nestedVariationTemplateKey = nestedDirectionSpec?.variationTemplateKey;
+  const nestedVariantMutationAxis = nestedDirectionSpec?.refinementMutationAxis;
 
   const styleFamilyCandidate = isStyleFamilyKey(directStyleFamily)
     ? directStyleFamily
@@ -292,10 +707,56 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
       : typeof nestedVariationTemplateKey === "string"
         ? nestedVariationTemplateKey
         : null;
+  const templateKeyCandidate =
+    typeof nestedTemplateKey === "string"
+      ? nestedTemplateKey
+      : typeof directTemplateKey === "string"
+        ? directTemplateKey
+        : variationTemplateKeyCandidate;
+  const typeRegionCandidate =
+    typeof nestedTypeRegion === "string"
+      ? nestedTypeRegion
+      : typeof directTypeRegion === "string"
+        ? directTypeRegion
+        : null;
+  const motifRegionCandidate =
+    typeof nestedMotifRegion === "string"
+      ? nestedMotifRegion
+      : typeof directMotifRegion === "string"
+        ? directMotifRegion
+        : null;
+  const titleIntegrationModeCandidate =
+    typeof nestedTitleIntegrationMode === "string"
+      ? nestedTitleIntegrationMode
+      : typeof directTitleIntegrationMode === "string"
+        ? directTitleIntegrationMode
+        : null;
 
   return {
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
     wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
+    optionStatus: resolveOptionGenerationStatus(output, dbStatus),
+    roundHasFallback: roundHasFallbackCandidate === true,
+    roundStatus: isRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
+    roundCompletedCount:
+      typeof roundCompletedCountCandidate === "number" && Number.isFinite(roundCompletedCountCandidate)
+        ? roundCompletedCountCandidate
+        : null,
+    roundAttemptCount:
+      typeof roundAttemptCountCandidate === "number" && Number.isFinite(roundAttemptCountCandidate)
+        ? roundAttemptCountCandidate
+        : null,
+    roundRequiredCompletedCount:
+      typeof roundRequiredCompletedCountCandidate === "number" && Number.isFinite(roundRequiredCompletedCountCandidate)
+        ? roundRequiredCompletedCountCandidate
+        : null,
+    roundFailureReason:
+      roundFailureReasonCandidate === "INSUFFICIENT_NONFALLBACK_OPTIONS" ||
+      roundFailureReasonCandidate === "RATE_LIMIT" ||
+      roundFailureReasonCandidate === "BUDGET" ||
+      roundFailureReasonCandidate === "UNKNOWN"
+        ? roundFailureReasonCandidate
+        : null,
     styleBucket: styleBucketCandidate,
     styleTone: styleToneCandidate,
     styleMedium: styleMediumCandidate,
@@ -307,8 +768,68 @@ function readDesignSpecSummary(output: unknown): OptionDesignSpecSummary {
     referenceCluster: referenceClusterCandidate && referenceClusterCandidate.trim() ? referenceClusterCandidate.trim() : null,
     variationTemplateKey:
       variationTemplateKeyCandidate && variationTemplateKeyCandidate.trim() ? variationTemplateKeyCandidate.trim() : null,
+    debugTemplateKey: templateKeyCandidate && templateKeyCandidate.trim() ? templateKeyCandidate.trim() : null,
+    debugTypeRegion: typeRegionCandidate && typeRegionCandidate.trim() ? typeRegionCandidate.trim() : null,
+    debugMotifRegion: motifRegionCandidate && motifRegionCandidate.trim() ? motifRegionCandidate.trim() : null,
+    debugTitleIntegrationMode:
+      titleIntegrationModeCandidate && titleIntegrationModeCandidate.trim() ? titleIntegrationModeCandidate.trim() : null,
     debugBackgroundAnchorSrc,
-    debugLockupAnchorSrc
+    debugLockupAnchorSrc,
+    debugBackgroundSource:
+      debugBackgroundSourceCandidate === "generated" ||
+      debugBackgroundSourceCandidate === "reused" ||
+      debugBackgroundSourceCandidate === "fallback"
+        ? debugBackgroundSourceCandidate
+        : null,
+    debugLockupSource:
+      debugLockupSourceCandidate === "generated" ||
+      debugLockupSourceCandidate === "reused" ||
+      debugLockupSourceCandidate === "fallback"
+        ? debugLockupSourceCandidate
+        : null,
+    debugBackgroundFailureReason:
+      isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+    debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
+    debugImageCalls,
+    debugRateLimitWaitMs,
+    debugRefinementChainId:
+      debugRefinementChainId ||
+      (typeof directRefinementObject?.refinementChainId === "string" && directRefinementObject.refinementChainId.trim()
+        ? directRefinementObject.refinementChainId.trim()
+        : typeof directRefinementChainId === "string" && directRefinementChainId.trim()
+          ? directRefinementChainId.trim()
+          : null),
+    debugAnchorDirectionFingerprint:
+      debugAnchorDirectionFingerprint ||
+      (typeof directRefinementObject?.anchorDirectionFingerprint === "string" && directRefinementObject.anchorDirectionFingerprint.trim()
+        ? directRefinementObject.anchorDirectionFingerprint.trim()
+        : typeof directAnchorDirectionFingerprint === "string" && directAnchorDirectionFingerprint.trim()
+          ? directAnchorDirectionFingerprint.trim()
+          : null),
+    debugLockedInvariantsSummary:
+      debugLockedInvariantsSummary ||
+      (typeof directRefinementObject?.lockedInvariantsSummary === "string" && directRefinementObject.lockedInvariantsSummary.trim()
+        ? directRefinementObject.lockedInvariantsSummary.trim()
+        : typeof directLockedInvariantsSummary === "string" && directLockedInvariantsSummary.trim()
+          ? directLockedInvariantsSummary.trim()
+          : null),
+    debugVariantMutationAxis:
+      debugVariantMutationAxis ||
+      (directRefinementObject?.variantMutationAxis === "composition" ||
+      directRefinementObject?.variantMutationAxis === "motif_emphasis" ||
+      directRefinementObject?.variantMutationAxis === "typography_energy"
+        ? directRefinementObject.variantMutationAxis
+        : directVariantMutationAxis === "composition" ||
+            directVariantMutationAxis === "motif_emphasis" ||
+            directVariantMutationAxis === "typography_energy"
+          ? directVariantMutationAxis
+          : nestedVariantMutationAxis === "composition" ||
+              nestedVariantMutationAxis === "motif_emphasis" ||
+              nestedVariantMutationAxis === "typography_energy"
+            ? nestedVariantMutationAxis
+            : null),
+    debugEliminatedChecks,
+    debugBestEffortBackground
   };
 }
 
@@ -404,6 +925,7 @@ export default async function ProjectGenerationsPage({
     select: {
       id: true,
       round: true,
+      status: true,
       output: true,
       createdAt: true,
       updatedAt: true,
@@ -471,17 +993,89 @@ export default async function ProjectGenerationsPage({
         </div>
       ) : (
         <div className="space-y-8">
-          {roundEntries.map(([round, roundGenerations], roundIndex) => (
-            <div key={round} className="space-y-3">
-              <div className="flex items-center gap-3">
-                <h2 className="text-lg font-semibold">Round {round}</h2>
-                {roundIndex === 0 ? (
-                  <span className="rounded-full bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">Latest</span>
-                ) : null}
-              </div>
+          {roundEntries.map(([round, roundGenerations], roundIndex) => {
+            const roundDesignSummaries = roundGenerations.map((generation) =>
+              readDesignSpecSummary(generation.output, generation.status)
+            );
+            const persistedRoundStatus =
+              roundDesignSummaries.find((summary) => summary.roundStatus === "FAILED")?.roundStatus ||
+              roundDesignSummaries.find((summary) => summary.roundStatus === "PARTIAL")?.roundStatus ||
+              roundDesignSummaries.find((summary) => summary.roundStatus === "COMPLETED")?.roundStatus ||
+              null;
+            const hasFailedOptions = roundDesignSummaries.some((summary) => summary.optionStatus !== "COMPLETED");
+            const persistedCompletedCount = roundDesignSummaries.find((summary) => summary.roundCompletedCount !== null)?.roundCompletedCount ?? null;
+            const persistedAttemptCount = roundDesignSummaries.find((summary) => summary.roundAttemptCount !== null)?.roundAttemptCount ?? null;
+            const persistedRequiredCompletedCount =
+              roundDesignSummaries.find((summary) => summary.roundRequiredCompletedCount !== null)?.roundRequiredCompletedCount ??
+              REQUIRED_COMPLETED_OPTIONS_PER_ROUND;
+            const roundFailureReason =
+              roundDesignSummaries.find((summary) => summary.roundFailureReason !== null)?.roundFailureReason || null;
+            const computedCompletedCount = roundDesignSummaries.filter((summary) => summary.optionStatus === "COMPLETED").length;
+            const roundCompletedCount = persistedCompletedCount ?? computedCompletedCount;
+            const computedRoundStatus = persistedRoundStatus || (hasFailedOptions
+              ? roundDesignSummaries.some((summary) => summary.optionStatus === "COMPLETED")
+                ? "PARTIAL"
+                : "FAILED"
+              : "COMPLETED");
+            const roundHasFallback = roundDesignSummaries.some(
+              (summary) => summary.roundHasFallback || summary.optionStatus === "FALLBACK"
+            );
+            const roundNeedsRetry =
+              computedRoundStatus === "FAILED" || roundCompletedCount < persistedRequiredCompletedCount;
+            const retryHref = round === 1 ? `/app/projects/${project.id}` : `/app/projects/${project.id}/feedback?round=${round}`;
+            const roundFailureMessage =
+              roundFailureReason === "RATE_LIMIT"
+                ? "Rate limit reached before 3 real options were completed."
+                : roundFailureReason === "BUDGET"
+                  ? "Generation budget was reached before 3 real options were completed."
+                  : "Couldn’t produce 3 real options. Retry.";
 
-              <div className="grid gap-4 md:grid-cols-3">
-                {roundGenerations.map((generation, optionIndex) => {
+            return (
+              <div key={round} className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <h2 className="text-lg font-semibold">Round {round}</h2>
+                  {roundIndex === 0 ? (
+                    <span className="rounded-full bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">Latest</span>
+                  ) : null}
+                  {computedRoundStatus === "PARTIAL" ? (
+                    <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+                      Partial
+                    </span>
+                  ) : null}
+                  {computedRoundStatus === "FAILED" ? (
+                    <span className="rounded-full border border-rose-300 bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-800">
+                      Failed
+                    </span>
+                  ) : null}
+                  {computedRoundStatus === "COMPLETED" ? (
+                    <span className="rounded-full border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                      Completed
+                    </span>
+                  ) : null}
+                  {roundHasFallback ? (
+                    <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
+                      Contains fallback options
+                    </span>
+                  ) : null}
+                </div>
+                {roundNeedsRetry ? (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2">
+                    <p className="text-sm text-rose-900">
+                      {roundFailureMessage}
+                      {typeof persistedAttemptCount === "number" ? ` Attempts: ${persistedAttemptCount}.` : ""}
+                      {typeof roundCompletedCount === "number" ? ` Completed: ${roundCompletedCount}/${persistedRequiredCompletedCount}.` : ""}
+                    </p>
+                    <Link
+                      href={retryHref}
+                      className="inline-flex rounded-md border border-rose-300 bg-white px-3 py-1.5 text-sm font-medium text-rose-700 hover:bg-rose-100"
+                    >
+                      Retry Round
+                    </Link>
+                  </div>
+                ) : null}
+
+                <div className="grid gap-4 md:grid-cols-3">
+                  {roundGenerations.map((generation, optionIndex) => {
                   const optionKey = String.fromCharCode(65 + optionIndex);
                   const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
@@ -492,7 +1086,8 @@ export default async function ProjectGenerationsPage({
                   const styleRefCount = (
                     generation.output as { meta?: { styleRefCount?: unknown } } | null
                   )?.meta?.styleRefCount;
-                  const designSpecSummary = readDesignSpecSummary(generation.output);
+                  const designSpecSummary =
+                    roundDesignSummaries[optionIndex] || readDesignSpecSummary(generation.output, generation.status);
                   const previewUrls = {
                     square: getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, preview.square, {
                       debugStage: debugStageEnabled
@@ -512,6 +1107,7 @@ export default async function ProjectGenerationsPage({
                       projectId={project.id}
                       round={round}
                       generationId={generation.id}
+                      generationStatus={designSpecSummary.optionStatus}
                       optionLabel={label}
                       tintClass={tintClass}
                       isApprovedFinal={isApprovedFinal}
@@ -529,17 +1125,34 @@ export default async function ProjectGenerationsPage({
                       debugReferenceId={designSpecSummary.referenceId}
                       debugReferenceCluster={designSpecSummary.referenceCluster}
                       debugVariationTemplateKey={designSpecSummary.variationTemplateKey}
+                      debugTemplateKey={designSpecSummary.debugTemplateKey}
+                      debugTypeRegion={designSpecSummary.debugTypeRegion}
+                      debugMotifRegion={designSpecSummary.debugMotifRegion}
+                      debugTitleIntegrationMode={designSpecSummary.debugTitleIntegrationMode}
                       debugBackgroundAnchorSrc={designSpecSummary.debugBackgroundAnchorSrc}
                       debugLockupAnchorSrc={designSpecSummary.debugLockupAnchorSrc}
+                      debugBackgroundSource={designSpecSummary.debugBackgroundSource}
+                      debugLockupSource={designSpecSummary.debugLockupSource}
+                      debugBackgroundFailureReason={designSpecSummary.debugBackgroundFailureReason}
+                      debugWarning={designSpecSummary.debugWarning}
+                      debugImageCalls={designSpecSummary.debugImageCalls}
+                      debugRateLimitWaitMs={designSpecSummary.debugRateLimitWaitMs}
+                      debugRefinementChainId={designSpecSummary.debugRefinementChainId}
+                      debugAnchorDirectionFingerprint={designSpecSummary.debugAnchorDirectionFingerprint}
+                      debugLockedInvariantsSummary={designSpecSummary.debugLockedInvariantsSummary}
+                      debugVariantMutationAxis={designSpecSummary.debugVariantMutationAxis}
+                      debugEliminatedChecks={designSpecSummary.debugEliminatedChecks}
+                      debugBestEffortBackground={designSpecSummary.debugBestEffortBackground}
                       showDebugChips={debugStageEnabled}
                       previewUrls={previewUrls}
                       finalizeAction={finalizeAction}
                     />
                   );
-                })}
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </section>

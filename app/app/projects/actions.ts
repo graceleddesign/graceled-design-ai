@@ -9,7 +9,13 @@ import { redirect } from "next/navigation";
 import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
-import { buildFinalDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { buildFinalDesignDoc, normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import {
+  mapLegacyTitleIntegrationToDesignSpec,
+  normalizeBackgroundTitleIntegrationMode,
+  type DesignSpec,
+  type DesignSpecTitleIntegrationMode
+} from "@/lib/design-spec";
 import {
   buildDesignBrief,
   type DesignBrief,
@@ -20,23 +26,28 @@ import {
 } from "@/lib/design-brief";
 import {
   planDirectionSet,
-  planRoundTwoRefinementSet,
-  pickExplorationFallbackStyleFamily,
+  planRefinementDirectionSet,
+  createRefinementVariantFingerprint,
   type PlannedDirectionSpec,
+  type PlannedRefinementVariant,
+  type RefinementLockedStyleInvariants,
+  type RefinementMutationAxis,
   type TitleIntegrationMode,
   type StyleFamily as DirectionStyleFamily
 } from "@/lib/direction-planner";
 import { extractBibleCreativeBrief, type BibleCreativeBrief } from "@/lib/bible-creative-brief";
+import { generateDesignSpec, readSymbolDirectives } from "@/lib/design-spec-generator";
 import { getMotifBankContext, type MotifBankContext } from "@/lib/bible-motif-bank";
 import { buildFinalSvg } from "@/lib/final-deliverables";
 import { resizeCoverWithFocalPoint, type FocalPoint } from "@/lib/image-cover";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
+import { isOpenAiRateLimitError } from "@/lib/gptImageRateLimit";
 import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
 import { generatePngFromPrompt } from "@/lib/openai-image";
 import { openai } from "@/lib/openai";
 import { optionLabel } from "@/lib/option-label";
 import { buildOverlayDisplayContent, normalizeLine } from "@/lib/overlay-lines";
-import { GENERIC_CHRISTIAN_MOTIFS } from "@/lib/motif-guardrails";
+import { buildSymbolDirectives, SYMBOL_ONLY_TEXT_BAN_DIRECTIVE } from "@/lib/motif-symbol-directives";
 import { resolveEffectiveBrandKit } from "@/lib/brand-kit";
 import { prisma } from "@/lib/prisma";
 import {
@@ -49,7 +60,6 @@ import {
 import { getCuratedReferences, type CuratedReference, type ReferenceCluster } from "@/lib/referenceCuration";
 import {
   deriveRecentReferenceIds,
-  getRound1ClusterProfile,
   getRound1VariationTemplateByKey,
   isRound1DefaultBiasTemplateKey,
   listRound1VariationTemplates
@@ -139,6 +149,7 @@ const generateRoundTwoSchema = z.object({
   styleDirection: z.unknown().optional()
 });
 const ROUND_OPTION_COUNT = 3;
+const ROUND1_NON_FALLBACK_MAX_ATTEMPTS = 8;
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
 type FinalAssetSlot = "square" | "wide" | "tall";
 type LegacyPreviewAssetSlot = "square_main" | "wide_main" | "tall_main" | "widescreen_main" | "vertical_main";
@@ -187,7 +198,6 @@ const DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD = 68;
 const ROUND1_RERANK_MIN_EDGES_FULL = 0.01;
 const ROUND1_RERANK_MIN_STD_FULL = 20;
 const ROUND1_RERANK_MIN_EDGES_NON_TITLE = 0.008;
-const ROUND1_RERANK_MIN_ACCEPTABLE_SCORE = 180;
 const ROUND1_RERANK_BORDER_BAND_RATIO = 0.08;
 const ROUND1_RERANK_LONG_BORDER_RUN_RATIO = 0.62;
 const ROUND1_RERANK_MIN_LONG_BORDER_LINES_FOR_SCAFFOLD = 2;
@@ -197,8 +207,16 @@ const ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY = 90;
 const ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS = 120;
 const ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY = 180;
 const ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT = 110;
+const ROUND1_RERANK_SCAFFOLD_FAIL_PENALTY = 220;
+const ROUND1_RERANK_MOTIF_FAIL_PENALTY = 160;
+const ROUND1_RERANK_TONE_FAIL_PENALTY = 40;
+const ROUND1_RERANK_TONE_PASS_BONUS = 20;
 const ROUND1_RERANK_TITLE_SAFE_WEIGHT = 12;
 const ROUND1_RERANK_MIDTONE_RANGE_WEIGHT = 14;
+const TEXT_SCRUB_REGION_BLUR_SIGMA = 16;
+const TEXT_SCRUB_MAX_DIMENSION = 640;
+const TEXT_SCRUB_EDGE_THRESHOLD = 66;
+const TEXT_SCRUB_NOISE_ALPHA = 30;
 const LIGHT_TONE_OVERRIDE_RETRY_BOOST =
   "TONE OVERRIDE RETRY: Must satisfy tone targets. LIGHT must be high-key bright/clean (white or near-white background), NOT parchment/sepia/vintage. Avoid filmic grading, avoid desaturation, avoid heavy grain. Prioritize tone compliance over atmosphere.";
 const VIVID_TONE_OVERRIDE_RETRY_BOOST =
@@ -210,6 +228,13 @@ const DARK_TONE_OVERRIDE_RETRY_BOOST =
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
 const ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT = 4;
 const ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT = 2;
+const CHEAP_MODE_ROUND1_BACKGROUND_CANDIDATE_COUNT = 1;
+const STANDARD_ROUND1_BACKGROUND_CANDIDATE_COUNT = 2;
+const ROUND1_NO_NOTES_LOCKUP_CANDIDATE_COUNT = 1;
+const ROUND1_NO_NOTES_MAX_TEXT_RETRIES = 1;
+const ROUND1_CHEAP_MODE_MAX_IMAGE_CALLS = 12;
+const ROUND1_IMAGE_CALL_CAP_WARNING = "Image call cap reached; returning best available.";
+const DEV_CHEAP_MODE = process.env.DEV_CHEAP_MODE?.trim().toLowerCase() === "true";
 const ROUND1_OPTION_PARALLEL_CONCURRENCY = 3;
 const ROUND1_CANDIDATE_PARALLEL_CONCURRENCY = 4;
 const ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY = 4;
@@ -1141,6 +1166,9 @@ type BackgroundHardFailStats = {
   borderLineEdgeDominance: number;
   longStraightBorderLineCount: number;
   mostEdgesAreLongStraightBorders: boolean;
+  focalComponentEdgeRatio: number;
+  focalComponentAreaRatio: number;
+  focalMotifPresent: boolean;
   passes: boolean;
 };
 
@@ -1287,6 +1315,7 @@ async function computeBackgroundHardFailStatsFromBuffer(
     let nonTitleEdgeCount = 0;
     let nonTitleEdgeSamples = 0;
     let borderEdgeCount = 0;
+    const edgeMask = new Uint8Array(totalPixels);
     const borderBandX = clampNumber(
       Math.round(width * ROUND1_RERANK_BORDER_BAND_RATIO),
       1,
@@ -1323,6 +1352,7 @@ async function computeBackgroundHardFailStatsFromBuffer(
         fullEdgeSamples += 1;
         if (isEdge) {
           fullEdgeCount += 1;
+          edgeMask[idx] = 1;
         }
 
         const insideSafe = x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom;
@@ -1395,6 +1425,73 @@ async function computeBackgroundHardFailStatsFromBuffer(
     const mostEdgesAreLongStraightBorders =
       borderEdgeRatio >= ROUND1_RERANK_BORDER_EDGE_DOMINANCE_THRESHOLD &&
       longStraightBorderLineCount >= ROUND1_RERANK_MIN_LONG_BORDER_LINES_FOR_SCAFFOLD;
+    const visited = new Uint8Array(totalPixels);
+    const queue = new Int32Array(totalPixels);
+    let largestNonBorderComponentArea = 0;
+    let largestNonBorderComponentBoxArea = 0;
+
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const start = y * width + x;
+        if (!edgeMask[start] || visited[start]) {
+          continue;
+        }
+        const startInsideSafe = x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom;
+        const startInBorderBand =
+          y < borderBandY || y >= height - borderBandY || x < borderBandX || x >= width - borderBandX;
+        if (startInsideSafe || startInBorderBand) {
+          continue;
+        }
+
+        let head = 0;
+        let tail = 0;
+        visited[start] = 1;
+        queue[tail++] = start;
+        let area = 0;
+        let minX = x;
+        let maxX = x;
+        let minY = y;
+        let maxY = y;
+
+        while (head < tail) {
+          const current = queue[head++];
+          const cy = Math.floor(current / width);
+          const cx = current - cy * width;
+          area += 1;
+          if (cx < minX) minX = cx;
+          if (cx > maxX) maxX = cx;
+          if (cy < minY) minY = cy;
+          if (cy > maxY) maxY = cy;
+
+          const neighbors = [current - 1, current + 1, current - width, current + width];
+          for (const neighbor of neighbors) {
+            if (neighbor <= 0 || neighbor >= totalPixels - 1 || visited[neighbor] || !edgeMask[neighbor]) {
+              continue;
+            }
+            const ny = Math.floor(neighbor / width);
+            const nx = neighbor - ny * width;
+            const insideSafe = nx >= safeLeft && nx < safeRight && ny >= safeTop && ny < safeBottom;
+            const inBorderBand =
+              ny < borderBandY || ny >= height - borderBandY || nx < borderBandX || nx >= width - borderBandX;
+            if (insideSafe || inBorderBand) {
+              continue;
+            }
+            visited[neighbor] = 1;
+            queue[tail++] = neighbor;
+          }
+        }
+
+        if (area > largestNonBorderComponentArea) {
+          largestNonBorderComponentArea = area;
+          largestNonBorderComponentBoxArea = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1));
+        }
+      }
+    }
+
+    const focalComponentEdgeRatio = nonTitleEdgeCount > 0 ? largestNonBorderComponentArea / nonTitleEdgeCount : 0;
+    const focalComponentAreaRatio = totalPixels > 0 ? largestNonBorderComponentBoxArea / totalPixels : 0;
+    const focalMotifPresent =
+      focalComponentEdgeRatio >= 0.2 || (focalComponentEdgeRatio >= 0.12 && focalComponentAreaRatio >= 0.035);
     const meaningfulStructureScore = edgeDensityNonTitle + luminanceStdNonTitle / 255;
     const meaningfulStructurePass =
       edgeDensityNonTitle >= requiredNonTitleEdgeDensity &&
@@ -1421,6 +1518,9 @@ async function computeBackgroundHardFailStatsFromBuffer(
       borderLineEdgeDominance,
       longStraightBorderLineCount,
       mostEdgesAreLongStraightBorders,
+      focalComponentEdgeRatio,
+      focalComponentAreaRatio,
+      focalMotifPresent,
       passes
     };
   } catch {
@@ -1961,6 +2061,50 @@ function resolveTitleIntegrationMode(directionSpec?: PlannedDirectionSpec | null
   return isTitleIntegrationMode(candidate) ? candidate : null;
 }
 
+function resolveDesignSpecTitleIntegrationMode(params: {
+  designSpec?: DesignSpec | null;
+  directionSpec?: PlannedDirectionSpec | null;
+}): DesignSpecTitleIntegrationMode {
+  const direct = params.designSpec?.titleIntegrationMode;
+  if (direct) {
+    return direct;
+  }
+  const legacy = mapLegacyTitleIntegrationToDesignSpec(resolveTitleIntegrationMode(params.directionSpec));
+  return legacy || "PLATE";
+}
+
+function mapDesignSpecModeToLockupIntegrationMode(mode: DesignSpecTitleIntegrationMode): LockupIntegrationMode {
+  if (mode === "PLATE") {
+    return "plate";
+  }
+  if (mode === "MASK") {
+    return "mask";
+  }
+  if (mode === "CUTOUT") {
+    return "cutout";
+  }
+  if (mode === "GRID_LOCK") {
+    return "grid_lock";
+  }
+  if (mode === "TYPE_AS_TEXTURE") {
+    return "grid_lock";
+  }
+  return "clean";
+}
+
+function summarizeDesignSpecForPrompt(designSpec: DesignSpec): string {
+  const symbols = readSymbolDirectives(designSpec).join(", ") || "none";
+  return [
+    `reference=${designSpec.reference.id}/${designSpec.reference.cluster}/${designSpec.reference.tier}`,
+    `composition(template=${designSpec.composition.templateKey}, type=${designSpec.composition.typeRegion}, motif=${designSpec.composition.motifRegion}, overlap=${designSpec.composition.overlap}, asymmetry=${designSpec.composition.asymmetry})`,
+    `titleIntegration=${normalizeBackgroundTitleIntegrationMode(designSpec.titleIntegrationMode)}`,
+    `typography(hierarchy=${designSpec.typographySystem.hierarchy}, case=${designSpec.typographySystem.caseRule}, breaks=${designSpec.typographySystem.lineBreakStrategy}, tracking=${designSpec.typographySystem.tracking}, subtitle=${designSpec.typographySystem.subtitleStyle})`,
+    `motif(symbols=${symbols}, abstraction=${designSpec.motifTreatment.abstraction}, texture=${designSpec.motifTreatment.texture}, colorUse=${designSpec.motifTreatment.colorUse})`,
+    `palette(intent=${designSpec.palette.intent}, contrast=${designSpec.palette.contrast}, background=${designSpec.palette.background})`,
+    "doNot(noScaffoldFrames=true,noRuledPaperAsOnlyDesign=true,noBordersOnly=true,noStickerClipartUnlessFunTier=true,noReadableBackgroundText=true)"
+  ].join(" | ");
+}
+
 function buildTitleIntegrationAuthorityInstruction(params: {
   mode: TitleIntegrationMode;
   target: "background" | "lockup";
@@ -1990,7 +2134,7 @@ function buildTitleIntegrationAuthorityInstruction(params: {
   }
 
   return params.target === "background"
-    ? `HARD TITLE-INTEGRATION MODE: TYPE_AS_TEXTURE. Add subtle repeated microtype/letterform fragments as abstract texture only. ${templateContext} Never form readable extra words, logos, or signage; fragments must stay non-readable and atmospheric.`
+    ? `HARD TITLE-INTEGRATION MODE: TYPE_AS_TEXTURE. Build subtle texture rhythm with non-typographic micro marks only. ${templateContext} Background stage must stay fully text-free: no words, letters, logos, signage, or glyph-like fragments.`
     : `HARD TITLE-INTEGRATION MODE: TYPE_AS_TEXTURE. Let the lockup borrow subtle fragment/texture rhythm from the background letterform system. ${templateContext} Never add readable extra words beyond the title and optional subtitle.`;
 }
 
@@ -2398,33 +2542,6 @@ function resolveDirectionStyleFields(directionSpec?: PlannedDirectionSpec | null
   };
 }
 
-function applyFallbackStyleFamilyToDirectionSpec(params: {
-  directionSpec?: PlannedDirectionSpec | null;
-  styleFamily: StyleFamilyKey;
-  explorationSetKey?: string;
-  explorationLaneKey?: string;
-}): PlannedDirectionSpec | null {
-  if (!params.directionSpec) {
-    return null;
-  }
-
-  const record = STYLE_FAMILY_BANK[params.styleFamily];
-  const nextDirectionSpec: PlannedDirectionSpec = {
-    ...params.directionSpec,
-    styleFamily: params.styleFamily,
-    styleBucket: record.bucket,
-    styleTone: record.tone,
-    styleMedium: record.medium
-  };
-  if (params.explorationSetKey) {
-    nextDirectionSpec.explorationSetKey = params.explorationSetKey;
-  }
-  if (params.explorationLaneKey) {
-    nextDirectionSpec.explorationLaneKey = params.explorationLaneKey;
-  }
-  return nextDirectionSpec;
-}
-
 function buildLockupGenerationPrompt(params: {
   title: string;
   subtitle: string;
@@ -2432,6 +2549,7 @@ function buildLockupGenerationPrompt(params: {
   lockupLayout: LockupLayoutArchetype;
   explorationMode?: boolean;
   directionSpec?: PlannedDirectionSpec | null;
+  designSpec?: DesignSpec | null;
   references: ReferenceLibraryItem[];
   bibleCreativeBrief?: BibleCreativeBrief | null;
   wantsSeriesMark?: boolean;
@@ -2501,20 +2619,37 @@ function buildLockupGenerationPrompt(params: {
           target: "lockup"
         })
       : "";
+  const designSpecTitleIntegrationMode = resolveDesignSpecTitleIntegrationMode({
+    designSpec: params.designSpec,
+    directionSpec: params.directionSpec
+  });
   const titleIntegrationMode = resolveTitleIntegrationMode(params.directionSpec);
   const titleIntegrationModeLine = titleIntegrationMode
-    ? `Title integration mode: ${titleIntegrationMode}.`
-    : "";
+    ? `Legacy title integration mode: ${titleIntegrationMode}.`
+    : `Legacy title integration mode: auto.`;
+  const designSpecIntegrationLine = `DesignSpec title integration mode (authoritative): ${designSpecTitleIntegrationMode}.`;
   const titleIntegrationAuthorityLine = titleIntegrationMode
     ? buildTitleIntegrationAuthorityInstruction({
         mode: titleIntegrationMode,
         target: "lockup",
         variationTemplate
       })
+    : "Legacy title integration guidance unavailable; follow DesignSpec mode as authority.";
+  const titleIntegrationQualityLine =
+    "Integration quality bar: title lockup must feel architected with the composition, never pasted as a detached sticker.";
+  const designSpecTypographyLine = params.designSpec
+    ? `DesignSpec typography system: hierarchy=${params.designSpec.typographySystem.hierarchy}, case=${params.designSpec.typographySystem.caseRule}, lineBreak=${params.designSpec.typographySystem.lineBreakStrategy}, tracking=${params.designSpec.typographySystem.tracking}, subtitle=${params.designSpec.typographySystem.subtitleStyle}.`
     : "";
-  const titleIntegrationQualityLine = titleIntegrationMode
-    ? "Integration quality bar: title lockup must feel architected with the composition, never pasted as a detached sticker."
-    : "";
+  const designSpecIntegrationBehaviorLine =
+    designSpecTitleIntegrationMode === "PLATE"
+      ? "PLATE mode: build title/subtitle as one integrated block with a restrained scrim plate contour and clean padding."
+      : designSpecTitleIntegrationMode === "MASK"
+        ? "MASK mode: use a solid host shape behind type for integrated masking; no duplicate text layers."
+        : designSpecTitleIntegrationMode === "CUTOUT"
+          ? "CUTOUT mode: shape-backed knockout feel with disciplined edges; no duplicated title layers."
+          : designSpecTitleIntegrationMode === "GRID_LOCK"
+            ? "GRID_LOCK mode: align title/subtitle blocks to one simple grid with consistent margins and baselines."
+            : "TYPE_AS_TEXTURE is disabled for lockup readability in this pipeline; use micro ornament only and keep copy fully readable.";
   const defaultBiasGuardLine = referenceFirstDefaultBiasGuardLine(params.directionSpec);
   const referenceAnchorContextLine = params.directionSpec?.referenceId
     ? `Reference anchor: ${params.directionSpec.referenceId} (${params.directionSpec.referenceCluster || "other"}, ${
@@ -2526,7 +2661,7 @@ function buildLockupGenerationPrompt(params: {
     : "";
   const referenceTypographyGuardLine = params.directionSpec?.referenceId
     ? "Match typographic energy and hierarchy from the reference, but use ONLY the provided title/subtitle text. Do not introduce any other words."
-    : "";
+    : "Use ONLY the provided title/subtitle text. Do not introduce any other words.";
   const referenceAnchorPriorityLine = isReferenceFirst && !isRound1ReferenceFirst
     ? "REFERENCE ANCHOR IS HIGHEST PRIORITY. Match the reference's composition, texture, palette logic, and typographic energy."
     : "";
@@ -2565,6 +2700,14 @@ function buildLockupGenerationPrompt(params: {
   const archetypeLine = `Lockup layout archetype: ${params.lockupLayout}. Follow this layout strongly.`;
   const archetypeInstructionLine = lockupLayoutInstructionForArchetype(params.lockupLayout);
   const typographicRecipeLine = lockupTypographicRecipeInstructionForArchetype(params.lockupLayout);
+  const refinementTypographyEnergyLine =
+    params.directionSpec?.refinementMutationAxis === "typography_energy"
+      ? params.directionSpec.refinementTypographyEnergyProfile === "airy"
+        ? "Refinement delta (typography energy): use slightly lighter weight and looser tracking with more breathing room; preserve clean hierarchy."
+        : params.directionSpec.refinementTypographyEnergyProfile === "tight"
+          ? "Refinement delta (typography energy): use slightly heavier weight, tighter tracking, and compact line breaks; preserve readability."
+          : "Refinement delta (typography energy): keep hierarchy consistent while slightly increasing rhythm through disciplined tracking/weight contrast."
+      : "";
   // Bible brief motifs/markIdeas provide symbolic lockup accents without introducing extra copy.
   const motifsLine =
     promptProfile.includeFlags.includeBibleBrief && params.bibleCreativeBrief && params.bibleCreativeBrief.motifs.length > 0
@@ -2647,6 +2790,9 @@ function buildLockupGenerationPrompt(params: {
     referenceLockupLayoutFamilyLine,
     referenceToneMediumLine,
     variationTemplateLine,
+    designSpecIntegrationLine,
+    designSpecTypographyLine,
+    designSpecIntegrationBehaviorLine,
     titleIntegrationModeLine,
     titleIntegrationAuthorityLine,
     titleIntegrationQualityLine,
@@ -2656,6 +2802,7 @@ function buildLockupGenerationPrompt(params: {
     archetypeLine,
     archetypeInstructionLine,
     typographicRecipeLine,
+    refinementTypographyEnergyLine,
     styleModeLayoutBiasLine,
     motifsLine,
     typographyMoodLine,
@@ -3047,7 +3194,9 @@ async function renderValidatedLockupPng(params: {
       lockupRecipe: lockupRecipeForAttempt,
       lockupPresetId: lockupPresetIdForAttempt,
       styleFamily: params.styleFamily,
-      fontSeed: params.fontSeed
+      fontSeed: params.fontSeed,
+      // Keep lockup generation text-only; integration treatment is applied in compositor.
+      integrationMode: "NONE"
     });
     const validation = validateLockupSvgTextIntegrity({
       svg,
@@ -3103,6 +3252,32 @@ type PrimaryDirectionContext = {
   mode: "refinement_funnel" | "new_direction";
   explicitDirectionChangeRequested: boolean;
   directionSpec: PlannedDirectionSpec;
+};
+
+type RefinementFeedbackDelta = {
+  round: number;
+  request: string;
+  emphasis: "title" | "quote";
+  expressiveness: number;
+  temperature: number;
+  regenerateLockup?: boolean;
+  explicitNewTitleStyle?: boolean;
+  regenerateBackground?: boolean;
+  mode: "refinement_funnel" | "new_direction";
+  variantMutations?: Array<{
+    optionLabel: "A" | "B" | "C";
+    axis: RefinementMutationAxis;
+    fingerprint: string;
+    noveltyRetryApplied: boolean;
+  }>;
+};
+
+type RefinementLineageState = {
+  refinementChainId: string;
+  anchorDirectionFingerprint: string;
+  lockedStyleInvariants: RefinementLockedStyleInvariants;
+  appliedFeedbackDeltas: RefinementFeedbackDelta[];
+  seenVariantFingerprints: string[];
 };
 
 function readLockupLayoutFromInput(input: unknown): LockupLayoutArchetype | null {
@@ -3184,6 +3359,342 @@ function readFeedbackGenerationControls(input: unknown): FeedbackGenerationContr
       typeof typedFeedback.explicitNewTitleStyle === "boolean" ? typedFeedback.explicitNewTitleStyle : undefined,
     regenerateBackground:
       typeof typedFeedback.regenerateBackground === "boolean" ? typedFeedback.regenerateBackground : undefined
+  };
+}
+
+function normalizeRefinementReferenceIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const trimmed = item.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function normalizeRefinementVariantMutations(value: unknown): RefinementFeedbackDelta["variantMutations"] {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const normalized = value
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+      }
+      const typed = item as {
+        optionLabel?: unknown;
+        axis?: unknown;
+        fingerprint?: unknown;
+        noveltyRetryApplied?: unknown;
+      };
+      const optionLabel =
+        typed.optionLabel === "A" || typed.optionLabel === "B" || typed.optionLabel === "C" ? typed.optionLabel : null;
+      const axis =
+        typed.axis === "composition" || typed.axis === "motif_emphasis" || typed.axis === "typography_energy"
+          ? typed.axis
+          : null;
+      const fingerprint = typeof typed.fingerprint === "string" ? typed.fingerprint.trim() : "";
+      if (!optionLabel || !axis || !fingerprint) {
+        return null;
+      }
+      return {
+        optionLabel,
+        axis,
+        fingerprint,
+        noveltyRetryApplied: typed.noveltyRetryApplied === true
+      };
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        optionLabel: "A" | "B" | "C";
+        axis: RefinementMutationAxis;
+        fingerprint: string;
+        noveltyRetryApplied: boolean;
+      } => Boolean(item)
+    );
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeRefinementFeedbackDeltas(value: unknown): RefinementFeedbackDelta[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+      }
+      const typed = item as {
+        round?: unknown;
+        request?: unknown;
+        emphasis?: unknown;
+        expressiveness?: unknown;
+        temperature?: unknown;
+        regenerateLockup?: unknown;
+        explicitNewTitleStyle?: unknown;
+        regenerateBackground?: unknown;
+        mode?: unknown;
+        variantMutations?: unknown;
+      };
+      if (
+        typeof typed.round !== "number" ||
+        !Number.isFinite(typed.round) ||
+        !Number.isInteger(typed.round) ||
+        (typed.emphasis !== "title" && typed.emphasis !== "quote") ||
+        typeof typed.expressiveness !== "number" ||
+        !Number.isFinite(typed.expressiveness) ||
+        typeof typed.temperature !== "number" ||
+        !Number.isFinite(typed.temperature) ||
+        (typed.mode !== "refinement_funnel" && typed.mode !== "new_direction")
+      ) {
+        return null;
+      }
+      return {
+        round: typed.round,
+        request: typeof typed.request === "string" ? typed.request : "",
+        emphasis: typed.emphasis,
+        expressiveness: Math.max(0, Math.min(100, Math.round(typed.expressiveness))),
+        temperature: Math.max(0, Math.min(100, Math.round(typed.temperature))),
+        regenerateLockup: typeof typed.regenerateLockup === "boolean" ? typed.regenerateLockup : undefined,
+        explicitNewTitleStyle: typeof typed.explicitNewTitleStyle === "boolean" ? typed.explicitNewTitleStyle : undefined,
+        regenerateBackground: typeof typed.regenerateBackground === "boolean" ? typed.regenerateBackground : undefined,
+        mode: typed.mode,
+        variantMutations: normalizeRefinementVariantMutations(typed.variantMutations)
+      } satisfies RefinementFeedbackDelta;
+    })
+    .filter((item): item is RefinementFeedbackDelta => Boolean(item));
+}
+
+function normalizeRefinementLockedStyleInvariants(value: unknown): RefinementLockedStyleInvariants | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const typed = value as {
+    toneLane?: unknown;
+    styleFamily?: unknown;
+    templateFamily?: unknown;
+    referenceAnchorIds?: unknown;
+    motifPrimitives?: unknown;
+  };
+  const toneLane = isStyleToneKey(typed.toneLane) ? typed.toneLane : null;
+  const styleFamily = isStyleFamilyKey(typed.styleFamily) ? typed.styleFamily : null;
+  const templateFamily =
+    typeof typed.templateFamily === "string" && typed.templateFamily.trim() ? typed.templateFamily.trim().toLowerCase() : null;
+  const referenceAnchorIds = normalizeRefinementReferenceIds(typed.referenceAnchorIds);
+  const motifPrimitives = safeArrayOfStrings(typed.motifPrimitives, []).slice(0, 2);
+  return {
+    toneLane,
+    styleFamily,
+    templateFamily,
+    referenceAnchorIds,
+    motifPrimitives
+  };
+}
+
+function hashRefinementAnchorFingerprint(lockedStyleInvariants: RefinementLockedStyleInvariants): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        toneLane: lockedStyleInvariants.toneLane || null,
+        styleFamily: lockedStyleInvariants.styleFamily || null,
+        templateFamily: lockedStyleInvariants.templateFamily || null,
+        referenceAnchorIds: lockedStyleInvariants.referenceAnchorIds,
+        motifPrimitives: lockedStyleInvariants.motifPrimitives
+      })
+    )
+    .digest("hex");
+}
+
+function summarizeLockedStyleInvariants(lockedStyleInvariants: RefinementLockedStyleInvariants): string {
+  return [
+    `tone=${lockedStyleInvariants.toneLane || "auto"}`,
+    `family=${lockedStyleInvariants.styleFamily || "auto"}`,
+    `template=${lockedStyleInvariants.templateFamily || "auto"}`,
+    `refs=${
+      lockedStyleInvariants.referenceAnchorIds.length > 0 ? lockedStyleInvariants.referenceAnchorIds.join("+") : "none"
+    }`,
+    `motifs=${lockedStyleInvariants.motifPrimitives.length > 0 ? lockedStyleInvariants.motifPrimitives.join("+") : "none"}`
+  ].join(" | ");
+}
+
+function readRefinementLineageFromInput(input: unknown): RefinementLineageState | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  const refinement = (input as { refinement?: unknown }).refinement;
+  if (!refinement || typeof refinement !== "object" || Array.isArray(refinement)) {
+    return null;
+  }
+  const typed = refinement as {
+    refinementChainId?: unknown;
+    anchorDirectionFingerprint?: unknown;
+    lockedStyleInvariants?: unknown;
+    appliedFeedbackDeltas?: unknown;
+    seenVariantFingerprints?: unknown;
+  };
+  const refinementChainId =
+    typeof typed.refinementChainId === "string" && typed.refinementChainId.trim() ? typed.refinementChainId.trim() : null;
+  const anchorDirectionFingerprint =
+    typeof typed.anchorDirectionFingerprint === "string" && typed.anchorDirectionFingerprint.trim()
+      ? typed.anchorDirectionFingerprint.trim()
+      : null;
+  const lockedStyleInvariants = normalizeRefinementLockedStyleInvariants(typed.lockedStyleInvariants);
+  if (!refinementChainId || !anchorDirectionFingerprint || !lockedStyleInvariants) {
+    return null;
+  }
+  const seenVariantFingerprints = normalizeRefinementReferenceIds(typed.seenVariantFingerprints);
+  return {
+    refinementChainId,
+    anchorDirectionFingerprint,
+    lockedStyleInvariants,
+    appliedFeedbackDeltas: normalizeRefinementFeedbackDeltas(typed.appliedFeedbackDeltas),
+    seenVariantFingerprints
+  };
+}
+
+function readRefinementLineageFromGenerationOutput(output: unknown): RefinementLineageState | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const debug = (meta as { debug?: unknown }).debug;
+  const debugRefinement =
+    debug && typeof debug === "object" && !Array.isArray(debug)
+      ? ((debug as { refinement?: unknown }).refinement as unknown)
+      : null;
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  const designSpecRefinement =
+    designSpec && typeof designSpec === "object" && !Array.isArray(designSpec)
+      ? ((designSpec as { refinement?: unknown }).refinement as unknown)
+      : null;
+  const candidate = designSpecRefinement || debugRefinement;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  const typed = candidate as {
+    refinementChainId?: unknown;
+    anchorDirectionFingerprint?: unknown;
+    lockedStyleInvariants?: unknown;
+    appliedFeedbackDeltas?: unknown;
+    seenVariantFingerprints?: unknown;
+  };
+  const refinementChainId =
+    typeof typed.refinementChainId === "string" && typed.refinementChainId.trim() ? typed.refinementChainId.trim() : null;
+  const anchorDirectionFingerprint =
+    typeof typed.anchorDirectionFingerprint === "string" && typed.anchorDirectionFingerprint.trim()
+      ? typed.anchorDirectionFingerprint.trim()
+      : null;
+  const lockedStyleInvariants = normalizeRefinementLockedStyleInvariants(typed.lockedStyleInvariants);
+  if (!refinementChainId || !anchorDirectionFingerprint || !lockedStyleInvariants) {
+    return null;
+  }
+  return {
+    refinementChainId,
+    anchorDirectionFingerprint,
+    lockedStyleInvariants,
+    appliedFeedbackDeltas: normalizeRefinementFeedbackDeltas(typed.appliedFeedbackDeltas),
+    seenVariantFingerprints: normalizeRefinementReferenceIds(typed.seenVariantFingerprints)
+  };
+}
+
+function readReferenceAnchorIdsFromGenerationOutput(output: unknown): string[] {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return [];
+  }
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return [];
+  }
+  const designSpec = (meta as { designSpec?: unknown }).designSpec;
+  if (!designSpec || typeof designSpec !== "object" || Array.isArray(designSpec)) {
+    return [];
+  }
+  const directReferenceIds = normalizeRefinementReferenceIds((designSpec as { referenceIds?: unknown }).referenceIds);
+  const directReferenceId =
+    typeof (designSpec as { referenceId?: unknown }).referenceId === "string"
+      ? (designSpec as { referenceId?: string }).referenceId
+      : null;
+  return normalizeRefinementReferenceIds([...directReferenceIds, ...(directReferenceId ? [directReferenceId] : [])]);
+}
+
+function resolveTemplateFamilyForVariationKey(variationTemplateKey?: string | null): string | null {
+  const key = typeof variationTemplateKey === "string" ? variationTemplateKey.trim() : "";
+  if (!key) {
+    return null;
+  }
+  const variationTemplate = getRound1VariationTemplateByKey(key);
+  if (variationTemplate?.cluster && variationTemplate.cluster !== "other") {
+    return `cluster:${variationTemplate.cluster}`;
+  }
+  const normalized = key.toLowerCase();
+  const parts = normalized.split("_").filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0]}_${parts[1]}`;
+  }
+  return normalized || null;
+}
+
+function buildLockedStyleInvariants(params: {
+  directionSpec: PlannedDirectionSpec;
+  referenceAnchorIds?: string[];
+}): RefinementLockedStyleInvariants {
+  const styleFields = resolveDirectionStyleFields(params.directionSpec);
+  const referenceAnchorIds = normalizeRefinementReferenceIds([
+    ...(params.referenceAnchorIds || []),
+    ...(params.directionSpec.referenceId ? [params.directionSpec.referenceId] : [])
+  ]);
+  return {
+    toneLane: styleFields.styleTone,
+    styleFamily: styleFields.styleFamily,
+    templateFamily: resolveTemplateFamilyForVariationKey(params.directionSpec.variationTemplateKey),
+    referenceAnchorIds,
+    motifPrimitives: safeArrayOfStrings(params.directionSpec.motifFocus, []).slice(0, 2)
+  };
+}
+
+function normalizeRefinementVariantMutationAxis(value: unknown): RefinementMutationAxis | null {
+  return value === "composition" || value === "motif_emphasis" || value === "typography_energy" ? value : null;
+}
+
+function buildRefinementDebugPayload(params: {
+  input: unknown;
+  directionSpec?: PlannedDirectionSpec | null;
+}): NonNullable<NonNullable<GenerationOutputPayload["meta"]["debug"]>["refinement"]> | null {
+  const lineage = readRefinementLineageFromInput(params.input);
+  if (!lineage) {
+    return null;
+  }
+  const variantMutationAxis = normalizeRefinementVariantMutationAxis(params.directionSpec?.refinementMutationAxis);
+  const variantFingerprint =
+    typeof params.directionSpec?.refinementVariantFingerprint === "string" && params.directionSpec.refinementVariantFingerprint.trim()
+      ? params.directionSpec.refinementVariantFingerprint.trim()
+      : null;
+  return {
+    refinementChainId: lineage.refinementChainId,
+    anchorDirectionFingerprint: lineage.anchorDirectionFingerprint,
+    lockedInvariantsSummary: summarizeLockedStyleInvariants(lineage.lockedStyleInvariants),
+    lockedStyleInvariants: lineage.lockedStyleInvariants,
+    variantMutationAxis,
+    variantFingerprint
   };
 }
 
@@ -3325,6 +3836,7 @@ async function loadReusableAssetsFromGeneration(params: {
     },
     select: {
       id: true,
+      status: true,
       output: true,
       assets: {
         select: {
@@ -3339,20 +3851,39 @@ async function loadReusableAssetsFromGeneration(params: {
   if (!generation) {
     return null;
   }
+  if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
+    return null;
+  }
 
   const backgroundPath =
     pickAssetPathBySlots(generation.assets, ["wide_bg", "widescreen_bg", "square_bg", "tall_bg", "vertical_bg"], [
-      "BACKGROUND",
-      "IMAGE"
+      "BACKGROUND"
     ]) || null;
-  const lockupPath =
-    pickAssetPathBySlots(generation.assets, [LOCKUP_ASSET_SLOT], ["LOCKUP", "IMAGE"]) ||
-    pickAssetPathBySlots(generation.assets, [LOCKUP_ASSET_SLOT]) ||
-    null;
-  const [masterBackgroundPng, lockupPng] = await Promise.all([
+  const lockupPath = pickAssetPathBySlots(generation.assets, [LOCKUP_ASSET_SLOT], ["LOCKUP"]) || null;
+  let [masterBackgroundPng, lockupPng] = await Promise.all([
     backgroundPath ? readAssetBufferFromPublicPath(backgroundPath) : Promise.resolve(null),
     lockupPath ? readAssetBufferFromPublicPath(lockupPath) : Promise.resolve(null)
   ]);
+  if (!masterBackgroundPng || !lockupPng) {
+    const reusableDesignDoc = parseReusableMasterDesignDoc(generation.output);
+    if (reusableDesignDoc) {
+      const [derivedBackgroundPng, derivedLockupPng] = await Promise.all([
+        masterBackgroundPng ? Promise.resolve(null) : renderBackgroundOnlyPreviewPng(reusableDesignDoc),
+        lockupPng
+          ? Promise.resolve(null)
+          : (async () => {
+              const lockupSvg = await buildFinalSvg(reusableDesignDoc, {
+                includeBackground: false,
+                includeImages: false
+              });
+              const lockupResult = await renderTrimmedLockupPngFromSvg(lockupSvg);
+              return lockupResult.png;
+            })()
+      ]);
+      masterBackgroundPng = masterBackgroundPng || derivedBackgroundPng;
+      lockupPng = lockupPng || derivedLockupPng;
+    }
+  }
 
   return {
     sourceGenerationId: generation.id,
@@ -3363,6 +3894,49 @@ async function loadReusableAssetsFromGeneration(params: {
     styleTone: readStyleToneFromGenerationOutput(generation.output),
     styleMedium: readStyleMediumFromGenerationOutput(generation.output)
   };
+}
+
+function parseReusableMasterDesignDoc(output: unknown): DesignDoc | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const shapeDocs = (output as { designDocByShape?: unknown }).designDocByShape;
+  if (shapeDocs && typeof shapeDocs === "object" && !Array.isArray(shapeDocs)) {
+    const docsByShape = shapeDocs as Record<string, unknown>;
+    const wideDoc = normalizeDesignDoc(docsByShape.wide) || normalizeDesignDoc(docsByShape.widescreen);
+    if (wideDoc) {
+      return adaptDesignDocToDimensions(wideDoc, PREVIEW_DIMENSIONS.wide.width, PREVIEW_DIMENSIONS.wide.height);
+    }
+    const squareDoc = normalizeDesignDoc(docsByShape.square);
+    if (squareDoc) {
+      return adaptDesignDocToDimensions(squareDoc, PREVIEW_DIMENSIONS.wide.width, PREVIEW_DIMENSIONS.wide.height);
+    }
+    const tallDoc = normalizeDesignDoc(docsByShape.tall) || normalizeDesignDoc(docsByShape.vertical);
+    if (tallDoc) {
+      return adaptDesignDocToDimensions(tallDoc, PREVIEW_DIMENSIONS.wide.width, PREVIEW_DIMENSIONS.wide.height);
+    }
+  }
+
+  const nestedDesignDoc = normalizeDesignDoc((output as { designDoc?: unknown }).designDoc);
+  if (nestedDesignDoc) {
+    return adaptDesignDocToDimensions(
+      nestedDesignDoc,
+      PREVIEW_DIMENSIONS.wide.width,
+      PREVIEW_DIMENSIONS.wide.height
+    );
+  }
+
+  const directDesignDoc = normalizeDesignDoc(output);
+  if (directDesignDoc) {
+    return adaptDesignDocToDimensions(
+      directDesignDoc,
+      PREVIEW_DIMENSIONS.wide.width,
+      PREVIEW_DIMENSIONS.wide.height
+    );
+  }
+
+  return null;
 }
 
 type StyleBrief = {
@@ -3443,6 +4017,71 @@ function normalizeMotifToken(value: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+}
+
+function isGenerationOptionStatus(value: unknown): value is GenerationOptionStatus {
+  return value === "COMPLETED" || value === "FAILED_GENERATION" || value === "FALLBACK";
+}
+
+function readGenerationOptionStatusFromOutput(output: unknown): GenerationOptionStatus | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const directStatus = (output as { status?: unknown }).status;
+  if (isGenerationOptionStatus(directStatus)) {
+    return directStatus;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const debug = (meta as { debug?: unknown }).debug;
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+  const backgroundSource = (debug as { backgroundSource?: unknown }).backgroundSource;
+  if (backgroundSource === "fallback") {
+    return "FALLBACK";
+  }
+
+  return null;
+}
+
+function resolveGenerationOptionStatus(params: {
+  output: unknown;
+  dbStatus?: string | null;
+}): GenerationOptionStatus {
+  const parsed = readGenerationOptionStatusFromOutput(params.output);
+  if (parsed) {
+    return parsed;
+  }
+
+  if (params.dbStatus === "COMPLETED") {
+    return "COMPLETED";
+  }
+  if (params.dbStatus === "FAILED") {
+    return "FAILED_GENERATION";
+  }
+  if (params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED") {
+    return "FAILED_GENERATION";
+  }
+  if (!params.output) {
+    return "FAILED_GENERATION";
+  }
+  return "COMPLETED";
+}
+
+function isCompletedGenerationOption(params: { output: unknown; dbStatus?: string | null }): boolean {
+  return resolveGenerationOptionStatus(params) === "COMPLETED";
+}
+
+function withOutputStatus(output: GenerationOutputPayload, status: GenerationOptionStatus): GenerationOutputPayload {
+  return {
+    ...output,
+    status
+  };
 }
 
 function readMotifFocusFromGenerationOutput(output: unknown): string[] {
@@ -3643,6 +4282,7 @@ async function loadRecentProjectMotifs(projectId: string): Promise<string[]> {
     take: 12,
     select: {
       round: true,
+      status: true,
       output: true
     }
   });
@@ -3656,6 +4296,9 @@ async function loadRecentProjectMotifs(projectId: string): Promise<string[]> {
   const recent = new Set<string>();
 
   for (const generation of recentGenerations) {
+    if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
+      continue;
+    }
     if (generation.round < minimumRound) {
       continue;
     }
@@ -3685,6 +4328,7 @@ async function loadRecentStyleFamilies(params: {
       orderBy: [{ round: "desc" }, { createdAt: "desc" }],
       take: 24,
       select: {
+        status: true,
         output: true
       }
     }),
@@ -3700,6 +4344,7 @@ async function loadRecentStyleFamilies(params: {
       orderBy: [{ createdAt: "desc" }],
       take: 60,
       select: {
+        status: true,
         output: true
       }
     })
@@ -3710,6 +4355,9 @@ async function loadRecentStyleFamilies(params: {
   const recent: StyleFamilyKey[] = [];
 
   for (const generation of ordered) {
+    if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
+      continue;
+    }
     const styleFamily = readStyleFamilyFromGenerationOutput(generation.output);
     if (!styleFamily || seen.has(styleFamily)) {
       continue;
@@ -3744,6 +4392,7 @@ async function loadRecentReferenceIds(params: {
       orderBy: [{ round: "desc" }, { createdAt: "desc" }],
       take: 40,
       select: {
+        status: true,
         output: true
       }
     }),
@@ -3759,13 +4408,20 @@ async function loadRecentReferenceIds(params: {
       orderBy: [{ createdAt: "desc" }],
       take: 100,
       select: {
+        status: true,
         output: true
       }
     })
   ]);
 
-  const projectRecent = deriveRecentReferenceIds(projectGenerations, { limit: projectLimit });
-  const globalRecent = deriveRecentReferenceIds([...projectGenerations, ...organizationGenerations], { limit: globalLimit });
+  const projectCompleted = projectGenerations.filter((generation) =>
+    isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })
+  );
+  const organizationCompleted = organizationGenerations.filter((generation) =>
+    isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })
+  );
+  const projectRecent = deriveRecentReferenceIds(projectCompleted, { limit: projectLimit });
+  const globalRecent = deriveRecentReferenceIds([...projectCompleted, ...organizationCompleted], { limit: globalLimit });
 
   return {
     projectRecent,
@@ -3787,6 +4443,7 @@ async function loadRecentLockupRecipeIds(params: {
       orderBy: [{ round: "desc" }, { createdAt: "desc" }],
       take: 24,
       select: {
+        status: true,
         output: true
       }
     }),
@@ -3802,6 +4459,7 @@ async function loadRecentLockupRecipeIds(params: {
       orderBy: [{ createdAt: "desc" }],
       take: 60,
       select: {
+        status: true,
         output: true
       }
     })
@@ -3811,6 +4469,9 @@ async function loadRecentLockupRecipeIds(params: {
   const seen = new Set<string>();
   const recent: string[] = [];
   for (const generation of ordered) {
+    if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
+      continue;
+    }
     const recipeId = readLockupTypographicRecipeIdFromGenerationOutput(generation.output);
     if (!recipeId || seen.has(recipeId)) {
       continue;
@@ -3836,6 +4497,7 @@ async function loadRecentExplorationSetKeys(params: {
     orderBy: [{ round: "desc" }, { createdAt: "desc" }],
     take: 24,
     select: {
+      status: true,
       output: true
     }
   });
@@ -3843,6 +4505,9 @@ async function loadRecentExplorationSetKeys(params: {
   const seen = new Set<string>();
   const recent: string[] = [];
   for (const generation of recentGenerations) {
+    if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
+      continue;
+    }
     const setKey = readExplorationSetKeyFromGenerationOutput(generation.output);
     if (!setKey || seen.has(setKey)) {
       continue;
@@ -4377,25 +5042,588 @@ async function detectTextArtifactsHeuristic(image: Buffer): Promise<boolean> {
   return textLikeComponents >= 8;
 }
 
-async function imageHasReadableText(image: Buffer): Promise<boolean> {
-  if (await hasTextLikeRasterPattern(image)) {
-    return true;
+type TextScrubPixelBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+type TextScrubGlyph = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+  area: number;
+};
+
+type TextScrubGlyphCluster = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  count: number;
+  totalHeight: number;
+  totalArea: number;
+};
+
+function gap1d(aMin: number, aMax: number, bMin: number, bMax: number): number {
+  if (aMax < bMin) {
+    return bMin - aMax;
+  }
+  if (bMax < aMin) {
+    return aMin - bMax;
+  }
+  return 0;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.round(clampNumber(value, min, max));
+}
+
+function mergeTextScrubPixelBoxes(boxes: TextScrubPixelBox[]): TextScrubPixelBox[] {
+  if (boxes.length <= 1) {
+    return boxes;
   }
 
+  const merged = [...boxes];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i < merged.length; i += 1) {
+      for (let j = i + 1; j < merged.length; j += 1) {
+        const a = merged[i];
+        const b = merged[j];
+        const aRight = a.left + a.width;
+        const aBottom = a.top + a.height;
+        const bRight = b.left + b.width;
+        const bBottom = b.top + b.height;
+        const xGap = gap1d(a.left, aRight, b.left, bRight);
+        const yGap = gap1d(a.top, aBottom, b.top, bBottom);
+        const maxXGap = Math.max(8, Math.round(Math.min(a.width, b.width) * 0.28));
+        const maxYGap = Math.max(6, Math.round(Math.min(a.height, b.height) * 0.9));
+        if (xGap > maxXGap || yGap > maxYGap) {
+          continue;
+        }
+
+        merged[i] = {
+          left: Math.min(a.left, b.left),
+          top: Math.min(a.top, b.top),
+          width: Math.max(aRight, bRight) - Math.min(a.left, b.left),
+          height: Math.max(aBottom, bBottom) - Math.min(a.top, b.top)
+        };
+        merged.splice(j, 1);
+        changed = true;
+        break;
+      }
+      if (changed) {
+        break;
+      }
+    }
+  }
+
+  return merged;
+}
+
+function detectTextScrubBoxesFromRaw(params: {
+  pixels: Buffer;
+  width: number;
+  height: number;
+}): TextScrubPixelBox[] {
+  const { pixels, width, height } = params;
+  if (width < 48 || height < 48) {
+    return [];
+  }
+
+  const totalPixels = width * height;
+  const edgeMask = new Uint8Array(totalPixels);
+  let edgeCount = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const idx = y * width + x;
+      const gx = Math.abs(pixels[idx + 1] - pixels[idx - 1]);
+      const gy = Math.abs(pixels[idx + width] - pixels[idx - width]);
+      const magnitude = gx + gy;
+      if (magnitude > TEXT_SCRUB_EDGE_THRESHOLD) {
+        edgeMask[idx] = 1;
+        edgeCount += 1;
+      }
+    }
+  }
+
+  const edgeRatio = edgeCount / totalPixels;
+  if (edgeRatio < 0.006 || edgeRatio > 0.4) {
+    return [];
+  }
+
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  const glyphs: TextScrubGlyph[] = [];
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const start = y * width + x;
+      if (!edgeMask[start] || visited[start]) {
+        continue;
+      }
+
+      let head = 0;
+      let tail = 0;
+      visited[start] = 1;
+      queue[tail++] = start;
+
+      let area = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+
+      while (head < tail) {
+        const current = queue[head++];
+        const cy = Math.floor(current / width);
+        const cx = current - cy * width;
+
+        area += 1;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const neighbor of neighbors) {
+          if (neighbor <= 0 || neighbor >= totalPixels - 1) {
+            continue;
+          }
+          if (!edgeMask[neighbor] || visited[neighbor]) {
+            continue;
+          }
+          visited[neighbor] = 1;
+          queue[tail++] = neighbor;
+        }
+      }
+
+      const boxWidth = maxX - minX + 1;
+      const boxHeight = maxY - minY + 1;
+      if (boxWidth < 2 || boxHeight < 2) {
+        continue;
+      }
+      const boxArea = boxWidth * boxHeight;
+      const density = area / boxArea;
+      const aspect = boxWidth / boxHeight;
+      const isLikelyGlyph =
+        area >= 7 &&
+        area <= 460 &&
+        boxWidth <= 44 &&
+        boxHeight <= 30 &&
+        boxArea <= 920 &&
+        aspect >= 0.12 &&
+        aspect <= 10 &&
+        density >= 0.07 &&
+        density <= 0.84;
+
+      if (!isLikelyGlyph) {
+        continue;
+      }
+
+      glyphs.push({
+        minX,
+        maxX,
+        minY,
+        maxY,
+        width: boxWidth,
+        height: boxHeight,
+        area
+      });
+    }
+  }
+
+  if (glyphs.length < 4) {
+    return [];
+  }
+
+  glyphs.sort((a, b) => (a.minY - b.minY) || (a.minX - b.minX));
+  const clusters: TextScrubGlyphCluster[] = [];
+  for (const glyph of glyphs) {
+    let bestClusterIndex = -1;
+    let bestDistanceScore = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < clusters.length; index += 1) {
+      const cluster = clusters[index];
+      const avgHeight = cluster.totalHeight / Math.max(1, cluster.count);
+      const xGap = gap1d(glyph.minX, glyph.maxX, cluster.minX, cluster.maxX);
+      const yGap = gap1d(glyph.minY, glyph.maxY, cluster.minY, cluster.maxY);
+      const xTolerance = Math.max(12, Math.round(avgHeight * 3.2));
+      const yTolerance = Math.max(8, Math.round(avgHeight * 1.25));
+      if (xGap > xTolerance || yGap > yTolerance) {
+        continue;
+      }
+      const distanceScore = xGap + yGap * 2;
+      if (distanceScore < bestDistanceScore) {
+        bestDistanceScore = distanceScore;
+        bestClusterIndex = index;
+      }
+    }
+
+    if (bestClusterIndex === -1) {
+      clusters.push({
+        minX: glyph.minX,
+        maxX: glyph.maxX,
+        minY: glyph.minY,
+        maxY: glyph.maxY,
+        count: 1,
+        totalHeight: glyph.height,
+        totalArea: glyph.area
+      });
+      continue;
+    }
+
+    const cluster = clusters[bestClusterIndex];
+    cluster.minX = Math.min(cluster.minX, glyph.minX);
+    cluster.maxX = Math.max(cluster.maxX, glyph.maxX);
+    cluster.minY = Math.min(cluster.minY, glyph.minY);
+    cluster.maxY = Math.max(cluster.maxY, glyph.maxY);
+    cluster.count += 1;
+    cluster.totalHeight += glyph.height;
+    cluster.totalArea += glyph.area;
+  }
+
+  const boxes: TextScrubPixelBox[] = [];
+  for (const cluster of clusters) {
+    const boxWidth = cluster.maxX - cluster.minX + 1;
+    const boxHeight = cluster.maxY - cluster.minY + 1;
+    const boxArea = boxWidth * boxHeight;
+    const aspect = boxWidth / Math.max(1, boxHeight);
+    if (cluster.count < 3 || boxWidth < 14 || boxHeight < 6) {
+      continue;
+    }
+    if (boxArea > totalPixels * 0.45 || aspect < 0.45 || aspect > 24) {
+      continue;
+    }
+
+    const avgHeight = cluster.totalHeight / cluster.count;
+    const expandX = Math.max(4, Math.round(avgHeight * 1.1));
+    const expandY = Math.max(3, Math.round(avgHeight * 0.7));
+
+    const left = clampInt(cluster.minX - expandX, 0, width - 1);
+    const top = clampInt(cluster.minY - expandY, 0, height - 1);
+    const right = clampInt(cluster.maxX + expandX, 0, width - 1);
+    const bottom = clampInt(cluster.maxY + expandY, 0, height - 1);
+    const regionWidth = Math.max(1, right - left + 1);
+    const regionHeight = Math.max(1, bottom - top + 1);
+
+    boxes.push({
+      left,
+      top,
+      width: regionWidth,
+      height: regionHeight
+    });
+  }
+
+  return mergeTextScrubPixelBoxes(boxes);
+}
+
+async function detectTextScrubPixelBoxes(image: Buffer): Promise<TextScrubPixelBox[]> {
+  const [metadata, downscaled] = await Promise.all([
+    sharp(image, { failOn: "none" }).metadata().catch(() => null),
+    sharp(image, { failOn: "none" })
+      .resize({
+        width: TEXT_SCRUB_MAX_DIMENSION,
+        height: TEXT_SCRUB_MAX_DIMENSION,
+        fit: "inside",
+        withoutEnlargement: true
+      })
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true })
+      .catch(() => null)
+  ]);
+
+  const imageWidth = metadata?.width || 0;
+  const imageHeight = metadata?.height || 0;
+  if (imageWidth <= 0 || imageHeight <= 0 || !downscaled || !downscaled.info.width || !downscaled.info.height) {
+    return [];
+  }
+
+  const downscaledWidth = downscaled.info.width;
+  const downscaledHeight = downscaled.info.height;
+  const rawBoxes = detectTextScrubBoxesFromRaw({
+    pixels: downscaled.data,
+    width: downscaledWidth,
+    height: downscaledHeight
+  });
+  if (rawBoxes.length <= 0) {
+    return [];
+  }
+
+  const scaleX = imageWidth / downscaledWidth;
+  const scaleY = imageHeight / downscaledHeight;
+  const mapped = rawBoxes
+    .map((box) => {
+      const marginX = Math.max(6, Math.round(imageWidth * 0.01));
+      const marginY = Math.max(5, Math.round(imageHeight * 0.008));
+      const left = clampInt(Math.floor(box.left * scaleX) - marginX, 0, imageWidth - 1);
+      const top = clampInt(Math.floor(box.top * scaleY) - marginY, 0, imageHeight - 1);
+      const right = clampInt(Math.ceil((box.left + box.width) * scaleX) + marginX, 1, imageWidth);
+      const bottom = clampInt(Math.ceil((box.top + box.height) * scaleY) + marginY, 1, imageHeight);
+      const width = right - left;
+      const height = bottom - top;
+      if (width < 2 || height < 2) {
+        return null;
+      }
+      return {
+        left,
+        top,
+        width,
+        height
+      } as TextScrubPixelBox;
+    })
+    .filter((box): box is TextScrubPixelBox => Boolean(box));
+
+  return mergeTextScrubPixelBoxes(mapped);
+}
+
+async function createTextScrubNoiseOverlay(width: number, height: number): Promise<Buffer> {
+  const channels = 4;
+  const pixels = Buffer.alloc(width * height * channels);
+  for (let index = 0; index < width * height; index += 1) {
+    const offset = index * channels;
+    const value = clampInt(128 + Math.floor(Math.random() * 18) - 9, 0, 255);
+    pixels[offset] = value;
+    pixels[offset + 1] = value;
+    pixels[offset + 2] = value;
+    pixels[offset + 3] = TEXT_SCRUB_NOISE_ALPHA;
+  }
+
+  return sharp(pixels, {
+    raw: {
+      width,
+      height,
+      channels
+    }
+  })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
+async function scrubReadableTextRegions(baseImage: Buffer, boxes: TextScrubPixelBox[]): Promise<Buffer> {
+  if (boxes.length <= 0) {
+    return baseImage;
+  }
+
+  const overlays = (
+    await Promise.all(
+      boxes.map(async (box) => {
+        const extracted = await sharp(baseImage, { failOn: "none" })
+          .extract({
+            left: box.left,
+            top: box.top,
+            width: box.width,
+            height: box.height
+          })
+          .blur(TEXT_SCRUB_REGION_BLUR_SIGMA)
+          .png({ compressionLevel: 9 })
+          .toBuffer()
+          .catch(() => null);
+        if (!extracted) {
+          return null;
+        }
+
+        const noiseOverlay = await createTextScrubNoiseOverlay(box.width, box.height).catch(() => null);
+        const patched = noiseOverlay
+          ? await sharp(extracted, { failOn: "none" })
+              .composite([{ input: noiseOverlay, blend: "overlay" }])
+              .png({ compressionLevel: 9 })
+              .toBuffer()
+              .catch(() => extracted)
+          : extracted;
+
+        return {
+          input: patched,
+          left: box.left,
+          top: box.top
+        };
+      })
+    )
+  ).filter((item): item is { input: Buffer; left: number; top: number } => Boolean(item));
+
+  if (overlays.length <= 0) {
+    return baseImage;
+  }
+
+  return sharp(baseImage, { failOn: "none" })
+    .composite(overlays)
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
+async function runLocalTextScrubPass(image: Buffer): Promise<{
+  scrubbedPng: Buffer;
+  boxesCount: number;
+}> {
+  const boxes = await detectTextScrubPixelBoxes(image);
+  if (boxes.length <= 0) {
+    return {
+      scrubbedPng: image,
+      boxesCount: 0
+    };
+  }
+
+  const scrubbedPng = await scrubReadableTextRegions(image, boxes);
+  return {
+    scrubbedPng,
+    boxesCount: boxes.length
+  };
+}
+
+const READABLE_TEXT_BOOK_TOKENS = new Set<string>([
+  "genesis",
+  "exodus",
+  "leviticus",
+  "numbers",
+  "deuteronomy",
+  "joshua",
+  "judges",
+  "ruth",
+  "samuel",
+  "kings",
+  "chronicles",
+  "ezra",
+  "nehemiah",
+  "esther",
+  "job",
+  "psalm",
+  "psalms",
+  "proverbs",
+  "ecclesiastes",
+  "songofsolomon",
+  "isaiah",
+  "jeremiah",
+  "lamentations",
+  "ezekiel",
+  "daniel",
+  "hosea",
+  "joel",
+  "amos",
+  "obadiah",
+  "jonah",
+  "micah",
+  "nahum",
+  "habakkuk",
+  "zephaniah",
+  "haggai",
+  "zechariah",
+  "malachi",
+  "matthew",
+  "mark",
+  "luke",
+  "john",
+  "acts",
+  "romans",
+  "corinthians",
+  "galatians",
+  "ephesians",
+  "philippians",
+  "colossians",
+  "thessalonians",
+  "timothy",
+  "titus",
+  "philemon",
+  "hebrews",
+  "james",
+  "peter",
+  "jude",
+  "revelation"
+]);
+
+function normalizeReadableToken(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
+}
+
+function isPlausibleReadableToken(token: string): boolean {
+  if (token.length < 3) {
+    return false;
+  }
+  if (!/[a-z]/i.test(token)) {
+    return false;
+  }
+  if (/^([a-z0-9])\1+$/.test(token)) {
+    return false;
+  }
+  const digitCount = (token.match(/[0-9]/g) || []).length;
+  if (digitCount / token.length > 0.66) {
+    return false;
+  }
+  return true;
+}
+
+function parseReadableTextTokens(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(
+    value
+      .filter((item): item is string => typeof item === "string")
+      .map(normalizeReadableToken)
+      .filter(isPlausibleReadableToken)
+  )];
+}
+
+function extractReadableHardFailTokens(values: Array<string | null | undefined>): string[] {
+  const tokens = values
+    .flatMap((value) => (value || "").split(/[\s|,;:/()-]+/g))
+    .map(normalizeReadableToken)
+    .filter(isPlausibleReadableToken);
+  return [...new Set(tokens)];
+}
+
+async function imageHasReadableText(
+  image: Buffer,
+  options?: {
+    hardFailTokens?: string[];
+  }
+): Promise<boolean> {
+  const hardFailTokens = new Set<string>([
+    ...READABLE_TEXT_BOOK_TOKENS,
+    ...(options?.hardFailTokens || []).map(normalizeReadableToken).filter(isPlausibleReadableToken)
+  ]);
+
   if (!process.env.OPENAI_API_KEY?.trim()) {
-    return true;
+    return false;
   }
 
   try {
     const response = await openai.responses.create({
       model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
+      temperature: 0,
       input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "You are a strict readable-text detector.",
+                "Return JSON only with schema: {\"tokens\":[string],\"uncertain\":boolean}.",
+                "Include only confidently readable alphanumeric tokens (>=3 chars) that look like real words/labels.",
+                "Exclude single letters, broken fragments, uncertain glyphs, and gibberish.",
+                "If uncertain, return uncertain=true and tokens=[]."
+              ].join(" ")
+            }
+          ]
+        },
         {
           role: "user",
           content: [
             {
               type: "input_text",
-              text: "Return hasText=true if ANY letters/words are visible even faintly or partially."
+              text: `Hard-fail token hints (if present): ${
+                [...hardFailTokens].slice(0, 36).join(", ") || "(none)"
+              }`
             },
             {
               type: "input_image",
@@ -4407,20 +5635,29 @@ async function imageHasReadableText(image: Buffer): Promise<boolean> {
       ]
     });
 
-    const responseText = parseResponseText(response);
-    const parsed = parseJsonObject(responseText);
-    if (parsed && typeof parsed.hasText === "boolean") {
-      return parsed.hasText;
-    }
-    if (/hasText\s*[:=]\s*true/i.test(responseText)) {
-      return true;
-    }
-    if (/hasText\s*[:=]\s*false/i.test(responseText)) {
+    const parsed = parseJsonObject(parseResponseText(response));
+    if (!parsed) {
       return false;
     }
-    return true;
+
+    const tokens = parseReadableTextTokens((parsed as { tokens?: unknown }).tokens);
+    const hasHardFailToken = tokens.some((token) => hardFailTokens.has(token));
+    if (hasHardFailToken) {
+      return true;
+    }
+    if (tokens.length > 0) {
+      return true;
+    }
+
+    const uncertain = (parsed as { uncertain?: unknown }).uncertain;
+    if (uncertain === true) {
+      return false;
+    }
+
+    return false;
   } catch {
-    return true;
+    // Fail-open for uncertain OCR; strict failures come from confident token reads only.
+    return false;
   }
 }
 
@@ -4455,7 +5692,7 @@ type BuildGenerationOutputParams = {
 
 type BackgroundRerankCandidateDebug = {
   url: string;
-  stage: "primary" | "fallback_family" | "fallback_set";
+  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
@@ -4463,12 +5700,15 @@ type BackgroundRerankCandidateDebug = {
   score: number;
   layoutDiversityPenalty?: number;
   frameScaffoldPenalty?: number;
+  textScrub?: TextScrubDebug;
   checks: {
     textFree: boolean;
     tonePass: boolean;
     designPresencePass: boolean;
     meaningfulStructurePass: boolean;
+    focalMotifPresent: boolean;
     frameScaffoldTriggered: boolean;
+    hardFailScaffold: boolean;
     hardFailBlankDesign: boolean;
   };
   stats: {
@@ -4505,6 +5745,9 @@ type BackgroundRerankCandidateDebug = {
       borderLineEdgeDominance: number;
       longStraightBorderLineCount: number;
       mostEdgesAreLongStraightBorders: boolean;
+      focalComponentEdgeRatio: number;
+      focalComponentAreaRatio: number;
+      focalMotifPresent: boolean;
       passes: boolean;
     } | null;
   };
@@ -4513,7 +5756,7 @@ type BackgroundRerankCandidateDebug = {
 type BackgroundRerankWinnerDebug = {
   index: number;
   url: string;
-  stage: "primary" | "fallback_family" | "fallback_set";
+  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
@@ -4525,6 +5768,70 @@ type BackgroundRerankFallbackDebug = {
   usedAltFamily: boolean;
   usedAltSet: boolean;
   attempts: number;
+};
+
+type DebugAssetSource = "generated" | "reused" | "fallback";
+type BackgroundAttemptFailureReason = "ALL_TEXT" | "ALL_SCAFFOLD" | "API_ERROR" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN";
+type ImageCallStage = "background" | "lockup";
+type ImageCallAspect = "wide" | "square" | "vertical";
+type GenerationOptionStatus = "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
+type GenerationRoundStatus = "COMPLETED" | "PARTIAL" | "FAILED";
+type GenerationRoundFailureReason = "INSUFFICIENT_NONFALLBACK_OPTIONS" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN";
+
+type TextScrubDebug = {
+  attempted: boolean;
+  boxesCount: number;
+  beforeHasText: boolean;
+  afterHasText: boolean;
+  scrubbedUrl: string | null;
+};
+
+type ImageCallDebugSummary = {
+  total: number;
+  byStage: Record<ImageCallStage, number>;
+  byAspect: Record<ImageCallAspect, number>;
+  retries: number;
+};
+
+class Round1ImageCallCapReachedError extends Error {
+  constructor() {
+    super("ROUND1_IMAGE_CALL_CAP_REACHED");
+    this.name = "Round1ImageCallCapReachedError";
+  }
+}
+
+function isRound1ImageCallCapReachedError(error: unknown): boolean {
+  return error instanceof Round1ImageCallCapReachedError;
+}
+
+type BackgroundAttemptCandidateDebug = {
+  url: string;
+  textScrub?: TextScrubDebug;
+  checks: {
+    textOk: boolean;
+    scaffoldOk: boolean;
+    motifOk: boolean;
+    toneOk: boolean;
+  };
+  scores: {
+    total: number;
+    layoutDiversityPenalty: number;
+    frameScaffoldPenalty: number;
+    meaningfulStructure: number;
+    titleSafe: number;
+    midtoneRange: number;
+  };
+};
+
+type BackgroundAttemptDebug = {
+  attemptIndex: number;
+  styleFamily: StyleFamilyKey | null;
+  anchorUsed: {
+    visualAnchorSrc: string | null;
+  };
+  candidates: BackgroundAttemptCandidateDebug[];
+  winnerIndex: number | null;
+  failureReason: BackgroundAttemptFailureReason | null;
 };
 
 type LockupRerankCandidateDebug = {
@@ -4558,6 +5865,7 @@ type RerankDebugMeta = {
 };
 
 type GenerationOutputPayload = {
+  status: GenerationOptionStatus;
   designDoc: DesignDoc;
   designDocByShape: Record<PreviewShape, DesignDoc>;
   notes: string;
@@ -4572,6 +5880,26 @@ type GenerationOutputPayload = {
         usedCleanMinFallback: boolean;
         resolvedStyleFamily: StyleFamily;
       };
+      backgroundSource?: DebugAssetSource;
+      lockupSource?: DebugAssetSource;
+      backgroundFailureReason?: BackgroundAttemptFailureReason | null;
+      backgroundAttempts?: BackgroundAttemptDebug[];
+      textScrub?: TextScrubDebug;
+      warnings?: string[];
+      imageCalls?: ImageCallDebugSummary;
+      rateLimitWaitMs?: number;
+      roundHasFallback?: boolean;
+      roundStatus?: GenerationRoundStatus;
+      roundCompletedCount?: number;
+      roundAttemptCount?: number;
+      roundRequiredCompletedCount?: number;
+      roundFailureReason?: GenerationRoundFailureReason | null;
+      fallbackPreview?: {
+        square: string;
+        wide: string;
+        tall: string;
+        lockup: string | null;
+      };
       referenceAnchor?: {
         referenceId: string;
         referenceCluster: string | null;
@@ -4580,6 +5908,14 @@ type GenerationOutputPayload = {
         typographyAnchorSrc: string;
         backgroundAnchorSrc?: string;
         lockupAnchorSrc?: string;
+      };
+      refinement?: {
+        refinementChainId: string;
+        anchorDirectionFingerprint: string;
+        lockedInvariantsSummary: string;
+        lockedStyleInvariants: RefinementLockedStyleInvariants;
+        variantMutationAxis: RefinementMutationAxis | null;
+        variantFingerprint: string | null;
       };
     };
     toneCheck?: ToneCheckSummary;
@@ -4654,6 +5990,11 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
   const designBrief = validatedDesignBrief.ok ? validatedDesignBrief.data : null;
   const lockupLayout = readLockupLayoutFromInput(params.input);
   const directionSpec = readDirectionSpecFromInput(params.input, params.optionIndex);
+  const refinementLineage = readRefinementLineageFromInput(params.input);
+  const refinementDebugPayload = buildRefinementDebugPayload({
+    input: params.input,
+    directionSpec
+  });
   const dedupedReferenceItems = dedupeReferencesById(params.referenceItems || []);
   const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(params.input);
   const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
@@ -4698,6 +6039,7 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     });
   }
   const fallbackDesignSpec: Record<string, unknown> = {
+    designSpec: null,
     styleFamily: directionSpec?.styleFamily || null,
     styleBucket: directionSpec?.styleBucket || null,
     styleTone: directionSpec?.styleTone || null,
@@ -4717,6 +6059,21 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     topicKeys: params.motifBankContext?.topicKeys || [],
     topicNames: params.motifBankContext?.topicNames || []
   };
+  if (refinementLineage) {
+    fallbackDesignSpec.refinement = {
+      refinementChainId: refinementLineage.refinementChainId,
+      anchorDirectionFingerprint: refinementLineage.anchorDirectionFingerprint,
+      lockedStyleInvariants: refinementLineage.lockedStyleInvariants,
+      appliedFeedbackDeltas: refinementLineage.appliedFeedbackDeltas,
+      seenVariantFingerprints: refinementLineage.seenVariantFingerprints,
+      variantMutationAxis: refinementDebugPayload?.variantMutationAxis || null,
+      variantFingerprint: refinementDebugPayload?.variantFingerprint || null
+    };
+    fallbackDesignSpec.refinementChainId = refinementLineage.refinementChainId;
+    fallbackDesignSpec.anchorDirectionFingerprint = refinementLineage.anchorDirectionFingerprint;
+    fallbackDesignSpec.lockedInvariantsSummary = summarizeLockedStyleInvariants(refinementLineage.lockedStyleInvariants);
+    fallbackDesignSpec.variantMutationAxis = refinementDebugPayload?.variantMutationAxis || null;
+  }
   if (lockupLayout) {
     fallbackDesignSpec.lockupLayout = lockupLayout;
   }
@@ -4740,19 +6097,28 @@ function buildFallbackGenerationOutput(params: BuildGenerationOutputParams): Gen
     typographyAnchorSrc: fallbackTypographyAnchorSrc,
     optionIndex: params.optionIndex
   });
-  const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(
-    !hasDesignNotes
-      ? {
-          styleFamilyFallback: {
-            usedCleanMinFallback,
-            resolvedStyleFamily
-          }
+  const fallbackDebugBase: NonNullable<GenerationOutputPayload["meta"]["debug"]> = !hasDesignNotes
+    ? {
+        backgroundSource: "fallback",
+        lockupSource: "fallback",
+        styleFamilyFallback: {
+          usedCleanMinFallback,
+          resolvedStyleFamily
         }
-      : undefined,
-    referenceAnchorDebugMeta
-  );
+      }
+    : {
+        backgroundSource: "fallback",
+        lockupSource: "fallback"
+      };
+  const fallbackDebugWithRefinement = refinementDebugPayload
+    ? mergeGenerationDebugMeta(fallbackDebugBase, {
+        refinement: refinementDebugPayload
+      })
+    : fallbackDebugBase;
+  const fallbackDebugMeta = mergeReferenceAnchorDebugMeta(fallbackDebugWithRefinement, referenceAnchorDebugMeta);
 
   return {
+    status: "FALLBACK",
     designDoc: designDocByShape.square,
     designDocByShape,
     notes: `Fallback layout: ${params.presetKey} | variant ${params.optionIndex % 3}`,
@@ -4843,7 +6209,8 @@ function buildGenerationInput(
   runSeed?: string,
   directionPlan?: PlannedDirectionSpec[],
   lockupLayout?: LockupLayoutArchetype,
-  primaryDirection?: PrimaryDirectionContext | null
+  primaryDirection?: PrimaryDirectionContext | null,
+  refinementLineage?: RefinementLineageState | null
 ) {
   const palette = brandKit ? parsePaletteJson(brandKit.paletteJson) : [];
 
@@ -4880,6 +6247,7 @@ function buildGenerationInput(
     directionPlan: directionPlan || [],
     lockupLayout: lockupLayout || null,
     primaryDirection: primaryDirection || null,
+    refinement: refinementLineage || null,
     designBrief
   };
 }
@@ -4967,6 +6335,24 @@ function readDirectionSpecFromInput(input: unknown, optionIndex: number): Planne
       ? parsed.styleMedium
       : isStyleFamilyKey(parsed.styleFamily)
         ? STYLE_FAMILY_BANK[parsed.styleFamily].medium
+        : undefined,
+    refinementMutationAxis: normalizeRefinementVariantMutationAxis(parsed.refinementMutationAxis) || undefined,
+    refinementVariantFingerprint:
+      typeof parsed.refinementVariantFingerprint === "string" && parsed.refinementVariantFingerprint.trim()
+        ? parsed.refinementVariantFingerprint.trim()
+        : undefined,
+    refinementMotifEmphasisProfile:
+      parsed.refinementMotifEmphasisProfile === "primary_large" ||
+      parsed.refinementMotifEmphasisProfile === "distributed_balance" ||
+      parsed.refinementMotifEmphasisProfile === "foreground_cluster" ||
+      parsed.refinementMotifEmphasisProfile === "edge_repeat"
+        ? parsed.refinementMotifEmphasisProfile
+        : undefined,
+    refinementTypographyEnergyProfile:
+      parsed.refinementTypographyEnergyProfile === "tight" ||
+      parsed.refinementTypographyEnergyProfile === "balanced" ||
+      parsed.refinementTypographyEnergyProfile === "airy"
+        ? parsed.refinementTypographyEnergyProfile
         : undefined,
     motifFocus: safeArrayOfStrings(parsed.motifFocus, []).slice(0, 2),
     motifScope:
@@ -5076,6 +6462,24 @@ function readDirectionSpecFromGenerationOutput(output: unknown, optionIndex: num
       ? parsed.styleMedium
       : isStyleFamilyKey(parsed.styleFamily)
         ? STYLE_FAMILY_BANK[parsed.styleFamily].medium
+        : undefined,
+    refinementMutationAxis: normalizeRefinementVariantMutationAxis(parsed.refinementMutationAxis) || undefined,
+    refinementVariantFingerprint:
+      typeof parsed.refinementVariantFingerprint === "string" && parsed.refinementVariantFingerprint.trim()
+        ? parsed.refinementVariantFingerprint.trim()
+        : undefined,
+    refinementMotifEmphasisProfile:
+      parsed.refinementMotifEmphasisProfile === "primary_large" ||
+      parsed.refinementMotifEmphasisProfile === "distributed_balance" ||
+      parsed.refinementMotifEmphasisProfile === "foreground_cluster" ||
+      parsed.refinementMotifEmphasisProfile === "edge_repeat"
+        ? parsed.refinementMotifEmphasisProfile
+        : undefined,
+    refinementTypographyEnergyProfile:
+      parsed.refinementTypographyEnergyProfile === "tight" ||
+      parsed.refinementTypographyEnergyProfile === "balanced" ||
+      parsed.refinementTypographyEnergyProfile === "airy"
+        ? parsed.refinementTypographyEnergyProfile
         : undefined,
     motifFocus: safeArrayOfStrings(parsed.motifFocus, []).slice(0, 2),
     motifScope:
@@ -5362,22 +6766,13 @@ function resolveReferenceStyleAnchorSrc(reference: ReferenceLibraryItem | null |
   return normalizeReferencePublicUrl(reference.styleAnchorPath, "style-anchor");
 }
 
-const VISUAL_STYLE_ANCHOR_CLUSTERS = new Set<ReferenceCluster>([
-  "editorial_photo",
-  "cinematic",
-  "illustration",
-  "modern_abstract"
-]);
-
 function resolveReferenceVisualAnchorSrc(params: {
   reference: ReferenceLibraryItem | null | undefined;
   referenceCluster?: string | null;
 }): string | null {
+  void params.referenceCluster;
   const originalSrc = resolveReferenceOriginalSrc(params.reference);
   const styleAnchorSrc = resolveReferenceStyleAnchorSrc(params.reference);
-  if (params.referenceCluster && VISUAL_STYLE_ANCHOR_CLUSTERS.has(params.referenceCluster as ReferenceCluster)) {
-    return styleAnchorSrc || originalSrc;
-  }
   return originalSrc || styleAnchorSrc;
 }
 
@@ -5398,8 +6793,8 @@ function buildReferenceAnchorDebugMeta(params: {
     return null;
   }
   const visualAnchorSrc =
-    normalizeReferencePublicUrl(params.visualAnchorSrc, "style-anchor") ||
-    normalizeReferencePublicUrl(params.visualAnchorSrc, "original");
+    normalizeReferencePublicUrl(params.visualAnchorSrc, "original") ||
+    normalizeReferencePublicUrl(params.visualAnchorSrc, "style-anchor");
   const typographyAnchorSrc =
     normalizeReferencePublicUrl(params.typographyAnchorSrc, "original") ||
     normalizeReferencePublicUrl(params.typographyAnchorSrc, "style-anchor");
@@ -5434,6 +6829,52 @@ function mergeReferenceAnchorDebugMeta(
     ...(existingDebug || {}),
     referenceAnchor: referenceAnchorDebug
   };
+}
+
+function mergeGenerationDebugMeta(
+  existingDebug: GenerationOutputPayload["meta"]["debug"] | undefined,
+  patch: Partial<NonNullable<GenerationOutputPayload["meta"]["debug"]>>
+): NonNullable<GenerationOutputPayload["meta"]["debug"]> {
+  return {
+    ...(existingDebug || {}),
+    ...patch
+  };
+}
+
+function appendUniqueDebugWarning(
+  existingWarnings: string[] | undefined,
+  nextWarning: string | null
+): string[] | undefined {
+  const base = Array.isArray(existingWarnings)
+    ? existingWarnings.filter((warning): warning is string => typeof warning === "string" && warning.trim().length > 0)
+    : [];
+  if (!nextWarning || !nextWarning.trim()) {
+    return base.length > 0 ? base : undefined;
+  }
+  if (base.some((warning) => warning.toLowerCase() === nextWarning.toLowerCase())) {
+    return base;
+  }
+  return [...base, nextWarning];
+}
+
+function createImageCallDebugSummary(): ImageCallDebugSummary {
+  return {
+    total: 0,
+    byStage: {
+      background: 0,
+      lockup: 0
+    },
+    byAspect: {
+      wide: 0,
+      square: 0,
+      vertical: 0
+    },
+    retries: 0
+  };
+}
+
+function aspectFromShape(shape: PreviewShape): ImageCallAspect {
+  return shape === "tall" ? "vertical" : shape;
 }
 
 function styleTagFromStyleTags(styleTags: string[]): ReferenceLibraryStyleTag {
@@ -5643,6 +7084,7 @@ function buildTemplateBackgroundPrompt(params: {
   shape: PreviewShape;
   generationId: string;
   directionSpec?: PlannedDirectionSpec | null;
+  designSpec?: DesignSpec | null;
   brandMode?: ProjectBrandMode;
   explorationMode?: boolean;
   seriesPreferenceGuidance?: string;
@@ -5654,6 +7096,64 @@ function buildTemplateBackgroundPrompt(params: {
   paletteComplianceBoost?: string;
   toneComplianceBoost?: string;
 }): string {
+  const refinementMotifEmphasisLine =
+    params.directionSpec?.refinementMutationAxis === "motif_emphasis"
+      ? params.directionSpec.refinementMotifEmphasisProfile === "distributed_balance"
+        ? "Refinement delta (motif emphasis): keep the same motif symbols but distribute them as smaller repeated elements with calmer dominance."
+        : params.directionSpec.refinementMotifEmphasisProfile === "foreground_cluster"
+          ? "Refinement delta (motif emphasis): keep the same motif symbols and cluster them into one tighter foreground grouping."
+          : params.directionSpec.refinementMotifEmphasisProfile === "edge_repeat"
+            ? "Refinement delta (motif emphasis): keep the same motif symbols and repeat them nearer frame edges with restrained center mass."
+            : "Refinement delta (motif emphasis): keep the same motif symbols but scale one primary motif larger and push it into clearer focal placement."
+      : "";
+  if (params.designSpec) {
+    const designSpec = {
+      ...params.designSpec,
+      titleIntegrationMode: normalizeBackgroundTitleIntegrationMode(params.designSpec.titleIntegrationMode)
+    };
+    const symbolDirectives = readSymbolDirectives(designSpec);
+    const symbolLine =
+      symbolDirectives.length > 0
+        ? symbolDirectives.join(", ")
+        : "radiant light burst, vine branch silhouette, circular stone form";
+    const referenceVibeLine = params.directionSpec?.referenceId
+      ? `Reference cue (${params.directionSpec.referenceId}) is vibe-only: borrow mood and materiality, never copy composition or motifs.`
+      : "";
+    const shapeLine =
+      params.shape === "wide"
+        ? "Shape guidance: preserve cinematic width with one dominant motif mass and a clean, calmer type region."
+        : params.shape === "square"
+          ? "Shape guidance: preserve central balance with asymmetric detail and a clear quieter type region."
+          : "Shape guidance: preserve vertical rhythm with one dominant motif and a protected type zone in upper/mid flow.";
+
+    return [
+      params.brandPaletteHardConstraint || "",
+      "Render a finished sermon series poster background (text-free).",
+      `DesignSpec summary: ${summarizeDesignSpecForPrompt(designSpec)}.`,
+      referenceVibeLine,
+      `Focal motif is REQUIRED and must be dominant: ${symbolLine}.`,
+      refinementMotifEmphasisLine,
+      `Use motif treatment exactly: abstraction=${designSpec.motifTreatment.abstraction}, texture=${designSpec.motifTreatment.texture}, colorUse=${designSpec.motifTreatment.colorUse}.`,
+      `Composition goal (not a wireframe): typeRegion=${designSpec.composition.typeRegion}, motifRegion=${designSpec.composition.motifRegion}, overlap=${designSpec.composition.overlap}, asymmetry=${designSpec.composition.asymmetry}.`,
+      `Imply title-safe space through quieter contrast and texture in the ${designSpec.composition.typeRegion} region with generous margins. No boxes or guide marks.`,
+      shapeLine,
+      SYMBOL_ONLY_TEXT_BAN_DIRECTIVE,
+      "Avoid generic clipart-style religious icons; keep symbols abstract, compositional, and material-driven.",
+      "No wireframes, no borders-only, no ruled-paper-only.",
+      "Do not create scaffold frames, detached stage panels, or placeholder layout cues.",
+      "Background must contain NO readable words; textured/engraved/halftone pseudo-glyph patterns are acceptable only when unreadable.",
+      params.seriesPreferenceGuidance || "",
+      params.paletteComplianceBoost || "",
+      params.toneComplianceBoost || "",
+      params.noTextBoost || "",
+      params.textArtifactRetryBoost || "",
+      params.originalityBoost || "",
+      `Variation seed: ${params.generationId}.`
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
   const isReferenceFirst = Boolean(params.directionSpec?.referenceId);
   const promptProfileSelection = resolvePromptProfile({
     explorationMode: params.explorationMode,
@@ -5748,45 +7248,33 @@ function buildTemplateBackgroundPrompt(params: {
     : "If any style refs conflict with bucket/family/tone/medium rules, IGNORE the refs and follow bucket/family/tone/medium.";
   const backgroundTextFreeRuleLine =
     !isRound1ReferenceFirst
-      ? titleIntegrationMode === "TYPE_AS_TEXTURE"
-        ? "BACKGROUND TEXT RULE: no readable words, no readable letters, no logos, no watermarks, no signage. Abstract non-readable letterform fragments are allowed only as subtle texture."
-        : "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos."
+      ? "BACKGROUND MUST BE TEXT-FREE: absolutely no words, letters, numbers, symbols resembling typography, watermarks, logos."
       : "";
   const ignoreTypographyRefLine =
     !isRound1ReferenceFirst
-      ? titleIntegrationMode === "TYPE_AS_TEXTURE"
-        ? "If style refs show typography, only borrow abstract texture rhythm; never reproduce readable words or signage."
-        : "If style refs show typography, ignore it completely and output only the graphical background style."
+      ? "If style refs show typography, ignore it completely and output only the graphical background style."
       : "";
   const explorationTextInvalidLine = params.explorationMode && !isRound1ReferenceFirst
-    ? titleIntegrationMode === "TYPE_AS_TEXTURE"
-      ? "If any readable text appears, the result is invalid. Keep any letterform texture fragmentary, non-readable, and secondary."
-      : "If ANY text appears, the result is invalid. Prioritize removing/avoiding text over all other style cues."
+    ? "If ANY text appears, the result is invalid. Prioritize removing/avoiding text over all other style cues."
     : "";
   const playfulBrandModeLine =
     params.brandMode === "brand" && styleFamily && PLAYFUL_STYLE_FAMILY_KEYS.has(styleFamily.key)
       ? "If brand mode, express playfulness via shapes/composition/texture only; DO NOT introduce forbidden hues."
       : "";
-  // Bible creative brief fields are used as symbolic visual guidance for background generation.
-  const bibleSummaryLine =
+  const motifFocus = safeArrayOfStrings(params.directionSpec?.motifFocus, []).slice(0, 3);
+  const bibleBriefMotifSignals =
     promptProfile.includeFlags.includeBibleBrief && params.bibleCreativeBrief
-      ? `Bible brief summary: ${params.bibleCreativeBrief.summary}`
-      : "";
-  const bibleThemeLine =
-    promptProfile.includeFlags.includeBibleBrief &&
-    params.bibleCreativeBrief &&
-    params.bibleCreativeBrief.themes.length > 0
-      ? `Themes: ${params.bibleCreativeBrief.themes.join(", ")}.`
-      : "";
-  const bibleMotifLine =
-    promptProfile.includeFlags.includeBibleBrief &&
-    params.bibleCreativeBrief &&
-    params.bibleCreativeBrief.motifs.length > 0
-      ? `Motifs (symbolic cues): ${params.bibleCreativeBrief.motifs.slice(0, 8).join(", ")}.`
-      : "";
-  const motifFocus = safeArrayOfStrings(params.directionSpec?.motifFocus, []).slice(0, 2);
-  const motifFocusLine =
-    motifFocus.length > 0 ? `Primary motifs for this direction: ${motifFocus.join(", ")}. Incorporate these subtly.` : "";
+      ? [
+          ...params.bibleCreativeBrief.themes,
+          ...params.bibleCreativeBrief.motifs,
+          ...params.bibleCreativeBrief.markIdeas
+        ]
+      : [];
+  const symbolDirectives = buildSymbolDirectives([...motifFocus, ...bibleBriefMotifSignals], 8);
+  const symbolDirectiveLine =
+    symbolDirectives.length > 0
+      ? `Symbol directives (visual only): ${symbolDirectives.join(", ")}.`
+      : "Symbol directives (visual only): radiant light burst, vine branch silhouette, circular stone form.";
   const profileHardRuleLines = promptProfile.hardRules
     .map((line) => {
       if (!isRound1ReferenceFirst) {
@@ -5795,9 +7283,9 @@ function buildTemplateBackgroundPrompt(params: {
       if (!line.includes("motifFocus")) {
         return line;
       }
-      return motifFocus.length > 0
-        ? `Include a clear focal motif tied to motifFocus (${motifFocus.join(", ")}).`
-        : "Include a clear focal motif tied to motifFocus.";
+      return symbolDirectives.length > 0
+        ? `Include a clear focal motif tied to symbol directives (${symbolDirectives.slice(0, 3).join(", ")}).`
+        : "Include a clear focal motif tied to symbol directives.";
     })
     .filter(Boolean);
   const profileSoftGuidanceLines = promptProfile.softGuidance
@@ -5820,21 +7308,6 @@ function buildTemplateBackgroundPrompt(params: {
   const motifScopeRuleLine =
     params.directionSpec?.motifScope === "whole_book"
       ? "MOTIF SCOPE RULE: If this is a whole-book series, use book-wide themes as symbols. Do NOT pick a single story scene as the main symbol unless notes request it."
-      : "";
-  const allowedGenericMotifs = safeArrayOfStrings(params.bibleCreativeBrief?.allowedGenericMotifs, []);
-  const allowedGenericForDirection = [...new Set([...allowedGenericMotifs, ...motifFocus])];
-  const allowedGenericLine =
-    allowedGenericForDirection.length > 0
-      ? `Allowed generic motifs for this direction (if context truly demands): ${allowedGenericForDirection.join(", ")}.`
-      : "Allowed generic motifs for this direction: none.";
-  const genericMotifBanLine = `Do NOT use generic Christian icons (${GENERIC_CHRISTIAN_MOTIFS.join(
-    ", "
-  )}) unless explicitly listed in allowedGenericMotifs or motifFocus.`;
-  const bibleDoNotUseLine =
-    promptProfile.includeFlags.includeBibleBrief &&
-    params.bibleCreativeBrief &&
-    params.bibleCreativeBrief.doNotUse.length > 0
-      ? `Do not use: ${params.bibleCreativeBrief.doNotUse.join("; ")}.`
       : "";
   const titleStageInstructions =
     promptProfile.includeFlags.includeTitleStage && params.directionSpec?.wantsTitleStage === true
@@ -5884,24 +7357,30 @@ function buildTemplateBackgroundPrompt(params: {
     backgroundTextFreeRuleLine,
     ignoreTypographyRefLine,
     explorationTextInvalidLine,
-    buildBackgroundPrompt(params.brief, params.styleFamily),
+    buildBackgroundPrompt(
+      {
+        ...params.brief,
+        // Background generation must stay text-free; do not expose literal series title/subtitle in this stage prompt.
+        title: "",
+        subtitle: "",
+        scripture: ""
+      },
+      params.styleFamily
+    ),
     directionHint,
     playfulBrandModeLine,
-    bibleSummaryLine,
-    bibleThemeLine,
-    bibleMotifLine,
+    symbolDirectiveLine,
+    refinementMotifEmphasisLine,
+    SYMBOL_ONLY_TEXT_BAN_DIRECTIVE,
     motifScopeLine,
     motifScopeRuleLine,
-    motifFocusLine,
-    allowedGenericLine,
-    genericMotifBanLine,
+    "Avoid generic clipart-style religious icons; keep motifs abstract, compositional, and material-driven.",
     params.seriesPreferenceGuidance || "",
     shapeCompositionHintLine,
     "Incorporate 1-2 motifs subtly and symbolically; avoid literal portraits or face-centric depictions.",
     lockupSafeAreaInstructionsLine,
     titleStageInstructions,
     lockupSafeAreaDetailLine,
-    bibleDoNotUseLine,
     "Keep hierarchy disciplined and leave the lockup lane clean.",
     params.paletteComplianceBoost || "",
     params.toneComplianceBoost || "",
@@ -5919,29 +7398,74 @@ async function generateCleanMinimalBackgroundPng(params: {
   shape: PreviewShape;
   referenceDataUrls: string[];
   runImageGeneration?: ConcurrencyLimiter;
+  imageDebugMeta?: {
+    rateLimitWaitMs?: number;
+  };
+  registerImageCall?: (params: { stage: ImageCallStage; aspect: ImageCallAspect; retry: boolean }) => boolean;
+  retryCall?: boolean;
+  disablePromptOnlyFallbackForRateLimit?: boolean;
+  disable429Retry?: boolean;
 }): Promise<Buffer> {
   const size = OPENAI_IMAGE_SIZE_BY_SHAPE[params.shape];
   const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
+  const aspect = aspectFromShape(params.shape);
+  let promptOnlyRetry = Boolean(params.retryCall);
+  const trackCall = (retry: boolean) => {
+    if (!params.registerImageCall) {
+      return;
+    }
+    const allowed = params.registerImageCall({
+      stage: "background",
+      aspect,
+      retry
+    });
+    if (allowed === false) {
+      throw new Round1ImageCallCapReachedError();
+    }
+  };
 
   if (params.referenceDataUrls.length > 0) {
     try {
+      trackCall(Boolean(params.retryCall));
       return await runImageGeneration(() =>
         generatePngFromPrompt({
           prompt: params.prompt,
           size,
-          references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl }))
+          references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl })),
+          disable429Retry: params.disable429Retry,
+          meta: params.imageDebugMeta
+            ? {
+                debug: params.imageDebugMeta
+              }
+            : undefined
         })
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
+      const quotaLikeError = /\binsufficient[_-]?quota\b|\bquota\b/i.test(message);
+      if (
+        isOpenAiRateLimitError(error) ||
+        (params.disablePromptOnlyFallbackForRateLimit && quotaLikeError) ||
+        isRound1ImageCallCapReachedError(error)
+      ) {
+        throw error;
+      }
+      promptOnlyRetry = true;
       console.warn(`Reference-guided generation failed for ${params.shape}; retrying prompt-only. ${message}`);
     }
   }
 
+  trackCall(promptOnlyRetry);
   return runImageGeneration(() =>
     generatePngFromPrompt({
       prompt: params.prompt,
-      size
+      size,
+      disable429Retry: params.disable429Retry,
+      meta: params.imageDebugMeta
+        ? {
+            debug: params.imageDebugMeta
+          }
+        : undefined
     })
   );
 }
@@ -5951,6 +7475,7 @@ const NO_TEXT_RETRY_BOOSTS = [
   "CRITICAL NO-TEXT RETRY: zero readable text, zero glyphs, zero typographic marks. Produce pure image textures and shapes only.",
   "Remove ALL letterforms; replace with texture."
 ] as const;
+const BACKGROUND_ELIGIBILITY_RETRY_BOOST = "Remove ALL letterforms; replace with texture.";
 const TEXT_ARTIFACT_RETRY_OVERRIDE =
   "TEXT REMOVAL RETRY OVERRIDE: remove all typography artifacts; regenerate as pure background only; no letters/words at all.";
 
@@ -5960,11 +7485,13 @@ async function generateValidatedBackgroundPng(params: {
   shape: PreviewShape;
   generationId: string;
   directionSpec?: PlannedDirectionSpec | null;
+  designSpec?: DesignSpec | null;
   brandMode?: ProjectBrandMode;
   explorationMode?: boolean;
   seriesPreferenceGuidance?: string;
   bibleCreativeBrief?: BibleCreativeBrief | null;
   referenceDataUrls: string[];
+  hardFailTextTokens?: string[];
   focalPoint?: FocalPoint;
   originalityBoost?: string;
   brandPaletteHardConstraint?: string;
@@ -5972,18 +7499,28 @@ async function generateValidatedBackgroundPng(params: {
   toneComplianceBoost?: string;
   textArtifactRetryBoost?: string;
   runImageGeneration?: ConcurrencyLimiter;
+  maxTextRetries?: number;
+  imageDebugMeta?: {
+    rateLimitWaitMs?: number;
+  };
+  registerImageCall?: (params: { stage: ImageCallStage; aspect: ImageCallAspect; retry: boolean }) => boolean;
+  isRetryGeneration?: boolean;
+  disablePromptOnlyFallbackForRateLimit?: boolean;
+  disable429Retry?: boolean;
 }): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number; textCheckPassed: boolean }> {
+  const maxTextRetries = Math.max(0, Math.min(params.maxTextRetries ?? NO_TEXT_RETRY_BOOSTS.length, NO_TEXT_RETRY_BOOSTS.length));
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
 
-  for (let attempt = 0; attempt <= NO_TEXT_RETRY_BOOSTS.length; attempt += 1) {
-    const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[attempt - 1];
+  for (let attempt = 0; attempt <= maxTextRetries; attempt += 1) {
+    const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[Math.min(attempt - 1, NO_TEXT_RETRY_BOOSTS.length - 1)];
     const prompt = buildTemplateBackgroundPrompt({
       brief: params.brief,
       styleFamily: params.styleFamily,
       shape: params.shape,
       generationId: params.generationId,
       directionSpec: params.directionSpec,
+      designSpec: params.designSpec,
       brandMode: params.brandMode,
       explorationMode: params.explorationMode,
       seriesPreferenceGuidance: params.seriesPreferenceGuidance,
@@ -6000,10 +7537,17 @@ async function generateValidatedBackgroundPng(params: {
       prompt,
       shape: params.shape,
       referenceDataUrls: params.referenceDataUrls,
-      runImageGeneration: params.runImageGeneration
+      runImageGeneration: params.runImageGeneration,
+      imageDebugMeta: params.imageDebugMeta,
+      registerImageCall: params.registerImageCall,
+      retryCall: params.isRetryGeneration === true || attempt > 0,
+      disablePromptOnlyFallbackForRateLimit: params.disablePromptOnlyFallbackForRateLimit,
+      disable429Retry: params.disable429Retry
     });
     const backgroundPng = await normalizePngToShape(backgroundSource, params.shape, params.focalPoint);
-    const hasText = await imageHasReadableText(backgroundPng);
+    const hasText = await imageHasReadableText(backgroundPng, {
+      hardFailTokens: params.hardFailTextTokens
+    });
     if (!hasText) {
       return {
         backgroundPng,
@@ -6020,7 +7564,7 @@ async function generateValidatedBackgroundPng(params: {
   return {
     backgroundPng: lastBackgroundPng as Buffer,
     prompt: lastPrompt,
-    textRetryCount: NO_TEXT_RETRY_BOOSTS.length,
+    textRetryCount: maxTextRetries,
     textCheckPassed: false
   };
 }
@@ -6076,15 +7620,13 @@ async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
   output: GenerationOutputPayload;
-}): Promise<void> {
+  failureReason?: BackgroundAttemptFailureReason;
+}): Promise<GenerationOptionStatus> {
   const designDocByShape = params.output.designDocByShape;
-  const [squarePng, widePng, tallPng, squareBackgroundPng, wideBackgroundPng, tallBackgroundPng, lockupResult] = await Promise.all([
+  const [squarePng, widePng, tallPng, lockupResult] = await Promise.all([
     renderCompositedPreviewPng(designDocByShape.square),
     renderCompositedPreviewPng(designDocByShape.wide),
     renderCompositedPreviewPng(designDocByShape.tall),
-    renderBackgroundOnlyPreviewPng(designDocByShape.square),
-    renderBackgroundOnlyPreviewPng(designDocByShape.wide),
-    renderBackgroundOnlyPreviewPng(designDocByShape.tall),
     (async () =>
       renderTrimmedLockupPngFromSvg(
         await buildFinalSvg(designDocByShape.wide, {
@@ -6093,75 +7635,50 @@ async function completeGenerationWithFallbackOutput(params: {
         })
       ))()
   ]);
-  const [squarePath, widePath, tallPath, squareBackgroundPath, wideBackgroundPath, tallBackgroundPath, lockupPath] =
-    await Promise.all([
+  const [squarePath, widePath, tallPath, lockupPath] = await Promise.all([
       writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-square.png`,
+        fileName: `${params.generationId}-fallback-square-preview.png`,
         png: squarePng
       }),
       writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-wide.png`,
+        fileName: `${params.generationId}-fallback-wide-preview.png`,
         png: widePng
       }),
       writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-tall.png`,
+        fileName: `${params.generationId}-fallback-tall-preview.png`,
         png: tallPng
       }),
       writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-square-bg.png`,
-        png: squareBackgroundPng
-      }),
-      writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-wide-bg.png`,
-        png: wideBackgroundPng
-      }),
-      writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-tall-bg.png`,
-        png: tallBackgroundPng
-      }),
-      writeGenerationPreviewFiles({
-        fileName: `${params.generationId}-lockup.png`,
+        fileName: `${params.generationId}-fallback-lockup-preview.png`,
         png: lockupResult.png
       })
     ]);
-  const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
-    projectId: params.projectId,
-    generationId: params.generationId,
-    kind: "BACKGROUND",
-    slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
-    file_path:
-      shape === "square" ? squareBackgroundPath : shape === "wide" ? wideBackgroundPath : tallBackgroundPath,
-    mime_type: "image/png",
-    width: PREVIEW_DIMENSIONS[shape].width,
-    height: PREVIEW_DIMENSIONS[shape].height
-  }));
-  const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
-    projectId: params.projectId,
-    generationId: params.generationId,
-    kind: "IMAGE",
-    slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
-    file_path: shape === "square" ? squarePath : shape === "wide" ? widePath : tallPath,
-    mime_type: "image/png",
-    width: PREVIEW_DIMENSIONS[shape].width,
-    height: PREVIEW_DIMENSIONS[shape].height
-  }));
-  const lockupAssetRow: Prisma.AssetCreateManyInput = {
-    projectId: params.projectId,
-    generationId: params.generationId,
-    kind: "LOCKUP",
-    slot: LOCKUP_ASSET_SLOT,
-    file_path: lockupPath,
-    mime_type: "image/png",
-    width: lockupResult.width,
-    height: lockupResult.height
-  };
-
-  const completedOutput: GenerationOutputPayload = {
-    ...params.output,
-    preview: {
-      square_main: squarePath,
-      widescreen_main: widePath,
-      vertical_main: tallPath
+  const fallbackStatus: GenerationOptionStatus = "FALLBACK";
+  const outputWithStatus = withOutputStatus(params.output, fallbackStatus);
+  const fallbackDebugMeta = mergeGenerationDebugMeta(outputWithStatus.meta.debug, {
+    backgroundSource: "fallback",
+    lockupSource: "fallback",
+    ...(params.failureReason
+      ? {
+          backgroundFailureReason: params.failureReason
+        }
+      : {}),
+    fallbackPreview: {
+      square: squarePath,
+      wide: widePath,
+      tall: tallPath,
+      lockup: lockupPath
+    }
+  });
+  const persistedFallbackOutput: GenerationOutputPayload = {
+    ...outputWithStatus,
+    meta: {
+      ...outputWithStatus.meta,
+      ...(fallbackDebugMeta
+        ? {
+            debug: fallbackDebugMeta
+          }
+        : {})
     }
   };
 
@@ -6174,17 +7691,118 @@ async function completeGenerationWithFallbackOutput(params: {
         }
       }
     }),
-    prisma.asset.createMany({
-      data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
-    }),
     prisma.generation.update({
       where: { id: params.generationId },
       data: {
-        status: "COMPLETED",
-        output: completedOutput as Prisma.InputJsonValue
+        status: "FAILED",
+        output: persistedFallbackOutput as Prisma.InputJsonValue
       }
     })
   ]);
+
+  return fallbackStatus;
+}
+
+type PlannedGenerationRunResult = {
+  generationId: string;
+  optionStatus: GenerationOptionStatus;
+  failureReason: BackgroundAttemptFailureReason | null;
+};
+
+function withRoundDebugStatusOutput(
+  output: unknown,
+  params: {
+    roundHasFallback: boolean;
+    roundStatus: GenerationRoundStatus;
+    roundCompletedCount: number;
+    roundAttemptCount: number;
+    roundRequiredCompletedCount: number;
+    roundFailureReason: GenerationRoundFailureReason | null;
+  }
+): Prisma.InputJsonValue | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const outputRecord = output as Record<string, unknown>;
+  const existingMeta =
+    outputRecord.meta && typeof outputRecord.meta === "object" && !Array.isArray(outputRecord.meta)
+      ? (outputRecord.meta as Record<string, unknown>)
+      : {};
+  const existingDebug =
+    existingMeta.debug && typeof existingMeta.debug === "object" && !Array.isArray(existingMeta.debug)
+      ? (existingMeta.debug as Record<string, unknown>)
+      : {};
+
+  return {
+    ...outputRecord,
+    meta: {
+      ...existingMeta,
+      debug: {
+        ...existingDebug,
+        roundHasFallback: params.roundHasFallback,
+        roundStatus: params.roundStatus,
+        roundCompletedCount: params.roundCompletedCount,
+        roundAttemptCount: params.roundAttemptCount,
+        roundRequiredCompletedCount: params.roundRequiredCompletedCount,
+        roundFailureReason: params.roundFailureReason
+      }
+    }
+  } as Prisma.InputJsonValue;
+}
+
+async function persistRoundDebugStatusForGenerations(params: {
+  generationIds: string[];
+  roundHasFallback: boolean;
+  roundStatus: GenerationRoundStatus;
+  roundCompletedCount: number;
+  roundAttemptCount: number;
+  roundRequiredCompletedCount: number;
+  roundFailureReason: GenerationRoundFailureReason | null;
+}): Promise<void> {
+  if (params.generationIds.length === 0) {
+    return;
+  }
+
+  const persistedRoundRows = await prisma.generation.findMany({
+    where: {
+      id: {
+        in: params.generationIds
+      }
+    },
+    select: {
+      id: true,
+      output: true
+    }
+  });
+  const roundUpdates: Prisma.PrismaPromise<unknown>[] = [];
+  for (const generation of persistedRoundRows) {
+    const outputWithRoundMeta = withRoundDebugStatusOutput(generation.output, {
+      roundHasFallback: params.roundHasFallback,
+      roundStatus: params.roundStatus,
+      roundCompletedCount: params.roundCompletedCount,
+      roundAttemptCount: params.roundAttemptCount,
+      roundRequiredCompletedCount: params.roundRequiredCompletedCount,
+      roundFailureReason: params.roundFailureReason
+    });
+    if (!outputWithRoundMeta) {
+      continue;
+    }
+    roundUpdates.push(
+      prisma.generation.update({
+        where: {
+          id: generation.id
+        },
+        data: {
+          output: outputWithRoundMeta
+        }
+      })
+    );
+  }
+
+  if (roundUpdates.length > 0) {
+    await prisma.$transaction(roundUpdates);
+  }
 }
 
 async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
@@ -6193,7 +7811,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   plannedGenerations: PlannedGeneration[];
   bibleCreativeBrief?: BibleCreativeBrief | null;
   motifBankContext?: MotifBankContext;
-}): Promise<void> {
+}): Promise<PlannedGenerationRunResult[]> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
   const imageGenerationLimit = createConcurrencyLimiter(ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY);
   const optionGenerationLimit = createConcurrencyLimiter(
@@ -6236,18 +7854,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
     params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
       ? params.project.brandKit.typographyDirection
       : null;
-  let cachedRecentStyleFamiliesForFallback: StyleFamilyKey[] | null = null;
-  const getRecentStyleFamiliesForFallback = async (): Promise<StyleFamilyKey[]> => {
-    if (cachedRecentStyleFamiliesForFallback) {
-      return cachedRecentStyleFamiliesForFallback;
-    }
-    cachedRecentStyleFamiliesForFallback = await loadRecentStyleFamilies({
-      organizationId: params.organizationId,
-      projectId: params.project.id,
-      limit: 24
-    });
-    return cachedRecentStyleFamiliesForFallback;
-  };
   const round1SelectedVariationTemplateUsage = new Map<string, number>();
   let round1SelectedDefaultBiasCount = 0;
   const layoutDiversityPenaltyForTemplate = (round: number, templateKey: string | null): number => {
@@ -6271,20 +7877,28 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       round1SelectedDefaultBiasCount += 1;
     }
   };
+  let round1ImageCallsConsumed = 0;
 
-  await Promise.all(params.plannedGenerations.map((plannedGeneration) => optionGenerationLimit(async () => {
-    let fallbackOutput = plannedGeneration.fallbackOutput;
+  const optionResults: PlannedGenerationRunResult[] = await Promise.all(
+    params.plannedGenerations.map((plannedGeneration) => optionGenerationLimit(async (): Promise<PlannedGenerationRunResult> => {
+      let fallbackOutput = plannedGeneration.fallbackOutput;
+      let imageCallCapReached = false;
 
-    if (!openAiEnabled) {
-      await completeGenerationWithFallbackOutput({
-        projectId: params.project.id,
-        generationId: plannedGeneration.id,
-        output: fallbackOutput
-      });
-      return;
-    }
+      if (!openAiEnabled) {
+        const optionStatus = await completeGenerationWithFallbackOutput({
+          projectId: params.project.id,
+          generationId: plannedGeneration.id,
+          output: fallbackOutput,
+          failureReason: "UNKNOWN"
+        });
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus,
+          failureReason: "UNKNOWN"
+        };
+      }
 
-    try {
+      try {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
       const feedbackControls = readFeedbackGenerationControls(plannedGeneration.input);
       const seriesPreferenceGuidance = buildSeriesPreferenceGuidance(params.project);
@@ -6294,9 +7908,45 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       }
       const runSeed = readRunSeedFromInput(plannedGeneration.input) || plannedGeneration.id;
       const directionSpec = readDirectionSpecFromInput(plannedGeneration.input, plannedGeneration.optionIndex);
+      const inputRefinementLineage = readRefinementLineageFromInput(plannedGeneration.input);
       const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(plannedGeneration.input);
       const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
       const shouldRunExplorationToneCheck = plannedGeneration.round === 1 && !hasDesignNotes;
+      const shouldUseCheapRound1Mode = DEV_CHEAP_MODE && plannedGeneration.round === 1;
+      const shouldUseRound1NoNotesThrottle = plannedGeneration.round === 1 && !hasDesignNotes;
+      const shouldDisableToneComplianceRetry = shouldUseRound1NoNotesThrottle;
+      const backgroundCandidateCount = shouldUseRound1NoNotesThrottle
+        ? DEV_CHEAP_MODE
+          ? CHEAP_MODE_ROUND1_BACKGROUND_CANDIDATE_COUNT
+          : STANDARD_ROUND1_BACKGROUND_CANDIDATE_COUNT
+        : ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT;
+      const lockupCandidateCount = shouldUseRound1NoNotesThrottle
+        ? ROUND1_NO_NOTES_LOCKUP_CANDIDATE_COUNT
+        : ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT;
+      const maxTextRetriesPerBackground = shouldUseRound1NoNotesThrottle
+        ? ROUND1_NO_NOTES_MAX_TEXT_RETRIES
+        : NO_TEXT_RETRY_BOOSTS.length;
+      const shouldDisablePromptFallbackOnRateLimit = shouldUseRound1NoNotesThrottle;
+      const shouldDisable429Retry = shouldUseRound1NoNotesThrottle;
+      const shouldEnforceRound1ImageCallCap = shouldUseCheapRound1Mode;
+      const imageCallSummary = createImageCallDebugSummary();
+      const imageRateLimitDebugMeta: { rateLimitWaitMs?: number } = {};
+      const registerImageCall = (params: { stage: ImageCallStage; aspect: ImageCallAspect; retry: boolean }): boolean => {
+        if (shouldEnforceRound1ImageCallCap && round1ImageCallsConsumed >= ROUND1_CHEAP_MODE_MAX_IMAGE_CALLS) {
+          imageCallCapReached = true;
+          return false;
+        }
+        if (shouldEnforceRound1ImageCallCap) {
+          round1ImageCallsConsumed += 1;
+        }
+        imageCallSummary.total += 1;
+        imageCallSummary.byStage[params.stage] += 1;
+        imageCallSummary.byAspect[params.aspect] += 1;
+        if (params.retry) {
+          imageCallSummary.retries += 1;
+        }
+        return true;
+      };
       const displayContent = buildOverlayDisplayContent({
         title: designBrief.seriesTitle || params.project.series_title,
         subtitle: designBrief.seriesSubtitle || params.project.series_subtitle,
@@ -6410,6 +8060,28 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         brandMode: params.project.brandMode,
         typographyDirection: organizationTypographyDirection
       });
+      const activeDesignSpec: DesignSpec | null = shouldRunExplorationToneCheck
+        ? await generateDesignSpec({
+            projectId: params.project.id,
+            seriesTitle: params.project.series_title,
+            subtitle: params.project.series_subtitle,
+            sermonTitle: content.title,
+            passageRef: designBrief.passage || params.project.scripture_passages,
+            motifScope: directionSpec?.motifScope || motifBankContext.scriptureScope,
+            motifFocus: safeArrayOfStrings(directionSpec?.motifFocus, []),
+            referenceId: anchorReference?.id || directionSpec?.referenceId || references[0]?.id || "unknown-reference",
+            referenceCluster: resolvedReferenceCluster || "other",
+            referenceTier: resolvedReferenceTier || "unknown",
+            round: plannedGeneration.round,
+            optionIndex: plannedGeneration.optionIndex
+          })
+        : null;
+      const hardFailTextTokens = extractReadableHardFailTokens([
+        content.title,
+        content.subtitle,
+        designBrief.passage || params.project.scripture_passages || "",
+        ...motifBankContext.bookNames
+      ]);
       const plannedLockupLayout = readLockupLayoutFromInput(plannedGeneration.input);
       const lockupLayout = plannedLockupLayout || defaultLockupLayoutForStyleMode(lockupStyleMode);
       let lockupPrompt = buildLockupGenerationPrompt({
@@ -6419,6 +8091,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         lockupLayout,
         explorationMode: shouldRunExplorationToneCheck,
         directionSpec,
+        designSpec: activeDesignSpec,
         references,
         bibleCreativeBrief,
         wantsSeriesMark: directionSpec?.wantsSeriesMark || false,
@@ -6426,7 +8099,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         typographyDirection: organizationTypographyDirection,
         optionalMarkAccentHexes: palette
       });
-      const lockupIntegrationMode = chooseLockupIntegrationMode(lockupStyleMode);
+      const lockupIntegrationMode = activeDesignSpec
+        ? mapDesignSpecModeToLockupIntegrationMode(
+            resolveDesignSpecTitleIntegrationMode({
+              designSpec: activeDesignSpec,
+              directionSpec
+            })
+          )
+        : chooseLockupIntegrationMode(lockupStyleMode);
       const templateBrief: TemplateBrief = {
         title: content.title,
         subtitle: content.subtitle,
@@ -6462,6 +8142,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const shouldReuseBackground =
         feedbackControls.regenerateBackground === false && Boolean(reusableAssets?.masterBackgroundPng);
       const shouldReuseLockup = feedbackControls.regenerateLockup === false && Boolean(reusableAssets?.lockupPng);
+      const backgroundSourceForSuccess: DebugAssetSource = shouldReuseBackground ? "reused" : "generated";
+      const lockupSourceForSuccess: DebugAssetSource = shouldReuseLockup ? "reused" : "generated";
       const initialDirectionStyleFields = resolveDirectionStyleFields(directionSpec);
       let effectiveDirectionStyleFamily =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleFamily
@@ -6494,6 +8176,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const titleSafeBoxForDirection = (targetDirectionSpec?: PlannedDirectionSpec | null): TitleSafeBox =>
         resolveTitleSafeBoxForDirection(OPTION_MASTER_BACKGROUND_SHAPE, targetDirectionSpec);
       let rerankMeta: RerankDebugMeta = {};
+      let backgroundAttemptDiagnostics: BackgroundAttemptDebug[] = [];
 
       const resolveToneTargetFromDirectionSpec = (targetDirectionSpec?: PlannedDirectionSpec | null) => {
         const styleTone = resolveDirectionStyleFields(targetDirectionSpec).styleTone;
@@ -6513,7 +8196,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             OPTION_MASTER_BACKGROUND_SHAPE,
             resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE)
           );
-          const hasText = await imageHasReadableText(backgroundPng);
+          const hasText = await imageHasReadableText(backgroundPng, {
+            hardFailTokens: hardFailTextTokens
+          });
           const hash = await computeDHashFromBuffer(backgroundPng);
           return {
             prompt: `reused background from generation ${reusableAssets.sourceGenerationId}`,
@@ -6527,6 +8212,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             textArtifactRetryCount: 0,
             backgroundTextCheck: null as BackgroundTextCheckSummary | null,
             textCheckPassed: !hasText,
+            textScrubDebug: null as TextScrubDebug | null,
             variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
           };
         }
@@ -6540,15 +8226,22 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           shape: OPTION_MASTER_BACKGROUND_SHAPE,
           generationId: generationSeedPrefix,
           directionSpec: activeDirectionSpec,
+          designSpec: activeDesignSpec,
           brandMode: params.project.brandMode,
           explorationMode: shouldRunExplorationToneCheck,
           seriesPreferenceGuidance,
           bibleCreativeBrief,
           referenceDataUrls,
+          hardFailTextTokens,
           focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
           originalityBoost: attemptParams.originalityBoost,
           brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
-          runImageGeneration: imageGenerationLimit
+          runImageGeneration: imageGenerationLimit,
+          maxTextRetries: maxTextRetriesPerBackground,
+          imageDebugMeta: imageRateLimitDebugMeta,
+          registerImageCall,
+          disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
+          disable429Retry: shouldDisable429Retry
         });
 
         let validatedBackground = initialBackground;
@@ -6593,16 +8286,24 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 shape: OPTION_MASTER_BACKGROUND_SHAPE,
                 generationId: `${generationSeedPrefix}|palette-retry`,
                 directionSpec: activeDirectionSpec,
+                designSpec: activeDesignSpec,
                 brandMode: params.project.brandMode,
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
                 referenceDataUrls,
+                hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
                 originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: BRAND_PALETTE_STRICT_RETRY_BOOST,
-                runImageGeneration: imageGenerationLimit
+                runImageGeneration: imageGenerationLimit,
+                maxTextRetries: maxTextRetriesPerBackground,
+                imageDebugMeta: imageRateLimitDebugMeta,
+                registerImageCall,
+                isRetryGeneration: true,
+                disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
+                disable429Retry: shouldDisable429Retry
               });
               paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
             }
@@ -6636,7 +8337,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           toneCheck.failuresAfter = toneEvaluationBefore.failures;
           toneCheck.passed = toneEvaluationBefore.passed;
 
-          if (!toneEvaluationBefore.passed) {
+          if (!toneEvaluationBefore.passed && !shouldDisableToneComplianceRetry) {
             console.warn(
               `[tone-compliance-retry] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} tone=${toneTargetForCompliance} reasons=${toneEvaluationBefore.failures.join(",")}`
             );
@@ -6649,17 +8350,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 shape: OPTION_MASTER_BACKGROUND_SHAPE,
                 generationId: `${generationSeedPrefix}|tone-retry`,
                 directionSpec: activeDirectionSpec,
+                designSpec: activeDesignSpec,
                 brandMode: params.project.brandMode,
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
                 referenceDataUrls,
+                hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
                 originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
                 toneComplianceBoost: toneOverrideRetryBoost(toneTargetForCompliance),
-                runImageGeneration: imageGenerationLimit
+                runImageGeneration: imageGenerationLimit,
+                maxTextRetries: maxTextRetriesPerBackground,
+                imageDebugMeta: imageRateLimitDebugMeta,
+                registerImageCall,
+                isRetryGeneration: true,
+                disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
+                disable429Retry: shouldDisable429Retry
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -6707,18 +8416,26 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 shape: OPTION_MASTER_BACKGROUND_SHAPE,
                 generationId: `${generationSeedPrefix}|text-artifact-retry`,
                 directionSpec: activeDirectionSpec,
+                designSpec: activeDesignSpec,
                 brandMode: params.project.brandMode,
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
                 referenceDataUrls,
+                hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
                 originalityBoost: attemptParams.originalityBoost,
                 brandPaletteHardConstraint: brandPaletteHardConstraintPrompt,
                 paletteComplianceBoost: paletteRetryCount > 0 ? BRAND_PALETTE_STRICT_RETRY_BOOST : undefined,
                 toneComplianceBoost: toneTargetForCompliance ? toneOverrideRetryBoost(toneTargetForCompliance) : undefined,
                 textArtifactRetryBoost: TEXT_ARTIFACT_RETRY_OVERRIDE,
-                runImageGeneration: imageGenerationLimit
+                runImageGeneration: imageGenerationLimit,
+                maxTextRetries: maxTextRetriesPerBackground,
+                imageDebugMeta: imageRateLimitDebugMeta,
+                registerImageCall,
+                isRetryGeneration: true,
+                disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
+                disable429Retry: shouldDisable429Retry
             });
 
             if (brandPaletteComplianceHexes.length > 0) {
@@ -6762,12 +8479,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           textArtifactRetryCount,
           backgroundTextCheck,
           textCheckPassed: validatedBackground.textCheckPassed,
+          textScrubDebug: null as TextScrubDebug | null,
           variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
         };
       };
 
       const runBackgroundRerankAttempt = async (params: {
-        stage: "primary" | "fallback_family" | "fallback_set";
+        stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
         attemptNumber: number;
         directionSpecOverride?: PlannedDirectionSpec | null;
         originalityBoost?: string;
@@ -6786,6 +8504,20 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             eligiblePoolEmpty: false,
             candidates: [] as BackgroundRerankCandidateDebug[],
             winner: null as BackgroundRerankWinnerDebug | null,
+            attemptDebug: {
+              attemptIndex: params.attemptNumber,
+              styleFamily: resolveDirectionStyleFields(
+                params.directionSpecOverride === undefined ? backgroundDirectionSpec : params.directionSpecOverride
+              ).styleFamily,
+              anchorUsed: {
+                visualAnchorSrc: null
+              },
+              candidates: [],
+              winnerIndex: 0,
+              failureReason: null
+            } as BackgroundAttemptDebug,
+            failureReason: null as BackgroundAttemptFailureReason | null,
+            textScrub: attempt.textScrubDebug || null,
             winnerDirectionSpec:
               params.directionSpecOverride === undefined ? backgroundDirectionSpec : (params.directionSpecOverride ?? null)
           };
@@ -6796,122 +8528,285 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const candidateTag = params.originalityBoost ? `${params.stage}-orig` : `${params.stage}-base`;
         const toneTargetForCompliance = resolveToneTargetFromDirectionSpec(activeDirectionSpec);
         const styleFields = resolveDirectionStyleFields(activeDirectionSpec);
+        const attemptAnchorReferenceId = normalizeReferenceId(activeDirectionSpec?.referenceId || "");
+        const attemptAnchorReference =
+          attemptAnchorReferenceId.length > 0
+            ? references.find((reference) => normalizeReferenceId(reference.id) === attemptAnchorReferenceId) ||
+              referenceIndexById.get(attemptAnchorReferenceId) ||
+              null
+            : anchorReference || references[0] || null;
+        const attemptVisualAnchorSrc =
+          resolveReferenceVisualAnchorSrc({
+            reference: attemptAnchorReference,
+            referenceCluster: activeDirectionSpec?.referenceCluster || resolvedReferenceCluster
+          }) ||
+          referenceAnchorDebug?.visualAnchorSrc ||
+          anchorVisualAnchorSrc ||
+          null;
         const candidateTemplateKeys = buildBackgroundCandidateTemplateKeys({
           seed: `${runSeed}|${plannedGeneration.optionIndex}|${candidateTag}|attempt-${params.attemptNumber}`,
-          count: ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT,
+          count: backgroundCandidateCount,
           directionSpec: activeDirectionSpec
         });
-        const backgroundCandidateLimit = createConcurrencyLimiter(ROUND1_CANDIDATE_PARALLEL_CONCURRENCY);
-        const candidates = await Promise.all(
-          Array.from({ length: ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT }, (_, candidateIndex) =>
-            backgroundCandidateLimit(async () => {
-              const candidateVariationTemplateKey =
-                candidateTemplateKeys[candidateIndex] || activeDirectionSpec?.variationTemplateKey || null;
-              const candidateDirectionSpec = withVariationTemplateKey(activeDirectionSpec, candidateVariationTemplateKey);
-              const candidateTitleSafeBox = titleSafeBoxForDirection(candidateDirectionSpec);
-              const attempt = await renderMasterAttempt({
-                directionSpecOverride: candidateDirectionSpec,
-                originalityBoost: params.originalityBoost,
-                candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
-              });
-              const toneStats = attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(attempt.backgroundPng));
-              const tonePass = toneTargetForCompliance
-                ? toneStats
-                  ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
-                  : false
-                : true;
-              const textArtifactDetected = await detectTextArtifactsHeuristic(attempt.backgroundPng);
-              const textFree = attempt.textCheckPassed && !textArtifactDetected;
-              const designPresencePass = passesDesignPresence(toneStats);
-              const hardFail = await computeBackgroundHardFailStatsFromBuffer(
-                attempt.backgroundPng,
-                candidateTitleSafeBox,
-                candidateDirectionSpec?.referenceCluster || null
-              );
-              const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
-              const meaningfulStructureScore = Math.max(0, hardFail?.meaningfulStructureScore || 0);
-              const frameScaffoldTriggered =
-                hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
-              const frameScaffoldPenalty = frameScaffoldTriggered
-                ? ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY
-                : hardFail?.mostEdgesAreLongStraightBorders
-                  ? ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY
-                  : 0;
-              const hardFailBlankDesign = !hardFail || !hardFail.passes;
-              const titleSafe = await scoreTitleSafeRegion(pngBufferToDataUrl(attempt.backgroundPng), candidateTitleSafeBox);
-              const midtoneRange = await scoreMidtoneRangeFromBuffer(attempt.backgroundPng);
-              let score = 0;
-              score += tonePass ? 140 : -140;
-              score += textFree ? 140 : -140;
-              score += designPresencePass ? 90 : -90;
-              score += meaningfulStructurePass
-                ? ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS
-                : -ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY;
-              score += meaningfulStructureScore * ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT;
-              score += hardFailBlankDesign ? -240 : 120;
-              score += (titleSafe?.score || 0) * ROUND1_RERANK_TITLE_SAFE_WEIGHT;
-              score += (midtoneRange?.score || 0) * ROUND1_RERANK_MIDTONE_RANGE_WEIGHT;
-              score -= attempt.textRetryCount * 2;
-              score -= attempt.textArtifactRetryCount * 4;
-              score -= frameScaffoldPenalty;
-              const layoutDiversityPenalty = layoutDiversityPenaltyForTemplate(
-                plannedGeneration.round,
-                attempt.variationTemplateKey || candidateVariationTemplateKey
-              );
-              score -= layoutDiversityPenalty;
-              const debugUrl = await writeGenerationPreviewFiles({
-                fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}.png`,
-                png: attempt.backgroundPng
-              });
+        const candidates = [] as Array<{
+          attempt: Awaited<ReturnType<typeof renderMasterAttempt>>;
+          directionSpecUsed: PlannedDirectionSpec | null;
+          variationTemplateKey: string | null;
+          layoutDiversityPenalty: number;
+          frameScaffoldPenalty: number;
+          score: number;
+          textScrub: TextScrubDebug | null;
+          checks: {
+            textFree: boolean;
+            tonePass: boolean;
+            designPresencePass: boolean;
+            meaningfulStructurePass: boolean;
+            focalMotifPresent: boolean;
+            frameScaffoldTriggered: boolean;
+            hardFailScaffold: boolean;
+            hardFailBlankDesign: boolean;
+          };
+          stats: {
+            tone: ImageToneStats | null;
+            titleSafe: Awaited<ReturnType<typeof scoreTitleSafeRegion>>;
+            midtoneRange: Awaited<ReturnType<typeof scoreMidtoneRangeFromBuffer>>;
+            hardFail: Awaited<ReturnType<typeof computeBackgroundHardFailStatsFromBuffer>>;
+          };
+          debugUrl: string;
+        }>;
+        const evaluateCandidate = async (
+          candidateAttempt: Awaited<ReturnType<typeof renderMasterAttempt>>,
+          candidateDirectionSpec: PlannedDirectionSpec | null,
+          candidateTitleSafeBox: TitleSafeBox,
+          candidateVariationTemplateKey: string | null
+        ) => {
+          const toneStats =
+            candidateAttempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(candidateAttempt.backgroundPng));
+          const tonePass = toneTargetForCompliance
+            ? toneStats
+              ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
+              : false
+            : true;
+          const textArtifactDetected = await detectTextArtifactsHeuristic(candidateAttempt.backgroundPng);
+          const textFree = candidateAttempt.textCheckPassed;
+          const designPresencePass = passesDesignPresence(toneStats);
+          const hardFail = await computeBackgroundHardFailStatsFromBuffer(
+            candidateAttempt.backgroundPng,
+            candidateTitleSafeBox,
+            candidateDirectionSpec?.referenceCluster || null
+          );
+          const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
+          const focalMotifPresent = hardFail?.focalMotifPresent === true;
+          const meaningfulStructureScore = Math.max(0, hardFail?.meaningfulStructureScore || 0);
+          const frameScaffoldTriggered =
+            hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
+          const hardFailScaffold = frameScaffoldTriggered;
+          const frameScaffoldPenalty = frameScaffoldTriggered
+            ? ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY
+            : hardFail?.mostEdgesAreLongStraightBorders
+              ? ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY
+              : 0;
+          const hardFailBlankDesign = !hardFail || !hardFail.passes;
+          const scaffoldOk = designPresencePass && meaningfulStructurePass && !hardFailScaffold && !hardFailBlankDesign;
+          const titleSafe = await scoreTitleSafeRegion(
+            pngBufferToDataUrl(candidateAttempt.backgroundPng),
+            candidateTitleSafeBox
+          );
+          const midtoneRange = await scoreMidtoneRangeFromBuffer(candidateAttempt.backgroundPng);
+          let score = 0;
+          score += tonePass ? ROUND1_RERANK_TONE_PASS_BONUS : 0;
+          score += textFree ? 140 : -140;
+          score += designPresencePass ? 90 : -90;
+          score += meaningfulStructurePass
+            ? ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS
+            : -ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY;
+          score += focalMotifPresent ? 120 : 0;
+          score += meaningfulStructureScore * ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT;
+          score += hardFailBlankDesign ? -240 : 120;
+          score += (titleSafe?.score || 0) * ROUND1_RERANK_TITLE_SAFE_WEIGHT;
+          score += (midtoneRange?.score || 0) * ROUND1_RERANK_MIDTONE_RANGE_WEIGHT;
+          score -= scaffoldOk ? 0 : ROUND1_RERANK_SCAFFOLD_FAIL_PENALTY;
+          score -= focalMotifPresent ? 0 : ROUND1_RERANK_MOTIF_FAIL_PENALTY;
+          score -= tonePass ? 0 : ROUND1_RERANK_TONE_FAIL_PENALTY;
+          score -= candidateAttempt.textRetryCount * 2;
+          score -= candidateAttempt.textArtifactRetryCount * 4;
+          score -= textArtifactDetected ? 42 : 0;
+          score -= frameScaffoldPenalty;
+          const layoutDiversityPenalty = layoutDiversityPenaltyForTemplate(
+            plannedGeneration.round,
+            candidateAttempt.variationTemplateKey || candidateVariationTemplateKey
+          );
+          score -= layoutDiversityPenalty;
 
-              return {
-                attempt,
-                directionSpecUsed: candidateDirectionSpec,
-                variationTemplateKey: attempt.variationTemplateKey || candidateVariationTemplateKey,
-                layoutDiversityPenalty,
-                frameScaffoldPenalty,
-                score,
-                checks: {
-                  textFree,
-                  tonePass,
-                  designPresencePass,
-                  meaningfulStructurePass,
-                  frameScaffoldTriggered,
-                  hardFailBlankDesign
-                },
-                stats: {
-                  tone: toneStats,
-                  titleSafe,
-                  midtoneRange,
-                  hardFail
-                },
-                debugUrl
+          return {
+            score,
+            layoutDiversityPenalty,
+            frameScaffoldPenalty,
+            checks: {
+              textFree,
+              tonePass,
+              designPresencePass,
+              meaningfulStructurePass,
+              focalMotifPresent,
+              frameScaffoldTriggered,
+              hardFailScaffold,
+              hardFailBlankDesign
+            },
+            stats: {
+              tone: toneStats,
+              titleSafe,
+              midtoneRange,
+              hardFail
+            }
+          };
+        };
+        for (let candidateIndex = 0; candidateIndex < backgroundCandidateCount; candidateIndex += 1) {
+          const candidateVariationTemplateKey =
+            candidateTemplateKeys[candidateIndex] || activeDirectionSpec?.variationTemplateKey || null;
+          const candidateDirectionSpec = withVariationTemplateKey(activeDirectionSpec, candidateVariationTemplateKey);
+          const candidateTitleSafeBox = titleSafeBoxForDirection(candidateDirectionSpec);
+          let attempt: Awaited<ReturnType<typeof renderMasterAttempt>>;
+          try {
+            attempt = await renderMasterAttempt({
+              directionSpecOverride: candidateDirectionSpec,
+              originalityBoost: params.originalityBoost,
+              candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
+            });
+          } catch (error) {
+            if (isRound1ImageCallCapReachedError(error)) {
+              break;
+            }
+            throw error;
+          }
+          let evaluation = await evaluateCandidate(
+            attempt,
+            candidateDirectionSpec,
+            candidateTitleSafeBox,
+            candidateVariationTemplateKey
+          );
+          let textScrub: TextScrubDebug | null = null;
+          const failsOnlyText =
+            !evaluation.checks.textFree &&
+            evaluation.checks.tonePass &&
+            evaluation.checks.designPresencePass &&
+            evaluation.checks.meaningfulStructurePass &&
+            evaluation.checks.focalMotifPresent &&
+            !evaluation.checks.hardFailScaffold &&
+            !evaluation.checks.hardFailBlankDesign;
+
+          if (failsOnlyText) {
+            const scrubResult = await runLocalTextScrubPass(attempt.backgroundPng);
+            const afterHasText = await imageHasReadableText(scrubResult.scrubbedPng, {
+              hardFailTokens: hardFailTextTokens
+            });
+            const scrubbedUrl = await writeGenerationPreviewFiles({
+              fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}-scrubbed.png`,
+              png: scrubResult.scrubbedPng
+            });
+            textScrub = {
+              attempted: true,
+              boxesCount: scrubResult.boxesCount,
+              beforeHasText: true,
+              afterHasText,
+              scrubbedUrl
+            };
+            attempt = {
+              ...attempt,
+              textScrubDebug: textScrub
+            };
+            if (!afterHasText) {
+              attempt = {
+                ...attempt,
+                backgroundPng: scrubResult.scrubbedPng,
+                textCheckPassed: true
               };
-            })
-          )
-        );
+              evaluation = await evaluateCandidate(
+                attempt,
+                candidateDirectionSpec,
+                candidateTitleSafeBox,
+                candidateVariationTemplateKey
+              );
+            }
+          }
+          const debugUrl = await writeGenerationPreviewFiles({
+            fileName: `${plannedGeneration.id}-${candidateTag}-bg-candidate-${candidateIndex}.png`,
+            png: attempt.backgroundPng
+          });
+
+          candidates.push({
+            attempt,
+            directionSpecUsed: candidateDirectionSpec,
+            variationTemplateKey: attempt.variationTemplateKey || candidateVariationTemplateKey,
+            layoutDiversityPenalty: evaluation.layoutDiversityPenalty,
+            frameScaffoldPenalty: evaluation.frameScaffoldPenalty,
+            score: evaluation.score,
+            textScrub,
+            checks: evaluation.checks,
+            stats: evaluation.stats,
+            debugUrl
+          });
+        }
+        if (candidates.length <= 0) {
+          throw new Round1ImageCallCapReachedError();
+        }
 
         const indexedCandidates = candidates.map((candidate, index) => ({ candidate, index }));
-        const noReadableTextCandidates = indexedCandidates.filter((entry) => entry.candidate.attempt.textCheckPassed);
-        const eligible = noReadableTextCandidates
-          .filter(
-            (entry) =>
-              entry.candidate.checks.textFree &&
-              entry.candidate.checks.tonePass &&
-              entry.candidate.checks.designPresencePass &&
-              entry.candidate.checks.meaningfulStructurePass &&
-              !entry.candidate.checks.hardFailBlankDesign
-          );
+        const eligible = indexedCandidates.filter((entry) => entry.candidate.checks.textFree);
         const winner = eligible.length > 0
           ? eligible.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), eligible[0])
           : null;
         const bestScore = winner?.candidate.score ?? Number.NEGATIVE_INFINITY;
-        const hardFailReadableText = noReadableTextCandidates.length <= 0;
+        const hardFailReadableText = eligible.length <= 0;
         const eligiblePoolEmpty = eligible.length <= 0;
-        const laneFailed = hardFailReadableText || eligible.length <= 0 || bestScore < ROUND1_RERANK_MIN_ACCEPTABLE_SCORE;
+        const laneFailed = hardFailReadableText;
+        const failureReason: BackgroundAttemptFailureReason | null = winner
+          ? null
+          : hardFailReadableText
+            ? "ALL_TEXT"
+            : eligiblePoolEmpty
+              ? "UNKNOWN"
+              : null;
+        const attemptDebug: BackgroundAttemptDebug = {
+          attemptIndex: params.attemptNumber,
+          styleFamily: styleFields.styleFamily,
+          anchorUsed: {
+            visualAnchorSrc: attemptVisualAnchorSrc
+          },
+          candidates: candidates.map((candidate) => {
+            const scaffoldOk =
+              candidate.checks.designPresencePass &&
+              candidate.checks.meaningfulStructurePass &&
+              !candidate.checks.hardFailScaffold &&
+              !candidate.checks.hardFailBlankDesign;
+            return {
+              url: candidate.debugUrl,
+              ...(candidate.textScrub
+                ? {
+                    textScrub: candidate.textScrub
+                  }
+                : {}),
+              checks: {
+                textOk: candidate.checks.textFree,
+                scaffoldOk,
+                motifOk: candidate.checks.focalMotifPresent,
+                toneOk: candidate.checks.tonePass
+              },
+              scores: {
+                total: candidate.score,
+                layoutDiversityPenalty: candidate.layoutDiversityPenalty,
+                frameScaffoldPenalty: candidate.frameScaffoldPenalty,
+                meaningfulStructure: Math.max(0, candidate.stats.hardFail?.meaningfulStructureScore || 0),
+                titleSafe: candidate.stats.titleSafe?.score || 0,
+                midtoneRange: candidate.stats.midtoneRange?.score || 0
+              }
+            };
+          }),
+          winnerIndex: winner ? winner.index : null,
+          failureReason
+        };
 
         return {
-          attempt: winner?.candidate.attempt || noReadableTextCandidates[0]?.candidate.attempt || candidates[0].attempt,
+          attempt: winner?.candidate.attempt || eligible[0]?.candidate.attempt || candidates[0].attempt,
           winnerIndex: winner?.index || 0,
           bestScore,
           laneFailed,
@@ -6927,6 +8822,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             score: candidate.score,
             layoutDiversityPenalty: candidate.layoutDiversityPenalty,
             frameScaffoldPenalty: candidate.frameScaffoldPenalty,
+            ...(candidate.textScrub
+              ? {
+                  textScrub: candidate.textScrub
+                }
+              : {}),
             checks: candidate.checks,
             stats: {
               textRetryCount: candidate.attempt.textRetryCount,
@@ -6950,6 +8850,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 score: winner.candidate.score
               }
             : null,
+          attemptDebug,
+          failureReason,
+          textScrub: winner
+            ? winner.candidate.textScrub || null
+            : candidates.find((candidate) => candidate.textScrub)?.textScrub || null,
           winnerDirectionSpec: winner
             ? winner.candidate.directionSpecUsed
             : params.directionSpecOverride === undefined
@@ -6960,12 +8865,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
       const selectBackgroundWinner = async (originalityBoost?: string) => {
         if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
+          const attempt = await renderMasterAttempt({ originalityBoost });
           return {
-            attempt: await renderMasterAttempt({ originalityBoost }),
+            attempt,
             winnerIndex: 0,
             laneFailed: false,
             eligiblePoolEmpty: false,
-            winnerDirectionSpec: backgroundDirectionSpec
+            winnerDirectionSpec: backgroundDirectionSpec,
+            backgroundAttempts: [] as BackgroundAttemptDebug[],
+            textScrub: attempt.textScrubDebug || null,
+            fallbackFailureReason: null as BackgroundAttemptFailureReason | null
           };
         }
 
@@ -6975,12 +8884,49 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           attempts: 1
         };
         const aggregatedCandidates: BackgroundRerankCandidateDebug[] = [];
+        const backgroundAttempts: BackgroundAttemptDebug[] = [];
         let globalWinnerIndex = 0;
         let winner: BackgroundRerankWinnerDebug | null = null;
+
+        const buildApiErrorAttemptDebug = (params: {
+          attemptIndex: number;
+          directionSpec: PlannedDirectionSpec | null;
+        }): BackgroundAttemptDebug => ({
+          attemptIndex: params.attemptIndex,
+          styleFamily: resolveDirectionStyleFields(params.directionSpec).styleFamily,
+          anchorUsed: {
+            visualAnchorSrc:
+              resolveReferenceVisualAnchorSrc({
+                reference: anchorReference || references[0] || null,
+                referenceCluster: params.directionSpec?.referenceCluster || resolvedReferenceCluster
+              }) ||
+              referenceAnchorDebug?.visualAnchorSrc ||
+              anchorVisualAnchorSrc ||
+              null
+          },
+          candidates: [],
+          winnerIndex: null,
+          failureReason: "API_ERROR"
+        });
+
+        const persistBackgroundRerankMeta = (params: {
+          laneFailed: boolean;
+          backgroundWinnerIndex?: number;
+        }) => {
+          rerankMeta = {
+            ...rerankMeta,
+            backgroundCandidates: aggregatedCandidates,
+            backgroundWinner: winner || undefined,
+            laneFailed: params.laneFailed,
+            fallback,
+            backgroundWinnerIndex: params.backgroundWinnerIndex
+          };
+        };
 
         const appendAttempt = (result: Awaited<ReturnType<typeof runBackgroundRerankAttempt>>) => {
           const startIndex = aggregatedCandidates.length;
           aggregatedCandidates.push(...result.candidates);
+          backgroundAttempts.push(result.attemptDebug);
           if (result.winner) {
             globalWinnerIndex = startIndex + result.winnerIndex;
             winner = {
@@ -6991,122 +8937,108 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         };
 
         let activeDirectionSpec = backgroundDirectionSpec;
-        let latestSelection = await runBackgroundRerankAttempt({
-          stage: "primary",
-          attemptNumber: fallback.attempts,
-          directionSpecOverride: activeDirectionSpec,
-          originalityBoost
-        });
-        appendAttempt(latestSelection);
+        let latestSelection: Awaited<ReturnType<typeof runBackgroundRerankAttempt>> | null = null;
+        try {
+          latestSelection = await runBackgroundRerankAttempt({
+            stage: "primary",
+            attemptNumber: fallback.attempts,
+            directionSpecOverride: activeDirectionSpec,
+            originalityBoost
+          });
+          appendAttempt(latestSelection);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown rerank attempt error";
+          console.warn(
+            `[background-rerank-attempt] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} stage=primary attempt=${fallback.attempts} error=${message}`
+          );
+          backgroundAttempts.push(
+            buildApiErrorAttemptDebug({
+              attemptIndex: fallback.attempts,
+              directionSpec: activeDirectionSpec
+            })
+          );
+        }
+        if (!latestSelection) {
+          persistBackgroundRerankMeta({
+            laneFailed: true
+          });
+          return {
+            attempt: null as Awaited<ReturnType<typeof renderMasterAttempt>> | null,
+            winnerIndex: null as number | null,
+            laneFailed: true,
+            eligiblePoolEmpty: true,
+            winnerDirectionSpec: activeDirectionSpec,
+            backgroundAttempts,
+            textScrub: null as TextScrubDebug | null,
+            fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
+          };
+        }
         let bestEligibleSelection = latestSelection.winner ? latestSelection : null;
         activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
 
-        const laneFamily = directionSpec?.laneFamily;
-        const laneTone = initialDirectionStyleFields.styleTone;
-        const laneMedium = initialDirectionStyleFields.styleMedium;
-        const baseStyleFamily = initialDirectionStyleFields.styleFamily;
-        const baseSetKey = initialDirectionStyleFields.explorationSetKey;
-        const recentFamiliesForFallback = await getRecentStyleFamiliesForFallback();
-
-        if (latestSelection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
-          const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
-          const currentFamilyForFallback = currentStyleFields.styleFamily || baseStyleFamily;
-          const currentSetForFallback = currentStyleFields.explorationSetKey || baseSetKey;
-          const allowedFamiliesForFallback =
-            activeDirectionSpec?.referenceCluster
-              ? getRound1ClusterProfile(activeDirectionSpec.referenceCluster).allowedStyleFamilies
-              : undefined;
-          const altFamilyFallback = pickExplorationFallbackStyleFamily({
-            runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-family`,
-            laneFamily,
-            currentStyleFamily: currentFamilyForFallback,
-            currentExplorationSetKey: currentSetForFallback,
-            tone: laneTone,
-            medium: laneMedium,
-            recentStyleFamilies: recentFamiliesForFallback,
-            setConstraint: "same",
-            allowedFamilies: allowedFamiliesForFallback
-          });
-          if (altFamilyFallback && altFamilyFallback.family !== currentFamilyForFallback) {
-            activeDirectionSpec = applyFallbackStyleFamilyToDirectionSpec({
-              directionSpec: activeDirectionSpec,
-              styleFamily: altFamilyFallback.family,
-              explorationSetKey: altFamilyFallback.explorationSetKey,
-              explorationLaneKey: altFamilyFallback.explorationLaneKey
-            });
-            fallback.usedAltFamily = true;
-            fallback.attempts += 1;
+        if (latestSelection.hardFailReadableText) {
+          fallback.attempts += 1;
+          const retryBoost = [originalityBoost, BACKGROUND_ELIGIBILITY_RETRY_BOOST].filter(Boolean).join(" ").trim() || undefined;
+          try {
             latestSelection = await runBackgroundRerankAttempt({
-              stage: "fallback_family",
+              stage: "text_retry",
               attemptNumber: fallback.attempts,
               directionSpecOverride: activeDirectionSpec,
-              originalityBoost
+              originalityBoost: retryBoost
             });
             appendAttempt(latestSelection);
-            if (latestSelection.winner) {
-              bestEligibleSelection = latestSelection;
-            }
-            activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
-          }
-        }
-
-        if (latestSelection.laneFailed && laneFamily && laneTone && laneMedium && baseStyleFamily) {
-          const currentStyleFields = resolveDirectionStyleFields(activeDirectionSpec);
-          const currentSetKey = currentStyleFields.explorationSetKey || baseSetKey;
-          const currentFamily = currentStyleFields.styleFamily || baseStyleFamily;
-          const allowedFamiliesForFallback =
-            activeDirectionSpec?.referenceCluster
-              ? getRound1ClusterProfile(activeDirectionSpec.referenceCluster).allowedStyleFamilies
-              : undefined;
-          const altSetFallback = pickExplorationFallbackStyleFamily({
-            runSeed: `${runSeed}|${plannedGeneration.optionIndex}|fallback-set`,
-            laneFamily,
-            currentStyleFamily: currentFamily,
-            currentExplorationSetKey: currentSetKey,
-            tone: laneTone,
-            medium: laneMedium,
-            recentStyleFamilies: recentFamiliesForFallback,
-            avoidFamilies: [currentFamily],
-            setConstraint: "different",
-            allowedFamilies: allowedFamiliesForFallback
-          });
-          const switchedSet = altSetFallback
-            ? !currentSetKey || altSetFallback.explorationSetKey !== currentSetKey
-            : false;
-          if (altSetFallback && switchedSet) {
-            activeDirectionSpec = applyFallbackStyleFamilyToDirectionSpec({
-              directionSpec: activeDirectionSpec,
-              styleFamily: altSetFallback.family,
-              explorationSetKey: altSetFallback.explorationSetKey,
-              explorationLaneKey: altSetFallback.explorationLaneKey
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown rerank attempt error";
+            console.warn(
+              `[background-rerank-attempt] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} stage=text_retry attempt=${fallback.attempts} error=${message}`
+            );
+            backgroundAttempts.push(
+              buildApiErrorAttemptDebug({
+                attemptIndex: fallback.attempts,
+                directionSpec: activeDirectionSpec
+              })
+            );
+            persistBackgroundRerankMeta({
+              laneFailed: true
             });
-            fallback.usedAltSet = true;
-            fallback.attempts += 1;
-            latestSelection = await runBackgroundRerankAttempt({
-              stage: "fallback_set",
-              attemptNumber: fallback.attempts,
-              directionSpecOverride: activeDirectionSpec,
-              originalityBoost
-            });
-            appendAttempt(latestSelection);
-            if (latestSelection.winner) {
-              bestEligibleSelection = latestSelection;
-            }
-            activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
+            return {
+              attempt: null as Awaited<ReturnType<typeof renderMasterAttempt>> | null,
+              winnerIndex: null as number | null,
+              laneFailed: true,
+              eligiblePoolEmpty: true,
+              winnerDirectionSpec: activeDirectionSpec,
+              backgroundAttempts,
+              textScrub: latestSelection?.textScrub || null,
+              fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
+            };
           }
+          if (latestSelection.winner) {
+            bestEligibleSelection = latestSelection;
+          }
+          activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
         }
 
         const finalSelection = bestEligibleSelection || latestSelection;
+        const finalFailureReason: BackgroundAttemptFailureReason | null =
+          finalSelection.failureReason ||
+          (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed ? "ALL_TEXT" : null);
 
-        if (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed) {
-          throw new Error(
-            `Strict text rejection: all rerank candidates contained readable text for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}.`
-          );
-        }
-        if (!bestEligibleSelection) {
-          throw new Error(
-            `Strict rerank rejection: no eligible background candidates for generation ${plannedGeneration.id} option=${plannedGeneration.optionIndex}; alternate family/set attempts exhausted.`
-          );
+        persistBackgroundRerankMeta({
+          laneFailed: finalSelection.laneFailed,
+          backgroundWinnerIndex: winner ? globalWinnerIndex : undefined
+        });
+
+        if (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed || !bestEligibleSelection) {
+          return {
+            attempt: null as Awaited<ReturnType<typeof renderMasterAttempt>> | null,
+            winnerIndex: null as number | null,
+            laneFailed: true,
+            eligiblePoolEmpty: true,
+            winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec,
+            backgroundAttempts,
+            textScrub: finalSelection.textScrub || null,
+            fallbackFailureReason: finalFailureReason || "UNKNOWN"
+          };
         }
 
         backgroundDirectionSpec = finalSelection.winnerDirectionSpec || activeDirectionSpec;
@@ -7118,32 +9050,107 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           effectiveDirectionStyleMedium = finalStyleFields.styleMedium;
         }
 
-        rerankMeta = {
-          ...rerankMeta,
-          backgroundCandidates: aggregatedCandidates,
-          backgroundWinner: winner || undefined,
-          laneFailed: finalSelection.laneFailed,
-          fallback,
-          backgroundWinnerIndex: globalWinnerIndex
-        };
-
         return {
           attempt: finalSelection.attempt,
           winnerIndex: finalSelection.winnerIndex,
           laneFailed: finalSelection.laneFailed,
-          winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec
+          winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec,
+          backgroundAttempts,
+          textScrub: finalSelection.textScrub || finalSelection.attempt.textScrubDebug || null,
+          fallbackFailureReason: null as BackgroundAttemptFailureReason | null
+        };
+      };
+
+      const completeWithBackgroundFallback = async (fallbackParams: {
+        failureReason: BackgroundAttemptFailureReason;
+        backgroundAttempts: BackgroundAttemptDebug[];
+        textScrub?: TextScrubDebug | null;
+      }): Promise<{ optionStatus: GenerationOptionStatus; failureReason: BackgroundAttemptFailureReason }> => {
+        const resolvedFailureReason: BackgroundAttemptFailureReason = imageCallCapReached
+          ? "BUDGET"
+          : fallbackParams.failureReason;
+        const fallbackWarning = "No eligible background found; fell back.";
+        const warningsWithFallback = appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, fallbackWarning);
+        const warnings = imageCallCapReached
+          ? appendUniqueDebugWarning(warningsWithFallback, ROUND1_IMAGE_CALL_CAP_WARNING)
+          : warningsWithFallback;
+        const fallbackDebugMeta = mergeGenerationDebugMeta(fallbackOutput.meta.debug, {
+          backgroundSource: "fallback",
+          lockupSource: "fallback",
+          backgroundFailureReason: resolvedFailureReason,
+          backgroundAttempts: fallbackParams.backgroundAttempts,
+          ...(fallbackParams.textScrub
+            ? {
+                textScrub: fallbackParams.textScrub
+              }
+            : {}),
+          warnings,
+          imageCalls: imageCallSummary,
+          rateLimitWaitMs: imageRateLimitDebugMeta.rateLimitWaitMs ?? 0
+        });
+        fallbackOutput = {
+          ...fallbackOutput,
+          status: "FALLBACK",
+          meta: {
+            ...fallbackOutput.meta,
+            debug: fallbackDebugMeta,
+            ...(shouldRunExplorationToneCheck &&
+            (rerankMeta.backgroundCandidates || rerankMeta.lockupCandidates || fallbackParams.backgroundAttempts.length > 0)
+              ? {
+                  rerank: rerankMeta
+                }
+              : {})
+          }
+        };
+        const optionStatus = await completeGenerationWithFallbackOutput({
+          projectId: params.project.id,
+          generationId: plannedGeneration.id,
+          output: fallbackOutput,
+          failureReason: resolvedFailureReason
+        });
+        return {
+          optionStatus,
+          failureReason: resolvedFailureReason
         };
       };
 
       const initialMasterSelection = await selectBackgroundWinner();
+      backgroundAttemptDiagnostics = initialMasterSelection.backgroundAttempts;
+      if (initialMasterSelection.fallbackFailureReason || !initialMasterSelection.attempt) {
+        const fallbackResult = await completeWithBackgroundFallback({
+          failureReason: initialMasterSelection.fallbackFailureReason || "UNKNOWN",
+          backgroundAttempts: initialMasterSelection.backgroundAttempts,
+          textScrub: initialMasterSelection.textScrub || null
+        });
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus: fallbackResult.optionStatus,
+          failureReason: fallbackResult.failureReason
+        };
+      }
       let masterAttempt = initialMasterSelection.attempt;
+      let selectedBackgroundTextScrub = initialMasterSelection.textScrub || masterAttempt.textScrubDebug || null;
       let originalityRetried = false;
       if (!shouldReuseBackground && Number.isFinite(masterAttempt.closestDistance) && masterAttempt.closestDistance < 6) {
         originalityRetried = true;
         const originalityMasterSelection = await selectBackgroundWinner(
           "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
         );
+        backgroundAttemptDiagnostics = originalityMasterSelection.backgroundAttempts;
+        if (originalityMasterSelection.fallbackFailureReason || !originalityMasterSelection.attempt) {
+          const fallbackResult = await completeWithBackgroundFallback({
+            failureReason: originalityMasterSelection.fallbackFailureReason || "UNKNOWN",
+            backgroundAttempts: originalityMasterSelection.backgroundAttempts,
+            textScrub: originalityMasterSelection.textScrub || selectedBackgroundTextScrub
+          });
+          return {
+            generationId: plannedGeneration.id,
+            optionStatus: fallbackResult.optionStatus,
+            failureReason: fallbackResult.failureReason
+          };
+        }
         masterAttempt = originalityMasterSelection.attempt;
+        selectedBackgroundTextScrub = originalityMasterSelection.textScrub || masterAttempt.textScrubDebug || selectedBackgroundTextScrub;
       }
       if (!masterAttempt.textCheckPassed) {
         throw new Error(
@@ -7160,6 +9167,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         lockupLayout,
         explorationMode: shouldRunExplorationToneCheck,
         directionSpec: backgroundDirectionSpec || directionSpec,
+        designSpec: activeDesignSpec,
         references,
         bibleCreativeBrief,
         wantsSeriesMark: (backgroundDirectionSpec || directionSpec)?.wantsSeriesMark || false,
@@ -7195,8 +9203,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         ...lockupPaletteForMaster,
         autoScrim: false
       };
-      const renderLockupAttempt = async (fontSeed: string) =>
-        renderValidatedLockupPng({
+      const renderLockupAttempt = async (fontSeed: string) => {
+        imageCallSummary.byStage.lockup += 1;
+        return renderValidatedLockupPng({
           width: masterDimensions.width,
           height: masterDimensions.height,
           content,
@@ -7207,6 +9216,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           fontSeed,
           lockupPrompt
         });
+      };
       const lockupRenderComputation = shouldReuseLockup && reusableAssets?.lockupPng
         ? {
             renderResult: {
@@ -7222,7 +9232,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           ? await (async () => {
               const lockupCandidateLimit = createConcurrencyLimiter(ROUND1_CANDIDATE_PARALLEL_CONCURRENCY);
               const candidates = await Promise.all(
-                Array.from({ length: ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT }, (_, candidateIndex) =>
+                Array.from({ length: lockupCandidateCount }, (_, candidateIndex) =>
                   lockupCandidateLimit(async () => {
                     const computation = await renderLockupAttempt(`${fontSeedBase}|lockup-candidate-${candidateIndex}`);
                     const validation = computation.textValidation;
@@ -7304,9 +9314,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         fileName: `${plannedGeneration.id}-lockup.png`,
         png: lockupRenderResult.png
       });
+      const shapesToRender: readonly PreviewShape[] = shouldUseCheapRound1Mode
+        ? [OPTION_MASTER_BACKGROUND_SHAPE]
+        : PREVIEW_SHAPES;
 
       const shapeResults = await Promise.all(
-        PREVIEW_SHAPES.map(async (shape) => {
+        shapesToRender.map(async (shape) => {
           const dimensions = PREVIEW_DIMENSIONS[shape];
           const backgroundPng =
             shape === OPTION_MASTER_BACKGROUND_SHAPE
@@ -7393,7 +9406,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         `[lockup-style-mode: ${lockupStyleMode}]`,
         `[lockup-layout: ${lockupLayout}]`,
         `[lockup-integration: ${lockupIntegrationMode}]`,
-        finalDirectionSpec?.titleIntegrationMode ? `[title-integration-mode: ${finalDirectionSpec.titleIntegrationMode}]` : "",
+        `[title-integration-mode: ${resolveDesignSpecTitleIntegrationMode({
+          designSpec: activeDesignSpec,
+          directionSpec: finalDirectionSpec
+        })}]`,
+        activeDesignSpec ? `[design-spec: ${summarizeDesignSpecForPrompt(activeDesignSpec)}]` : "",
         finalDirectionSpec?.wantsSeriesMark ? "[series-mark: requested]" : "[series-mark: not-requested]",
         finalDirectionSpec?.wantsTitleStage ? "[title-stage: requested]" : "[title-stage: not-requested]",
         finalDirectionSpec?.motifFocus && finalDirectionSpec.motifFocus.length > 0
@@ -7420,26 +9437,53 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         masterAttempt.paletteRetryCount > 0 ? `[retry: brand-palette x${masterAttempt.paletteRetryCount}]` : "",
         masterAttempt.toneRetryCount > 0 ? `[retry: tone-compliance x${masterAttempt.toneRetryCount}]` : "",
         masterAttempt.textArtifactRetryCount > 0 ? `[retry: text-artifact x${masterAttempt.textArtifactRetryCount}]` : "",
-        "derived variants: square/wide/tall from one shared background + one shared lockup."
+        shouldUseCheapRound1Mode
+          ? "cheap mode: widescreen-only output for round 1."
+          : "derived variants: square/wide/tall from one shared background + one shared lockup."
       ]
         .filter(Boolean)
         .join(" ");
-      const byShape = Object.fromEntries(shapeResults.map((result) => [result.shape, result])) as Record<
-        PreviewShape,
-        (typeof shapeResults)[number]
+      const byShape = Object.fromEntries(shapeResults.map((result) => [result.shape, result])) as Partial<
+        Record<PreviewShape, (typeof shapeResults)[number]>
       >;
-      const designDocByShape: Record<PreviewShape, DesignDoc> = {
-        square: byShape.square.designDoc,
-        wide: byShape.wide.designDoc,
-        tall: byShape.tall.designDoc
-      };
+      const wideShapeResult = byShape.wide;
+      if (!wideShapeResult) {
+        throw new Error(`Missing widescreen render result for generation ${plannedGeneration.id}.`);
+      }
+      const squareShapeResult = byShape.square;
+      const tallShapeResult = byShape.tall;
+      const designDocByShape: Record<PreviewShape, DesignDoc> = shouldUseCheapRound1Mode
+        ? {
+            square: adaptDesignDocToDimensions(
+              wideShapeResult.designDoc,
+              PREVIEW_DIMENSIONS.square.width,
+              PREVIEW_DIMENSIONS.square.height
+            ),
+            wide: wideShapeResult.designDoc,
+            tall: adaptDesignDocToDimensions(
+              wideShapeResult.designDoc,
+              PREVIEW_DIMENSIONS.tall.width,
+              PREVIEW_DIMENSIONS.tall.height
+            )
+          }
+        : {
+            square: squareShapeResult?.designDoc || wideShapeResult.designDoc,
+            wide: wideShapeResult.designDoc,
+            tall: tallShapeResult?.designDoc || wideShapeResult.designDoc
+          };
+      const squarePreviewPath = shouldUseCheapRound1Mode
+        ? wideShapeResult.finalPath
+        : squareShapeResult?.finalPath || wideShapeResult.finalPath;
+      const tallPreviewPath = shouldUseCheapRound1Mode
+        ? wideShapeResult.finalPath
+        : tallShapeResult?.finalPath || wideShapeResult.finalPath;
 
-      const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
+      const backgroundAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
         projectId: params.project.id,
         generationId: plannedGeneration.id,
         kind: "BACKGROUND",
         slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
-        file_path: byShape[shape].backgroundPath,
+        file_path: byShape[shape]?.backgroundPath || wideShapeResult.backgroundPath,
         mime_type: "image/png",
         width: PREVIEW_DIMENSIONS[shape].width,
         height: PREVIEW_DIMENSIONS[shape].height
@@ -7454,18 +9498,50 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         width: lockupRenderResult.width,
         height: lockupRenderResult.height
       };
-      const finalAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.map((shape) => ({
+      const finalAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
         projectId: params.project.id,
         generationId: plannedGeneration.id,
         kind: "IMAGE",
         slot: FINAL_ASSET_SLOT_BY_SHAPE[shape],
-        file_path: byShape[shape].finalPath,
+        file_path: byShape[shape]?.finalPath || wideShapeResult.finalPath,
         mime_type: "image/png",
         width: PREVIEW_DIMENSIONS[shape].width,
         height: PREVIEW_DIMENSIONS[shape].height
       }));
       const usedReferenceIds = [...new Set(backgroundStyleRefs.map((reference) => reference.referenceId))];
-      const debugMeta = mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug);
+      const warnings = imageCallCapReached
+        ? appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, ROUND1_IMAGE_CALL_CAP_WARNING)
+        : fallbackOutput.meta.debug?.warnings;
+      const refinementDebugPayload = buildRefinementDebugPayload({
+        input: plannedGeneration.input,
+        directionSpec: backgroundDirectionSpec || directionSpec
+      });
+      const debugMeta = mergeGenerationDebugMeta(
+        mergeReferenceAnchorDebugMeta(fallbackOutput.meta.debug, referenceAnchorDebug),
+        {
+          backgroundSource: backgroundSourceForSuccess,
+          lockupSource: lockupSourceForSuccess,
+          backgroundFailureReason: null,
+          ...(selectedBackgroundTextScrub
+            ? {
+                textScrub: selectedBackgroundTextScrub
+              }
+            : {}),
+          warnings,
+          imageCalls: imageCallSummary,
+          rateLimitWaitMs: imageRateLimitDebugMeta.rateLimitWaitMs ?? 0,
+          ...(shouldRunExplorationToneCheck
+            ? {
+                backgroundAttempts: backgroundAttemptDiagnostics
+              }
+            : {}),
+          ...(refinementDebugPayload
+            ? {
+                refinement: refinementDebugPayload
+              }
+            : {})
+        }
+      );
       if (process.env.NODE_ENV === "development") {
         console.log("[REFERENCE ANCHOR DEBUG META]", {
           optionIndex: plannedGeneration.optionIndex,
@@ -7478,6 +9554,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
       const completedOutput: GenerationOutputPayload = {
         ...fallbackOutput,
+        status: "COMPLETED",
         designDoc: designDocByShape.square,
         designDocByShape,
         notes: "ai+split-background-lockup",
@@ -7491,11 +9568,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             reasons: lockupTextValidation?.reasons || [],
             retried: lockupTextOverrideRetried
           },
-          ...(debugMeta
-            ? {
-                debug: debugMeta
-              }
-            : {}),
+          debug: debugMeta,
           ...(shouldRunExplorationToneCheck
             ? {
                 toneCheck: masterAttempt.toneCheck || {
@@ -7537,13 +9610,20 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             referenceCluster: resolvedReferenceCluster,
             referenceTier: resolvedReferenceTier,
             variationTemplateKey: selectedVariationTemplateKey,
-            titleIntegrationMode: (backgroundDirectionSpec || directionSpec)?.titleIntegrationMode || null,
+            titleIntegrationMode: resolveDesignSpecTitleIntegrationMode({
+              designSpec: activeDesignSpec,
+              directionSpec: backgroundDirectionSpec || directionSpec
+            }),
+            templateKey: activeDesignSpec?.composition.templateKey || selectedVariationTemplateKey || null,
+            typeRegion: activeDesignSpec?.composition.typeRegion || null,
+            motifRegion: activeDesignSpec?.composition.motifRegion || null,
             motifScope: backgroundDirectionSpec?.motifScope || directionSpec?.motifScope || motifBankContext.scriptureScope,
             lockupPresetId,
             lockupLayout,
             wantsTitleStage: (backgroundDirectionSpec || directionSpec)?.wantsTitleStage === true,
             wantsSeriesMark: (backgroundDirectionSpec || directionSpec)?.wantsSeriesMark === true,
             motifFocus: (backgroundDirectionSpec || directionSpec)?.motifFocus || [],
+            designSpec: activeDesignSpec,
             bookKeys: motifBankContext.bookKeys,
             bookNames: motifBankContext.bookNames,
             topicKeys: motifBankContext.topicKeys,
@@ -7560,13 +9640,30 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             paletteComplianceScore: masterAttempt.paletteComplianceScore,
             reusedBackgroundFromGenerationId:
               shouldReuseBackground && reusableAssets ? reusableAssets.sourceGenerationId : null,
-            reusedLockupFromGenerationId: shouldReuseLockup && reusableAssets ? reusableAssets.sourceGenerationId : null
+            reusedLockupFromGenerationId: shouldReuseLockup && reusableAssets ? reusableAssets.sourceGenerationId : null,
+            ...(inputRefinementLineage
+              ? {
+                  refinement: {
+                    refinementChainId: inputRefinementLineage.refinementChainId,
+                    anchorDirectionFingerprint: inputRefinementLineage.anchorDirectionFingerprint,
+                    lockedStyleInvariants: inputRefinementLineage.lockedStyleInvariants,
+                    appliedFeedbackDeltas: inputRefinementLineage.appliedFeedbackDeltas,
+                    seenVariantFingerprints: inputRefinementLineage.seenVariantFingerprints,
+                    variantMutationAxis: refinementDebugPayload?.variantMutationAxis || null,
+                    variantFingerprint: refinementDebugPayload?.variantFingerprint || null
+                  },
+                  refinementChainId: inputRefinementLineage.refinementChainId,
+                  anchorDirectionFingerprint: inputRefinementLineage.anchorDirectionFingerprint,
+                  lockedInvariantsSummary: summarizeLockedStyleInvariants(inputRefinementLineage.lockedStyleInvariants),
+                  variantMutationAxis: refinementDebugPayload?.variantMutationAxis || null
+                }
+              : {})
           }
         },
         preview: {
-          square_main: byShape.square.finalPath,
-          widescreen_main: byShape.wide.finalPath,
-          vertical_main: byShape.tall.finalPath
+          square_main: squarePreviewPath,
+          widescreen_main: wideShapeResult.finalPath,
+          vertical_main: tallPreviewPath
         }
       };
       if (process.env.NODE_ENV === "development") {
@@ -7606,19 +9703,107 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         })
       ]);
+      return {
+        generationId: plannedGeneration.id,
+        optionStatus: "COMPLETED",
+        failureReason: null
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
+      const failureReason: BackgroundAttemptFailureReason = imageCallCapReached
+        ? "BUDGET"
+        : isOpenAiRateLimitError(error)
+          ? "RATE_LIMIT"
+          : "API_ERROR";
       console.error(
         `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
       );
-
-      await completeGenerationWithFallbackOutput({
-        projectId: params.project.id,
-        generationId: plannedGeneration.id,
-        output: fallbackOutput
-      });
+      try {
+        const optionStatus = await completeGenerationWithFallbackOutput({
+          projectId: params.project.id,
+          generationId: plannedGeneration.id,
+          output: fallbackOutput,
+          failureReason
+        });
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus,
+          failureReason
+        };
+      } catch (fallbackError) {
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback persistence error";
+        const warnings = appendUniqueDebugWarning(
+          appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, "Fallback persistence failed."),
+          `Generation error: ${message}`
+        );
+        const failedOutput: GenerationOutputPayload = {
+          ...fallbackOutput,
+          status: "FAILED_GENERATION",
+          notes: "generation_failed",
+          meta: {
+            ...fallbackOutput.meta,
+            debug: mergeGenerationDebugMeta(fallbackOutput.meta.debug, {
+              backgroundSource: "fallback",
+              lockupSource: "fallback",
+              backgroundFailureReason: failureReason,
+              warnings: appendUniqueDebugWarning(warnings, `Fallback error: ${fallbackMessage}`)
+            })
+          }
+        };
+        await prisma.$transaction([
+          prisma.asset.deleteMany({
+            where: {
+              generationId: plannedGeneration.id,
+              slot: {
+                in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+              }
+            }
+          }),
+          prisma.generation.update({
+            where: {
+              id: plannedGeneration.id
+            },
+            data: {
+              status: "FAILED",
+              output: failedOutput as Prisma.InputJsonValue
+            }
+          })
+        ]);
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus: "FAILED_GENERATION",
+          failureReason
+        };
+      }
     }
-  })));
+  }))
+  );
+
+  const roundHasFallback = optionResults.some((result) => result.optionStatus === "FALLBACK");
+  const completedCount = optionResults.filter((result) => result.optionStatus === "COMPLETED").length;
+  const hasRoundFailures = optionResults.some((result) => result.optionStatus !== "COMPLETED");
+  const roundStatus: GenerationRoundStatus = hasRoundFailures
+    ? completedCount > 0
+      ? "PARTIAL"
+      : "FAILED"
+    : "COMPLETED";
+  const roundFailureReason: GenerationRoundFailureReason | null = hasRoundFailures
+    ? optionResults.some((result) => result.failureReason === "RATE_LIMIT")
+      ? "RATE_LIMIT"
+      : optionResults.some((result) => result.failureReason === "BUDGET")
+        ? "BUDGET"
+        : "UNKNOWN"
+    : null;
+  await persistRoundDebugStatusForGenerations({
+    generationIds: optionResults.map((result) => result.generationId),
+    roundHasFallback,
+    roundStatus,
+    roundCompletedCount: completedCount,
+    roundAttemptCount: optionResults.length,
+    roundRequiredCompletedCount: ROUND_OPTION_COUNT,
+    roundFailureReason
+  });
+  return optionResults;
 }
 
 export async function createProjectAction(
@@ -7978,13 +10163,116 @@ export async function generateRoundOneAction(
     )
   );
 
-  await createOpenAiPreviewAssetsForPlannedGenerations({
+  const shouldEnforceRound1NonFallbackRequirement = !hasDesignNotes;
+  const optionResultByGenerationId = new Map<string, PlannedGenerationRunResult>();
+  let totalRoundAttemptCount = 0;
+  let hardStopFailureReason: GenerationRoundFailureReason | null = null;
+  let retryCursor = 0;
+  const upsertResults = (results: PlannedGenerationRunResult[]) => {
+    totalRoundAttemptCount += results.length;
+    for (const result of results) {
+      optionResultByGenerationId.set(result.generationId, result);
+    }
+  };
+  const countCompleted = (): number =>
+    plannedGenerations.filter((generation) => optionResultByGenerationId.get(generation.id)?.optionStatus === "COMPLETED").length;
+
+  const firstAttemptResults = await createOpenAiPreviewAssetsForPlannedGenerations({
     organizationId: session.organizationId,
     project,
     plannedGenerations,
     bibleCreativeBrief,
     motifBankContext
   });
+  upsertResults(firstAttemptResults);
+  if (firstAttemptResults.some((result) => result.failureReason === "RATE_LIMIT")) {
+    hardStopFailureReason = "RATE_LIMIT";
+  } else if (firstAttemptResults.some((result) => result.failureReason === "BUDGET")) {
+    hardStopFailureReason = "BUDGET";
+  }
+
+  if (shouldEnforceRound1NonFallbackRequirement) {
+    while (
+      !hardStopFailureReason &&
+      countCompleted() < ROUND_OPTION_COUNT &&
+      totalRoundAttemptCount < ROUND1_NON_FALLBACK_MAX_ATTEMPTS
+    ) {
+      const remainingAttempts = ROUND1_NON_FALLBACK_MAX_ATTEMPTS - totalRoundAttemptCount;
+      if (remainingAttempts <= 0) {
+        break;
+      }
+      const incompleteGenerations = plannedGenerations.filter(
+        (generation) => optionResultByGenerationId.get(generation.id)?.optionStatus !== "COMPLETED"
+      );
+      if (incompleteGenerations.length === 0) {
+        break;
+      }
+
+      const batchSize = Math.min(remainingAttempts, incompleteGenerations.length);
+      const retryBatch = Array.from({ length: batchSize }, (_, offset) => {
+        const index = (retryCursor + offset) % incompleteGenerations.length;
+        return incompleteGenerations[index];
+      });
+      retryCursor = incompleteGenerations.length > 0 ? (retryCursor + batchSize) % incompleteGenerations.length : 0;
+      const retryIds = retryBatch.map((generation) => generation.id);
+      await prisma.generation.updateMany({
+        where: {
+          id: {
+            in: retryIds
+          }
+        },
+        data: {
+          status: "RUNNING"
+        }
+      });
+      const retryResults = await createOpenAiPreviewAssetsForPlannedGenerations({
+        organizationId: session.organizationId,
+        project,
+        plannedGenerations: retryBatch,
+        bibleCreativeBrief,
+        motifBankContext
+      });
+      upsertResults(retryResults);
+      if (retryResults.some((result) => result.failureReason === "RATE_LIMIT")) {
+        hardStopFailureReason = "RATE_LIMIT";
+        break;
+      }
+      if (retryResults.some((result) => result.failureReason === "BUDGET")) {
+        hardStopFailureReason = "BUDGET";
+        break;
+      }
+    }
+
+    const finalResults = plannedGenerations.map((generation) => {
+      const known = optionResultByGenerationId.get(generation.id);
+      return (
+        known || {
+          generationId: generation.id,
+          optionStatus: "FAILED_GENERATION" as GenerationOptionStatus,
+          failureReason: "UNKNOWN" as BackgroundAttemptFailureReason
+        }
+      );
+    });
+    const completedCount = finalResults.filter((result) => result.optionStatus === "COMPLETED").length;
+    const roundHasFallback = finalResults.some((result) => result.optionStatus === "FALLBACK");
+    const finalFailureReason: GenerationRoundFailureReason | null =
+      completedCount >= ROUND_OPTION_COUNT
+        ? null
+        : hardStopFailureReason || (finalResults.some((result) => result.failureReason === "RATE_LIMIT")
+            ? "RATE_LIMIT"
+            : finalResults.some((result) => result.failureReason === "BUDGET")
+              ? "BUDGET"
+              : "INSUFFICIENT_NONFALLBACK_OPTIONS");
+    await persistRoundDebugStatusForGenerations({
+      generationIds: plannedGenerations.map((generation) => generation.id),
+      roundHasFallback,
+      roundStatus: completedCount >= ROUND_OPTION_COUNT ? "COMPLETED" : "FAILED",
+      roundCompletedCount: completedCount,
+      roundAttemptCount: totalRoundAttemptCount,
+      roundRequiredCompletedCount: ROUND_OPTION_COUNT,
+      roundFailureReason: finalFailureReason
+    });
+  }
 
   redirect(`/app/projects/${projectId}/generations`);
 }
@@ -8030,6 +10318,7 @@ export async function generateRoundTwoAction(
         select: {
           id: true,
           round: true,
+          status: true,
           input: true,
           output: true
         }
@@ -8042,6 +10331,15 @@ export async function generateRoundTwoAction(
 
   if (chosenGeneration && chosenGeneration.round !== parsed.data.currentRound) {
     return { error: "Selected direction must come from the current round." };
+  }
+  if (
+    chosenGeneration &&
+    resolveGenerationOptionStatus({
+      output: chosenGeneration.output,
+      dbStatus: chosenGeneration.status
+    }) !== "COMPLETED"
+  ) {
+    return { error: "Selected direction is not eligible for refinement. Retry generation and choose a completed option." };
   }
 
   let selectedOptionIndex: number | null = null;
@@ -8071,11 +10369,14 @@ export async function generateRoundTwoAction(
     styleDirection,
     feedbackText: parsed.data.feedbackText
   });
+  const priorRefinementLineage = chosenGeneration
+    ? readRefinementLineageFromInput(chosenGeneration.input) || readRefinementLineageFromGenerationOutput(chosenGeneration.output)
+    : null;
   const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
   const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
   const round = parsed.data.currentRound + 1;
-  const useRoundTwoRefinementFunnel =
-    round === 2 &&
+  const useRefinementFunnel =
+    round >= 2 &&
     !explicitDirectionChangeRequested &&
     selectedOptionIndex !== null &&
     Boolean(primaryDirectionSpec && chosenGenerationId);
@@ -8127,19 +10428,76 @@ export async function generateRoundTwoAction(
           sourceRound: parsed.data.currentRound,
           selectedOptionIndex,
           chosenGenerationId,
-          mode: useRoundTwoRefinementFunnel ? "refinement_funnel" : "new_direction",
+          mode: useRefinementFunnel ? "refinement_funnel" : "new_direction",
           explicitDirectionChangeRequested,
           directionSpec: primaryDirectionSpec
         }
       : null;
+  let refinementLineageForRound: RefinementLineageState | null = null;
+  let refinementVariantsForRound: PlannedRefinementVariant[] = [];
   const directionPlan =
-    useRoundTwoRefinementFunnel && primaryDirectionSpec
-      ? planRoundTwoRefinementSet({
-          runSeed,
-          primaryDirection: primaryDirectionSpec,
-          motifPool: [...bibleCreativeBrief.motifs, ...bibleCreativeBrief.markIdeas, ...bibleCreativeBrief.allowedGenericMotifs],
-          optionCount: ROUND_OPTION_COUNT
-        })
+    useRefinementFunnel && primaryDirectionSpec
+      ? (() => {
+          const outputReferenceAnchorIds = chosenGeneration ? readReferenceAnchorIdsFromGenerationOutput(chosenGeneration.output) : [];
+          const lockedStyleInvariants =
+            priorRefinementLineage?.lockedStyleInvariants ||
+            buildLockedStyleInvariants({
+              directionSpec: primaryDirectionSpec,
+              referenceAnchorIds: outputReferenceAnchorIds
+            });
+          const anchorDirectionFingerprint =
+            priorRefinementLineage?.anchorDirectionFingerprint || hashRefinementAnchorFingerprint(lockedStyleInvariants);
+          const refinementChainId = priorRefinementLineage?.refinementChainId || randomUUID();
+          const anchorVariantFingerprint = createRefinementVariantFingerprint({
+            direction: primaryDirectionSpec,
+            referenceAnchorIds: lockedStyleInvariants.referenceAnchorIds
+          });
+          const seenVariantFingerprints = normalizeRefinementReferenceIds([
+            ...(priorRefinementLineage?.seenVariantFingerprints || []),
+            anchorVariantFingerprint
+          ]);
+          const refinementPlan = planRefinementDirectionSet({
+            runSeed,
+            primaryDirection: primaryDirectionSpec,
+            motifPool: [...bibleCreativeBrief.motifs, ...bibleCreativeBrief.markIdeas, ...bibleCreativeBrief.allowedGenericMotifs],
+            optionCount: ROUND_OPTION_COUNT,
+            lockedInvariants: lockedStyleInvariants,
+            seenVariantFingerprints
+          });
+          refinementVariantsForRound = refinementPlan.variants;
+          const variantMutations: NonNullable<RefinementFeedbackDelta["variantMutations"]> = refinementPlan.variants.map((variant) => ({
+            optionLabel: variant.optionLabel,
+            axis: variant.axis,
+            fingerprint: variant.fingerprint,
+            noveltyRetryApplied: variant.noveltyRetryApplied
+          }));
+          const nextSeenVariantFingerprints = normalizeRefinementReferenceIds([
+            ...seenVariantFingerprints,
+            ...refinementPlan.variants.map((variant) => variant.fingerprint)
+          ]);
+          refinementLineageForRound = {
+            refinementChainId,
+            anchorDirectionFingerprint,
+            lockedStyleInvariants: refinementPlan.lockedInvariants,
+            appliedFeedbackDeltas: [
+              ...(priorRefinementLineage?.appliedFeedbackDeltas || []),
+              {
+                round,
+                request: parsed.data.feedbackText || "",
+                emphasis: parsed.data.emphasis,
+                expressiveness: parsed.data.expressiveness,
+                temperature: parsed.data.temperature,
+                regenerateLockup: parsed.data.regenerateLockup,
+                explicitNewTitleStyle: parsed.data.explicitNewTitleStyle,
+                regenerateBackground: parsed.data.regenerateBackground,
+                mode: "refinement_funnel",
+                variantMutations
+              }
+            ],
+            seenVariantFingerprints: nextSeenVariantFingerprints
+          };
+          return refinementPlan.directions;
+        })()
       : planDirectionSet({
           runSeed,
           projectId: project.id,
@@ -8211,13 +10569,22 @@ export async function generateRoundTwoAction(
       runSeed,
       directionPlan,
       lockupLayoutsForOptions[index],
-      primaryDirectionContext
+      primaryDirectionContext,
+      refinementLineageForRound
     ),
     feedback: {
       sourceRound: parsed.data.currentRound,
       chosenGenerationId,
       selectedOptionIndex: primaryDirectionContext?.selectedOptionIndex,
       primaryDirectionMode: primaryDirectionContext?.mode,
+      refinementChainId: refinementLineageForRound?.refinementChainId,
+      anchorDirectionFingerprint: refinementLineageForRound?.anchorDirectionFingerprint,
+      lockedStyleInvariants: refinementLineageForRound?.lockedStyleInvariants,
+      variantMutationAxis: directionPlan[index]?.refinementMutationAxis || null,
+      variantFingerprint:
+        directionPlan[index]?.refinementVariantFingerprint ||
+        refinementVariantsForRound[index]?.fingerprint ||
+        null,
       request: parsed.data.feedbackText || "",
       emphasis: parsed.data.emphasis,
       expressiveness: parsed.data.expressiveness,
@@ -8337,6 +10704,7 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
     select: {
       id: true,
       round: true,
+      status: true,
       input: true,
       output: true
     }
@@ -8344,6 +10712,14 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
 
   if (!generation) {
     return;
+  }
+  if (
+    resolveGenerationOptionStatus({
+      output: generation.output,
+      dbStatus: generation.status
+    }) !== "COMPLETED"
+  ) {
+    throw new Error("Selected direction is not eligible for finalization. Retry generation and choose a completed option.");
   }
 
   const optionIndex = Math.max(0, normalizedOptionKey.charCodeAt(0) - 65);

@@ -227,7 +227,14 @@ function readLockupIntegrationModeFromOutput(output: unknown): LockupIntegration
   }
 
   const rawIntegrationMode = (designSpec as { lockupIntegrationMode?: unknown }).lockupIntegrationMode;
-  if (rawIntegrationMode === "stamp" || rawIntegrationMode === "clean") {
+  if (
+    rawIntegrationMode === "stamp" ||
+    rawIntegrationMode === "clean" ||
+    rawIntegrationMode === "plate" ||
+    rawIntegrationMode === "mask" ||
+    rawIntegrationMode === "cutout" ||
+    rawIntegrationMode === "grid_lock"
+  ) {
     return rawIntegrationMode;
   }
 
