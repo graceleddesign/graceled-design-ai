@@ -19,3 +19,6 @@ reference_zips/*.zip
 
 .env.*
 !.env.example
+
+.env.*
+!.env.example
