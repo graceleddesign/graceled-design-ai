@@ -13,7 +13,21 @@ export async function findFinalDesignForOrganization(projectId: string, organiza
       id: true,
       generationId: true,
       optionLabel: true,
-      designJson: true
+      designJson: true,
+      generation: {
+        select: {
+          id: true,
+          status: true,
+          output: true,
+          assets: {
+            select: {
+              kind: true,
+              slot: true,
+              file_path: true
+            }
+          }
+        }
+      }
     }
   });
 }

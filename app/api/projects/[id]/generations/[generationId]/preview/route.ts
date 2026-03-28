@@ -8,6 +8,7 @@ import { buildFallbackDesignDoc, normalizeDesignDoc, type DesignDoc } from "@/li
 import { buildFinalSvg } from "@/lib/final-deliverables";
 import { composeLockupOnBackground, LOCKUP_SAFE_REGION_RATIOS, type LockupIntegrationMode } from "@/lib/lockup-compositor";
 import { prisma } from "@/lib/prisma";
+import { resolveProductionValidOption, toAssetUrl } from "@/lib/production-valid-option";
 
 export const dynamic = "force-dynamic";
 
@@ -39,6 +40,26 @@ function noStoreHeaders(contentType?: string): HeadersInit {
   };
 }
 
+function previewHeaders(params: {
+  canonical: boolean;
+  mode: "canonical_asset" | "fallback_asset" | "fallback_composite" | "fallback_design_doc";
+  source: string;
+  productionValid: boolean;
+  invalidReasons: string[];
+  shapeInvalidReasons: string[];
+  contentType?: string;
+}): HeadersInit {
+  return {
+    ...noStoreHeaders(params.contentType),
+    "X-Preview-Canonical": params.canonical ? "1" : "0",
+    "X-Preview-Mode": params.mode,
+    "X-Preview-Source": params.source,
+    "X-Preview-Invalid-Reasons": JSON.stringify(params.invalidReasons),
+    "X-Preview-Shape-Invalid-Reasons": JSON.stringify(params.shapeInvalidReasons),
+    "X-Production-Valid-Option": params.productionValid ? "1" : "0"
+  };
+}
+
 function parseShape(value: string | null): PreviewShape | null {
   if (value === "square" || value === "wide" || value === "tall") {
     return value;
@@ -66,34 +87,6 @@ function normalizeAssetUrl(filePath: string): string {
   }
 
   return trimmed.startsWith("/") ? trimmed : `/${trimmed.replace(/^\/+/, "")}`;
-}
-
-function readFinalAssetPath(assets: GenerationAssetRecord[], shape: PreviewShape): string | null {
-  const match = assets.find((asset) => {
-    if (asset.kind !== "IMAGE") {
-      return false;
-    }
-
-    const slot = asset.slot?.trim().toLowerCase();
-    if (!slot || !asset.file_path?.trim()) {
-      return false;
-    }
-
-    if (shape === "square") {
-      return slot === "square" || slot === "square_main";
-    }
-    if (shape === "wide") {
-      return slot === "wide" || slot === "wide_main" || slot === "widescreen" || slot === "widescreen_main";
-    }
-    return slot === "tall" || slot === "tall_main" || slot === "vertical" || slot === "vertical_main";
-  });
-
-  if (!match) {
-    return null;
-  }
-
-  const normalizedPath = normalizeAssetUrl(match.file_path);
-  return normalizedPath || null;
 }
 
 function readBackgroundAssetPath(assets: GenerationAssetRecord[], shape: PreviewShape): string | null {
@@ -512,6 +505,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     select: {
       id: true,
       round: true,
+      status: true,
       input: true,
       output: true,
       preset: {
@@ -573,24 +567,38 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 
   const lockupAssetPath = readLockupAssetPath(generation.assets);
   const lockupLocalPath = lockupAssetPath ? resolveLocalPublicPath(lockupAssetPath) : null;
-  const finalAssetPath = readFinalAssetPath(generation.assets, shape);
-  if (finalAssetPath) {
+  const productionValidation = resolveProductionValidOption({
+    output: generation.output,
+    dbStatus: generation.status,
+    assets: generation.assets
+  });
+  const previewValidation = productionValidation.preview[shape];
+  const directPreviewAssetPath = previewValidation.assetPath ? toAssetUrl(previewValidation.assetPath) : null;
+  if (directPreviewAssetPath) {
     if (debugStageEnabled) {
-      const finalLocalPath = resolveLocalPublicPath(finalAssetPath);
+      const finalLocalPath = resolveLocalPublicPath(directPreviewAssetPath);
       if (finalLocalPath) {
         const [finalPng, lockupPng] = await Promise.all([readOptionalFile(finalLocalPath), readOptionalFile(lockupLocalPath)]);
         if (finalPng) {
           try {
             const debugPng = await applyStageDebugOverlay({
               basePng: finalPng,
-              shape,
-              width,
-              height,
-              lockupPng
-            });
+                shape,
+                width,
+                height,
+                lockupPng
+              });
             return new Response(new Uint8Array(debugPng), {
               status: 200,
-              headers: noStoreHeaders("image/png")
+              headers: previewHeaders({
+                canonical: previewValidation.canonical,
+                mode: previewValidation.mode,
+                source: previewValidation.source,
+                productionValid: productionValidation.valid,
+                invalidReasons: productionValidation.invalidReasons,
+                shapeInvalidReasons: previewValidation.invalidReasons,
+                contentType: "image/png"
+              })
             });
           } catch {
             // Fall back to redirect if debug overlay render fails.
@@ -599,15 +607,43 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       }
     }
 
+    if (!previewValidation.canonical) {
+      const previewLocalPath = resolveLocalPublicPath(directPreviewAssetPath);
+      if (previewLocalPath) {
+        const previewPng = await readOptionalFile(previewLocalPath);
+        if (previewPng) {
+          return new Response(new Uint8Array(previewPng), {
+            status: 200,
+            headers: previewHeaders({
+              canonical: false,
+              mode: previewValidation.mode,
+              source: previewValidation.source,
+              productionValid: productionValidation.valid,
+              invalidReasons: productionValidation.invalidReasons,
+              shapeInvalidReasons: previewValidation.invalidReasons,
+              contentType: "image/png"
+            })
+          });
+        }
+      }
+    }
+
     const redirectLocation =
-      /^https?:\/\//i.test(finalAssetPath) || /^data:/i.test(finalAssetPath)
-        ? finalAssetPath
-        : new URL(finalAssetPath, url.origin).toString();
+      /^https?:\/\//i.test(directPreviewAssetPath) || /^data:/i.test(directPreviewAssetPath)
+        ? directPreviewAssetPath
+        : new URL(directPreviewAssetPath, url.origin).toString();
 
     return new Response(null, {
       status: 302,
       headers: {
-        ...noStoreHeaders(),
+        ...previewHeaders({
+          canonical: previewValidation.canonical,
+          mode: previewValidation.mode,
+          source: previewValidation.source,
+          productionValid: productionValidation.valid,
+          invalidReasons: productionValidation.invalidReasons,
+          shapeInvalidReasons: previewValidation.invalidReasons
+        }),
         Location: redirectLocation
       }
     });
@@ -640,7 +676,15 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
           : compositedBase;
         return new Response(new Uint8Array(composited), {
           status: 200,
-          headers: noStoreHeaders("image/png")
+          headers: previewHeaders({
+            canonical: false,
+            mode: previewValidation.mode,
+            source: previewValidation.source,
+            productionValid: productionValidation.valid,
+            invalidReasons: productionValidation.invalidReasons,
+            shapeInvalidReasons: previewValidation.invalidReasons,
+            contentType: "image/png"
+          })
         });
       } catch {
         // Fall through to design-doc fallback render.
@@ -697,6 +741,14 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 
   return new Response(new Uint8Array(responsePng), {
     status: 200,
-    headers: noStoreHeaders("image/png")
+    headers: previewHeaders({
+      canonical: false,
+      mode: previewValidation.mode,
+      source: previewValidation.source,
+      productionValid: productionValidation.valid,
+      invalidReasons: productionValidation.invalidReasons,
+      shapeInvalidReasons: previewValidation.invalidReasons,
+      contentType: "image/png"
+    })
   });
 }

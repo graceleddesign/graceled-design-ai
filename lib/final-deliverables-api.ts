@@ -1,12 +1,20 @@
-import type { DesignDoc } from "@/lib/design-doc";
+import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import { getSession } from "@/lib/auth";
-import { findFinalDesignForOrganization, readStoredDesignDoc } from "@/lib/final-design-store";
+import { findFinalDesignForOrganization } from "@/lib/final-design-store";
+import {
+  buildProductionBlockedMessage,
+  resolveProductionValidOption,
+  type GenerationAssetRecord,
+  type ProductionValidOptionResult
+} from "@/lib/production-valid-option";
 
 type FinalDesignLookupResult =
   | {
       ok: true;
       designDoc: DesignDoc;
       generationId: string | null;
+      generationAssets: GenerationAssetRecord[];
+      generationValidation: ProductionValidOptionResult;
       optionLabel: string;
     }
   | {
@@ -31,10 +39,40 @@ export async function loadAuthorizedFinalDesign(projectId: string): Promise<Fina
     };
   }
 
+  const designDoc = normalizeDesignDoc(finalDesign.designJson);
+  if (!designDoc) {
+    return {
+      ok: false,
+      response: new Response(buildProductionBlockedMessage("Final design export", ["final_design_invalid"]), { status: 409 })
+    };
+  }
+  if (!finalDesign.generationId || !finalDesign.generation) {
+    return {
+      ok: false,
+      response: new Response("Final design is missing its source generation. Re-finalize a production-valid option.", { status: 409 })
+    };
+  }
+
+  const generationValidation = resolveProductionValidOption({
+    output: finalDesign.generation.output,
+    dbStatus: finalDesign.generation.status,
+    assets: finalDesign.generation.assets
+  });
+  if (!generationValidation.valid) {
+    return {
+      ok: false,
+      response: new Response(buildProductionBlockedMessage("Final design export", generationValidation.export.invalidReasons), {
+        status: 409
+      })
+    };
+  }
+
   return {
     ok: true,
-    designDoc: readStoredDesignDoc(finalDesign.designJson, finalDesign.optionLabel),
+    designDoc,
     generationId: finalDesign.generationId,
+    generationAssets: finalDesign.generation.assets,
+    generationValidation,
     optionLabel: finalDesign.optionLabel
   };
 }

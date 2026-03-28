@@ -4,9 +4,14 @@ import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { GenerationPreviewPane } from "@/components/generation-preview-pane";
+import {
+  summarizeProductionInvalidReasons,
+  type ProductionValidationFailedChecks
+} from "@/lib/production-valid-option";
 
 type DirectionPreviewFormat = "wide" | "square" | "tall";
 type AspectAssetStatus = "ok" | "missing" | "placeholder";
+type PreviewMode = "canonical_asset" | "fallback_asset" | "fallback_composite" | "fallback_design_doc";
 
 const PREVIEW_FORMATS: readonly DirectionPreviewFormat[] = ["wide", "square", "tall"];
 
@@ -123,6 +128,9 @@ type DirectionOptionCardProps = {
   } | null;
   showDebugChips?: boolean;
   previewUrls: Record<DirectionPreviewFormat, string>;
+  previewModeByFormat: Record<DirectionPreviewFormat, PreviewMode>;
+  invalidReasons?: string[];
+  failedChecks?: ProductionValidationFailedChecks | null;
   finalizeAction: () => Promise<void>;
 };
 
@@ -169,6 +177,9 @@ export function DirectionOptionCard({
   debugBestEffortBackground = null,
   showDebugChips = false,
   previewUrls,
+  previewModeByFormat,
+  invalidReasons = [],
+  failedChecks = null,
   finalizeAction
 }: DirectionOptionCardProps) {
   const [activeFormat, setActiveFormat] = useState<DirectionPreviewFormat>("wide");
@@ -182,6 +193,17 @@ export function DirectionOptionCard({
   const isFailedOption = generationStatus === "FAILED_GENERATION";
   const showGenerationFailureWarning = isFallbackOption || isFailedOption;
   const activeMeta = FORMAT_META[activeFormat];
+  const activePreviewMode = previewModeByFormat[activeFormat];
+  const activePreviewLabel =
+    activePreviewMode === "canonical_asset"
+      ? "Canonical production preview"
+      : activePreviewMode === "fallback_composite"
+        ? "Fallback recomposited preview"
+        : activePreviewMode === "fallback_design_doc"
+          ? "Fallback design-doc preview"
+          : "Fallback preview asset";
+  const activePreviewToneClass =
+    activePreviewMode === "canonical_asset" ? "text-emerald-700" : "text-amber-700";
   const infoChips = [
     isTitleStage ? "Title-Integrated" : null,
     wantsSeriesMark ? "Series Mark Attempt" : null,
@@ -228,6 +250,7 @@ export function DirectionOptionCard({
     showDebugChips && debugAspectAssets
       ? `Aspect completeness: wide ${debugAspectAssets.widescreen}, square ${debugAspectAssets.square}, vertical ${debugAspectAssets.vertical}`
       : null;
+  const topInvalidReasonLabels = summarizeProductionInvalidReasons(invalidReasons, 3);
 
   useEffect(() => {
     if (!isConfirmOpen) {
@@ -292,10 +315,12 @@ export function DirectionOptionCard({
           height={activeMeta.height}
           labelClassName="bg-white/70 text-[9px] text-slate-600"
         />
+        <p className={`text-xs font-medium ${activePreviewToneClass}`}>{activePreviewLabel}</p>
 
         <div className="grid grid-cols-2 gap-2">
           {PREVIEW_FORMATS.filter((format) => format !== activeFormat).map((format) => {
             const formatMeta = FORMAT_META[format];
+            const previewMode = previewModeByFormat[format];
             return (
               <button
                 key={format}
@@ -314,7 +339,10 @@ export function DirectionOptionCard({
                   showLabel={false}
                   className="border-slate-100"
                 />
-                <span className="mt-1 block px-1 text-[11px] font-medium text-slate-500">{formatMeta.label}</span>
+                <span className="mt-1 block px-1 text-[11px] font-medium text-slate-500">
+                  {formatMeta.label}
+                  {previewMode === "canonical_asset" ? "" : " • fallback"}
+                </span>
               </button>
             );
           })}
@@ -374,8 +402,37 @@ export function DirectionOptionCard({
       ) : null}
       {showGenerationFailureWarning ? (
         <div className="rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-900">
-          {isFallbackOption ? "Generation failed (fallback)" : "Generation failed."}
+          <p>{isFallbackOption ? "Generation failed (fallback)" : "Generation failed."}</p>
+          {topInvalidReasonLabels.length > 0 ? (
+            <ul className="mt-2 space-y-1 text-[11px] font-medium text-rose-900/90">
+              {topInvalidReasonLabels.map((reasonLabel) => (
+                <li key={reasonLabel}>{reasonLabel}</li>
+              ))}
+            </ul>
+          ) : null}
         </div>
+      ) : null}
+
+      {showDebugChips && (invalidReasons.length > 0 || failedChecks) ? (
+        <details className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+          <summary className="cursor-pointer font-semibold text-slate-800">Validation diagnostics</summary>
+          {invalidReasons.length > 0 ? (
+            <div className="mt-2 space-y-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">invalidReasons</p>
+              <pre className="overflow-x-auto rounded bg-white p-2 text-[11px] text-slate-700">
+                {JSON.stringify(invalidReasons, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+          {failedChecks ? (
+            <div className="mt-2 space-y-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">failedChecks</p>
+              <pre className="overflow-x-auto rounded bg-white p-2 text-[11px] text-slate-700">
+                {JSON.stringify(failedChecks, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+        </details>
       ) : null}
 
       {showDebugChips && (debugBackgroundAnchorSrc || debugLockupAnchorSrc) ? (

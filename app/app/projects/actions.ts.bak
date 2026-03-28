@@ -9,7 +9,7 @@ import { redirect } from "next/navigation";
 import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
-import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { buildFinalDesignDoc, normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import {
   mapLegacyTitleIntegrationToDesignSpec,
   normalizeBackgroundTitleIntegrationMode,
@@ -93,20 +93,6 @@ import {
   renderTrimmedLockupPngFromSvg,
   type PreviewShape
 } from "@/lib/lockup-compositor";
-import {
-  ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN,
-  buildProductionBlockedMessage,
-  isProductionValidOption,
-  normalizeAssetPathForCompletenessCheck,
-  readCanonicalDesignDocFromOutput,
-  resolveProductionValidOption,
-  resolveProductionValidOptionStatus,
-  type GenerationAssetRecord,
-  type ProductionBackgroundValidationEvidence,
-  type ProductionLockupValidationEvidence,
-  type ProductionValidationSnapshot,
-  toPersistedProductionValidationSnapshot
-} from "@/lib/production-valid-option";
 import { resolvePromptProfile } from "@/lib/prompt-profiles";
 
 export type ProjectActionState = {
@@ -501,6 +487,7 @@ const PREVIEW_ASSET_SLOTS_TO_CLEAR: readonly string[] = [
   ...Object.values(BACKGROUND_ASSET_SLOT_BY_SHAPE),
   LOCKUP_ASSET_SLOT
 ];
+const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 
 function normalizeWebsiteUrl(input: string): string | null {
   const trimmed = input.trim();
@@ -3811,8 +3798,6 @@ type ReusableGenerationAssets = {
   styleBucket: StyleBucketKey | null;
   styleTone: StyleToneKey | null;
   styleMedium: StyleMediumKey | null;
-  backgroundValidation: ProductionBackgroundValidationEvidence | null;
-  lockupValidation: ProductionLockupValidationEvidence | null;
 };
 
 function pickAssetPathBySlots(
@@ -3867,13 +3852,7 @@ async function loadReusableAssetsFromGeneration(params: {
   if (!generation) {
     return null;
   }
-
-  const sourceValidation = resolveProductionValidOption({
-    output: generation.output,
-    dbStatus: generation.status,
-    assets: generation.assets
-  });
-  if (!sourceValidation.valid) {
+  if (!isCompletedGenerationOption({ output: generation.output, dbStatus: generation.status })) {
     return null;
   }
 
@@ -3918,24 +3897,7 @@ async function loadReusableAssetsFromGeneration(params: {
     styleFamily: readStyleFamilyFromGenerationOutput(generation.output),
     styleBucket: readStyleBucketFromGenerationOutput(generation.output),
     styleTone: readStyleToneFromGenerationOutput(generation.output),
-    styleMedium: readStyleMediumFromGenerationOutput(generation.output),
-    backgroundValidation: {
-      source: sourceValidation.background.source,
-      sourceGenerationId: generation.id,
-      textFree: sourceValidation.background.textFree,
-      scaffoldFree: sourceValidation.background.scaffoldFree,
-      motifPresent: sourceValidation.background.motifPresent,
-      toneFit: sourceValidation.background.toneFit,
-      referenceFit: sourceValidation.background.referenceFit
-    },
-    lockupValidation: {
-      source: sourceValidation.lockup.source,
-      sourceGenerationId: generation.id,
-      textIntegrity: sourceValidation.lockup.textIntegrity,
-      fitPass: sourceValidation.lockup.fitPass,
-      insideTitleSafeWithMargin: sourceValidation.lockup.insideTitleSafeWithMargin,
-      notTooSmall: sourceValidation.lockup.notTooSmall
-    }
+    styleMedium: readStyleMediumFromGenerationOutput(generation.output)
   };
 }
 
@@ -3980,86 +3942,6 @@ function parseReusableMasterDesignDoc(output: unknown): DesignDoc | null {
   }
 
   return null;
-}
-
-function readSelectedBackgroundChecks(
-  attempts: BackgroundAttemptDebug[]
-): Pick<ProductionBackgroundValidationEvidence, "textFree" | "scaffoldFree" | "motifPresent" | "toneFit" | "referenceFit"> {
-  for (let index = attempts.length - 1; index >= 0; index -= 1) {
-    const attempt = attempts[index];
-    if (typeof attempt.winnerIndex !== "number" || !attempt.candidates[attempt.winnerIndex]) {
-      continue;
-    }
-    const winner = attempt.candidates[attempt.winnerIndex];
-    return {
-      textFree: winner.checks.textOk,
-      scaffoldFree: winner.checks.scaffoldOk,
-      motifPresent: winner.checks.motifOk,
-      toneFit: winner.checks.toneOk,
-      referenceFit: null
-    };
-  }
-
-  return {
-    textFree: null,
-    scaffoldFree: null,
-    motifPresent: null,
-    toneFit: null,
-    referenceFit: null
-  };
-}
-
-function buildProductionBackgroundValidationEvidence(params: {
-  source: DebugAssetSource;
-  sourceGenerationId: string | null;
-  reusableValidation: ProductionBackgroundValidationEvidence | null;
-  backgroundAttempts: BackgroundAttemptDebug[];
-  toneCheck: ToneCheckSummary | null;
-  backgroundTextCheck: BackgroundTextCheckSummary | null;
-}): ProductionBackgroundValidationEvidence {
-  if (params.source === "reused" && params.reusableValidation) {
-    return {
-      ...params.reusableValidation,
-      source: "reused",
-      sourceGenerationId: params.sourceGenerationId
-    };
-  }
-
-  const selectedChecks = readSelectedBackgroundChecks(params.backgroundAttempts);
-  return {
-    source: params.source,
-    sourceGenerationId: params.sourceGenerationId,
-    textFree:
-      selectedChecks.textFree ??
-      (params.backgroundTextCheck ? params.backgroundTextCheck.detected === false : null),
-    scaffoldFree: selectedChecks.scaffoldFree,
-    motifPresent: selectedChecks.motifPresent,
-    toneFit: selectedChecks.toneFit ?? params.toneCheck?.passed ?? null,
-    referenceFit: selectedChecks.referenceFit
-  };
-}
-
-function buildProductionLockupValidationEvidence(params: {
-  source: DebugAssetSource;
-  sourceGenerationId: string | null;
-  reusableValidation: ProductionLockupValidationEvidence | null;
-  textValidation: LockupSvgTextValidation | null;
-  fit: LockupFitCheck;
-}): ProductionLockupValidationEvidence {
-  const textIntegrity = params.textValidation
-    ? params.textValidation.valid &&
-      params.textValidation.unexpected.length === 0 &&
-      params.textValidation.missing.length === 0
-    : params.reusableValidation?.textIntegrity ?? null;
-
-  return {
-    source: params.source,
-    sourceGenerationId: params.sourceGenerationId,
-    textIntegrity,
-    fitPass: params.fit.fitPass,
-    insideTitleSafeWithMargin: params.fit.insideTitleSafeWithMargin,
-    notTooSmall: params.fit.notTooSmall
-  };
 }
 
 type StyleBrief = {
@@ -4142,28 +4024,167 @@ function normalizeMotifToken(value: string): string {
     .trim();
 }
 
+function isGenerationOptionStatus(value: unknown): value is GenerationOptionStatus {
+  return value === "COMPLETED" || value === "FAILED_GENERATION" || value === "FALLBACK";
+}
+
+function readGenerationOptionStatusFromOutput(output: unknown): GenerationOptionStatus | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const directStatus = (output as { status?: unknown }).status;
+  if (isGenerationOptionStatus(directStatus)) {
+    return directStatus;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const debug = (meta as { debug?: unknown }).debug;
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+  const backgroundSource = (debug as { backgroundSource?: unknown }).backgroundSource;
+  if (backgroundSource === "fallback") {
+    return "FALLBACK";
+  }
+
+  return null;
+}
+
+function isAspectAssetStatus(value: unknown): value is AspectAssetStatus {
+  return value === "ok" || value === "missing" || value === "placeholder";
+}
+
+function normalizeAssetPathForCompletenessCheck(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed.split("?")[0]?.trim() || null;
+}
+
+function readAspectAssetsFromOutput(output: unknown): AspectAssetStatusByOutputAspect | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const meta = (output as { meta?: unknown }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  const debug = (meta as { debug?: unknown }).debug;
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+  const aspectAssets = (debug as { aspectAssets?: unknown }).aspectAssets;
+  if (!aspectAssets || typeof aspectAssets !== "object" || Array.isArray(aspectAssets)) {
+    return null;
+  }
+
+  const value = aspectAssets as Record<string, unknown>;
+  const widescreen = value.widescreen;
+  const square = value.square;
+  const vertical = value.vertical;
+  if (!isAspectAssetStatus(widescreen) || !isAspectAssetStatus(square) || !isAspectAssetStatus(vertical)) {
+    return null;
+  }
+
+  return {
+    widescreen,
+    square,
+    vertical
+  };
+}
+
+function deriveAspectAssetsFromPreview(output: unknown): AspectAssetStatusByOutputAspect | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const preview = (output as { preview?: unknown }).preview;
+  if (!preview || typeof preview !== "object" || Array.isArray(preview)) {
+    return null;
+  }
+
+  const previewRecord = preview as Record<string, unknown>;
+  const rawByAspect = {
+    widescreen: normalizeAssetPathForCompletenessCheck(previewRecord.widescreen_main),
+    square: normalizeAssetPathForCompletenessCheck(previewRecord.square_main),
+    vertical: normalizeAssetPathForCompletenessCheck(previewRecord.vertical_main)
+  } as const;
+  const nonNullPaths = Object.values(rawByAspect).filter((value): value is string => Boolean(value));
+  const normalizedPathCounts = new Map<string, number>();
+  for (const pathValue of nonNullPaths) {
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    normalizedPathCounts.set(normalized, (normalizedPathCounts.get(normalized) || 0) + 1);
+  }
+
+  const classify = (pathValue: string | null): AspectAssetStatus => {
+    if (!pathValue) {
+      return "missing";
+    }
+    if (ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN.test(pathValue)) {
+      return "placeholder";
+    }
+    const normalized = pathValue.replace(/^\/+/, "").toLowerCase();
+    if ((normalizedPathCounts.get(normalized) || 0) > 1) {
+      return "placeholder";
+    }
+    return "ok";
+  };
+
+  return {
+    widescreen: classify(rawByAspect.widescreen),
+    square: classify(rawByAspect.square),
+    vertical: classify(rawByAspect.vertical)
+  };
+}
+
+function hasCompletedAspectAssetsFromOutput(output: unknown): boolean {
+  const aspectAssets = readAspectAssetsFromOutput(output) || deriveAspectAssetsFromPreview(output);
+  if (!aspectAssets) {
+    return false;
+  }
+  return aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
+}
+
 function resolveGenerationOptionStatus(params: {
   output: unknown;
   dbStatus?: string | null;
-  assets?: GenerationAssetRecord[];
 }): GenerationOptionStatus {
-  return resolveProductionValidOptionStatus({
-    output: params.output,
-    dbStatus: params.dbStatus,
-    assets: params.assets
-  });
+  const parsed = readGenerationOptionStatusFromOutput(params.output);
+  if (parsed) {
+    if (parsed === "COMPLETED" && !hasCompletedAspectAssetsFromOutput(params.output)) {
+      return "FAILED_GENERATION";
+    }
+    return parsed;
+  }
+
+  if (params.dbStatus === "COMPLETED") {
+    return hasCompletedAspectAssetsFromOutput(params.output) ? "COMPLETED" : "FAILED_GENERATION";
+  }
+  if (params.dbStatus === "FAILED") {
+    return "FAILED_GENERATION";
+  }
+  if (params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED") {
+    return "FAILED_GENERATION";
+  }
+  if (!params.output) {
+    return "FAILED_GENERATION";
+  }
+  return hasCompletedAspectAssetsFromOutput(params.output) ? "COMPLETED" : "FAILED_GENERATION";
 }
 
-function isCompletedGenerationOption(params: {
-  output: unknown;
-  dbStatus?: string | null;
-  assets?: GenerationAssetRecord[];
-}): boolean {
-  return isProductionValidOption({
-    output: params.output,
-    dbStatus: params.dbStatus,
-    assets: params.assets
-  });
+function isCompletedGenerationOption(params: { output: unknown; dbStatus?: string | null }): boolean {
+  return resolveGenerationOptionStatus(params) === "COMPLETED";
 }
 
 function withOutputStatus(output: GenerationOutputPayload, status: GenerationOptionStatus): GenerationOutputPayload {
@@ -6028,7 +6049,6 @@ type GenerationOutputPayload = {
       reasons: string[];
       retried: boolean;
     };
-    productionValidation?: ProductionValidationSnapshot;
     rerank?: RerankDebugMeta;
     designSpec?: Record<string, unknown>;
   };
@@ -7880,51 +7900,15 @@ async function completeGenerationWithFallbackOutput(params: {
       lockup: lockupPath
     }
   });
-  const fallbackOutputWithValidationEvidence: GenerationOutputPayload = {
+  const persistedFallbackOutput: GenerationOutputPayload = {
     ...outputWithStatus,
     meta: {
       ...outputWithStatus.meta,
-      productionValidation: {
-        version: 1,
-        background: {
-          source: "fallback",
-          sourceGenerationId: null,
-          textFree: false,
-          scaffoldFree: false,
-          motifPresent: null,
-          toneFit: null,
-          referenceFit: null
-        },
-        lockup: {
-          source: "fallback",
-          sourceGenerationId: null,
-          textIntegrity: false,
-          fitPass: false,
-          insideTitleSafeWithMargin: null,
-          notTooSmall: null
-        },
-        aspects: {
-          widescreen: { provenance: "fallback" },
-          square: { provenance: "fallback" },
-          vertical: { provenance: "fallback" }
-        }
-      },
       ...(fallbackDebugMeta
         ? {
             debug: fallbackDebugMeta
           }
         : {})
-    }
-  };
-  const fallbackValidation = resolveProductionValidOption({
-    output: fallbackOutputWithValidationEvidence,
-    dbStatus: "FAILED"
-  });
-  const persistedFallbackOutput: GenerationOutputPayload = {
-    ...fallbackOutputWithValidationEvidence,
-    meta: {
-      ...fallbackOutputWithValidationEvidence.meta,
-      productionValidation: toPersistedProductionValidationSnapshot(fallbackValidation)
     }
   };
 
@@ -9552,15 +9536,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const effectiveLockupPrompt = lockupRenderComputation.effectivePrompt;
       const lockupTextValidation = lockupRenderComputation.textValidation;
       const lockupTextOverrideRetried = lockupRenderComputation.textOverrideRetried;
-      const currentLockupFit = evaluateLockupFit({
-        lockupWidth: lockupRenderResult.width,
-        lockupHeight: lockupRenderResult.height,
-        shape: OPTION_MASTER_BACKGROUND_SHAPE,
-        canvasWidth: masterDimensions.width,
-        canvasHeight: masterDimensions.height,
-        marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
-        titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
-      });
       const lockupPngForComposite =
         shouldRunExplorationToneCheck && !shouldReuseLockup
           ? await padLockupForSafeMargin(lockupRenderResult.png, ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO)
@@ -9757,6 +9732,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const aspectAssets = await evaluateAspectAssetsForCompletion({
         pathsByShape: previewPathByShape
       });
+      const hasCompleteAspectAssets =
+        aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
 
       const backgroundAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
         projectId: params.project.id,
@@ -9796,35 +9773,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         ];
       });
-      const productionValidation = {
-        version: 1 as const,
-        background: buildProductionBackgroundValidationEvidence({
-          source: backgroundSourceForSuccess,
-          sourceGenerationId: shouldReuseBackground && reusableAssets ? reusableAssets.sourceGenerationId : null,
-          reusableValidation: shouldReuseBackground ? reusableAssets?.backgroundValidation || null : null,
-          backgroundAttempts: backgroundAttemptDiagnostics,
-          toneCheck: masterAttempt.toneCheck || null,
-          backgroundTextCheck: masterAttempt.backgroundTextCheck || null
-        }),
-        lockup: buildProductionLockupValidationEvidence({
-          source: lockupSourceForSuccess,
-          sourceGenerationId: shouldReuseLockup && reusableAssets ? reusableAssets.sourceGenerationId : null,
-          reusableValidation: shouldReuseLockup ? reusableAssets?.lockupValidation || null : null,
-          textValidation: lockupTextValidation,
-          fit: currentLockupFit
-        }),
-        aspects: {
-          widescreen: {
-            provenance: "rendered" as const
-          },
-          square: {
-            provenance: shouldUseCheapRound1Mode ? ("derived" as const) : ("rendered" as const)
-          },
-          vertical: {
-            provenance: shouldUseCheapRound1Mode ? ("derived" as const) : ("rendered" as const)
-          }
-        }
-      };
       const usedReferenceIds = [...new Set(backgroundStyleRefs.map((reference) => reference.referenceId))];
       const warnings = imageCallCapReached
         ? appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, ROUND1_IMAGE_CALL_CAP_WARNING)
@@ -9886,7 +9834,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             reasons: lockupTextValidation?.reasons || [],
             retried: lockupTextOverrideRetried
           },
-          productionValidation,
           debug: debugMeta,
           ...(shouldRunExplorationToneCheck
             ? {
@@ -9999,39 +9946,20 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         },
         resolvedLockupPalette
       );
-      const completionValidation = resolveProductionValidOption({
-        output: completedOutput,
-        dbStatus: "COMPLETED",
-        assets: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
-      });
-      const persistedProductionValidation = toPersistedProductionValidationSnapshot(completionValidation);
-      const completedOutputWithValidation: GenerationOutputPayload = {
-        ...completedOutput,
-        meta: {
-          ...completedOutput.meta,
-          productionValidation: persistedProductionValidation
-        }
-      };
-      if (!completionValidation.valid) {
-        const failureReason: BackgroundAttemptFailureReason = Object.values(completionValidation.failedChecks.aspects).some(
-          (aspectReasons) => aspectReasons.length > 0
-        )
-          ? "MISSING_ASPECT_ASSET"
-          : "UNKNOWN";
-        const validationWarning = `Production-validity gate failed: ${completionValidation.invalidReasons.join(", ") || "unknown_reason"}.`;
+      if (!hasCompleteAspectAssets) {
+        const failureReason: BackgroundAttemptFailureReason = "MISSING_ASPECT_ASSET";
         const failedOutput: GenerationOutputPayload = {
-          ...completedOutputWithValidation,
+          ...completedOutput,
           status: "FAILED_GENERATION",
-          notes: "production_validity_failed",
+          notes: "missing_aspect_asset",
           meta: {
-            ...completedOutputWithValidation.meta,
-            productionValidation: persistedProductionValidation,
-            debug: mergeGenerationDebugMeta(completedOutputWithValidation.meta.debug, {
+            ...completedOutput.meta,
+            debug: mergeGenerationDebugMeta(completedOutput.meta.debug, {
               backgroundFailureReason: failureReason,
               aspectAssets,
               warnings: appendUniqueDebugWarning(
-                appendUniqueDebugWarning(completedOutputWithValidation.meta.debug?.warnings, validationWarning),
-                "Option failed production-validity gate."
+                completedOutput.meta.debug?.warnings,
+                "Missing or placeholder aspect asset detected."
               )
             })
           }
@@ -10081,7 +10009,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           },
           data: {
             status: "COMPLETED",
-            output: completedOutputWithValidation as Prisma.InputJsonValue,
+            output: completedOutput as Prisma.InputJsonValue,
             input: persistedInputWithLockupPalette
           }
         })
@@ -10138,17 +10066,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             })
           }
         };
-        const failedValidation = resolveProductionValidOption({
-          output: failedOutput,
-          dbStatus: "FAILED"
-        });
-        const persistedFailedOutput: GenerationOutputPayload = {
-          ...failedOutput,
-          meta: {
-            ...failedOutput.meta,
-            productionValidation: toPersistedProductionValidationSnapshot(failedValidation)
-          }
-        };
         await prisma.$transaction([
           prisma.asset.deleteMany({
             where: {
@@ -10164,7 +10081,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             },
             data: {
               status: "FAILED",
-              output: persistedFailedOutput as Prisma.InputJsonValue
+              output: failedOutput as Prisma.InputJsonValue
             }
           })
         ]);
@@ -11089,6 +11006,12 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
     return;
   }
 
+  const effectiveBrandKit = await resolveEffectiveBrandKit({
+    organizationId: session.organizationId,
+    projectId: project.id,
+    projectBrandKit: project.brandKit
+  });
+
   const generation = await prisma.generation.findFirst({
     where: {
       id: generationId,
@@ -11099,34 +11022,38 @@ export async function approveFinalDesignAction(projectId: string, generationId: 
       round: true,
       status: true,
       input: true,
-      output: true,
-      assets: {
-        select: {
-          kind: true,
-          slot: true,
-          file_path: true
-        }
-      }
+      output: true
     }
   });
 
   if (!generation) {
     return;
   }
-  const generationValidation = resolveProductionValidOption({
-    output: generation.output,
-    dbStatus: generation.status,
-    assets: generation.assets
-  });
-  if (!generationValidation.finalize.eligible) {
-    throw new Error(buildProductionBlockedMessage("Finalize", generationValidation.finalize.invalidReasons));
+  if (
+    resolveGenerationOptionStatus({
+      output: generation.output,
+      dbStatus: generation.status
+    }) !== "COMPLETED"
+  ) {
+    throw new Error("Selected direction is not eligible for finalization. Retry generation and choose a completed option.");
   }
 
   const optionIndex = Math.max(0, normalizedOptionKey.charCodeAt(0) - 65);
-  const designDoc = readCanonicalDesignDocFromOutput(generation.output);
-  if (!designDoc) {
-    throw new Error(buildProductionBlockedMessage("Finalize", ["missing_canonical_design_doc"]));
-  }
+  const palette = effectiveBrandKit ? parsePaletteJson(effectiveBrandKit.paletteJson) : [];
+  const designDoc = buildFinalDesignDoc({
+    output: generation.output,
+    input: generation.input,
+    round: generation.round,
+    optionIndex,
+    project: {
+      seriesTitle: project.series_title,
+      seriesSubtitle: project.series_subtitle,
+      scripturePassages: project.scripture_passages,
+      seriesDescription: project.series_description,
+      logoPath: effectiveBrandKit?.logoPath || null,
+      palette
+    }
+  });
 
   await prisma.finalDesign.upsert({
     where: {

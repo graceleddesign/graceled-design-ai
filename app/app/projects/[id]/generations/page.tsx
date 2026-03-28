@@ -6,29 +6,23 @@ import { requireSession } from "@/lib/auth";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 import {
+  resolveProductionValidOption,
+  resolveProductionValidOptionStatus,
+  summarizeProductionInvalidReasons,
+  type ProductionValidationFailedChecks
+} from "@/lib/production-valid-option";
+import {
   isStyleBucketKey,
   isStyleFamilyKey,
   isStyleMediumKey,
   isStyleToneKey,
   STYLE_FAMILY_BANK
 } from "@/lib/style-family-bank";
-
-type PreviewFields = {
-  square: string;
-  wide: string;
-  tall: string;
-};
 type AspectAssetStatus = "ok" | "missing" | "placeholder";
 type DebugAspectAssets = {
   widescreen: AspectAssetStatus;
   square: AspectAssetStatus;
   vertical: AspectAssetStatus;
-};
-
-type GenerationAssetRecord = {
-  kind: "IMAGE" | "BACKGROUND" | "LOCKUP" | "ZIP" | "OTHER";
-  slot: string | null;
-  file_path: string;
 };
 
 type OptionDesignSpecSummary = {
@@ -139,10 +133,6 @@ const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|g
 type BackgroundFailureReason = (typeof BACKGROUND_FAILURE_REASONS)[number];
 type BackgroundCheckKey = (typeof BACKGROUND_CHECK_KEYS)[number];
 
-function isOptionGenerationStatus(value: unknown): value is "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
-  return value === "COMPLETED" || value === "FAILED_GENERATION" || value === "FALLBACK";
-}
-
 function isRoundStatus(value: unknown): value is "COMPLETED" | "PARTIAL" | "FAILED" {
   return value === "COMPLETED" || value === "PARTIAL" || value === "FAILED";
 }
@@ -243,47 +233,16 @@ function deriveAspectAssetsFromPreview(output: unknown): DebugAspectAssets | nul
   };
 }
 
-function hasCompleteAspectAssets(output: unknown): boolean {
-  const aspectAssets = parseDebugAspectAssets(output) || deriveAspectAssetsFromPreview(output);
-  if (!aspectAssets) {
-    return false;
-  }
-  return aspectAssets.widescreen === "ok" && aspectAssets.square === "ok" && aspectAssets.vertical === "ok";
-}
-
-function resolveOptionGenerationStatus(output: unknown, dbStatus?: string): "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
-  if (output && typeof output === "object" && !Array.isArray(output)) {
-    const directStatus = (output as { status?: unknown }).status;
-    if (isOptionGenerationStatus(directStatus)) {
-      if (directStatus === "COMPLETED" && !hasCompleteAspectAssets(output)) {
-        return "FAILED_GENERATION";
-      }
-      return directStatus;
-    }
-    const meta = (output as { meta?: unknown }).meta;
-    if (meta && typeof meta === "object" && !Array.isArray(meta)) {
-      const debug = (meta as { debug?: unknown }).debug;
-      if (debug && typeof debug === "object" && !Array.isArray(debug)) {
-        if ((debug as { backgroundSource?: unknown }).backgroundSource === "fallback") {
-          return "FALLBACK";
-        }
-      }
-    }
-  }
-
-  if (dbStatus === "FAILED") {
-    return "FAILED_GENERATION";
-  }
-  if (dbStatus === "COMPLETED") {
-    return hasCompleteAspectAssets(output) ? "COMPLETED" : "FAILED_GENERATION";
-  }
-  if (dbStatus === "RUNNING" || dbStatus === "QUEUED") {
-    return "FAILED_GENERATION";
-  }
-  if (!output) {
-    return "FAILED_GENERATION";
-  }
-  return hasCompleteAspectAssets(output) ? "COMPLETED" : "FAILED_GENERATION";
+function resolveOptionGenerationStatus(
+  output: unknown,
+  dbStatus?: string,
+  assets?: Array<{ kind: string; slot: string | null; file_path: string }>
+): "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
+  return resolveProductionValidOptionStatus({
+    output,
+    dbStatus,
+    assets
+  });
 }
 
 function isBackgroundFailureReason(value: unknown): value is BackgroundFailureReason {
@@ -303,72 +262,12 @@ function normalizeAssetUrl(filePath: string): string {
   return trimmed.startsWith("/") ? trimmed : `/${trimmed.replace(/^\/+/, "")}`;
 }
 
-function readAssetPreview(assets: GenerationAssetRecord[]): PreviewFields {
-  const resolved: Record<PreviewShape, { final: string; background: string }> = {
-    square: { final: "", background: "" },
-    wide: { final: "", background: "" },
-    tall: { final: "", background: "" }
-  };
-
-  const imageLikeAssets = assets.filter(
-    (asset) => (asset.kind === "IMAGE" || asset.kind === "BACKGROUND") && Boolean(asset.file_path?.trim())
-  );
-  const fallback = imageLikeAssets[0] ? normalizeAssetUrl(imageLikeAssets[0].file_path) : "";
-
-  for (const asset of imageLikeAssets) {
-    const slot = asset.slot?.trim().toLowerCase();
-    const filePath = normalizeAssetUrl(asset.file_path);
-    if (!filePath) {
-      continue;
-    }
-
-    if (slot === "square" || slot === "square_main") {
-      if (!resolved.square.final) {
-        resolved.square.final = filePath;
-      }
-      continue;
-    }
-    if (slot === "wide" || slot === "wide_main" || slot === "widescreen" || slot === "widescreen_main") {
-      if (!resolved.wide.final) {
-        resolved.wide.final = filePath;
-      }
-      continue;
-    }
-    if (slot === "tall" || slot === "tall_main" || slot === "vertical" || slot === "vertical_main") {
-      if (!resolved.tall.final) {
-        resolved.tall.final = filePath;
-      }
-      continue;
-    }
-    if (slot === "square_bg") {
-      if (!resolved.square.background) {
-        resolved.square.background = filePath;
-      }
-      continue;
-    }
-    if (slot === "wide_bg" || slot === "widescreen_bg") {
-      if (!resolved.wide.background) {
-        resolved.wide.background = filePath;
-      }
-      continue;
-    }
-    if (slot === "tall_bg" || slot === "vertical_bg") {
-      if (!resolved.tall.background) {
-        resolved.tall.background = filePath;
-      }
-    }
-  }
-
-  return {
-    square: resolved.square.final || resolved.square.background || fallback,
-    wide: resolved.wide.final || resolved.wide.background || fallback,
-    tall: resolved.tall.final || resolved.tall.background || fallback
-  };
-}
-
-function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesignSpecSummary {
+function readDesignSpecSummary(
+  output: unknown,
+  optionStatus: "COMPLETED" | "FAILED_GENERATION" | "FALLBACK"
+): OptionDesignSpecSummary {
   const fallback: OptionDesignSpecSummary = {
-    optionStatus: resolveOptionGenerationStatus(output, dbStatus),
+    optionStatus,
     roundHasFallback: false,
     roundStatus: null,
     roundCompletedCount: null,
@@ -894,7 +793,7 @@ function readDesignSpecSummary(output: unknown, dbStatus?: string): OptionDesign
   return {
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
     wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
-    optionStatus: resolveOptionGenerationStatus(output, dbStatus),
+    optionStatus,
     roundHasFallback: roundHasFallbackCandidate === true,
     roundStatus: isRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
     roundCompletedCount:
@@ -1000,16 +899,10 @@ function getGenerationPreviewUrl(
   generationId: string,
   shape: PreviewShape,
   updatedAt: Date,
-  assetUrl?: string,
   options?: { debugStage?: boolean }
 ): string {
   if (options?.debugStage) {
     return `/api/projects/${projectId}/generations/${generationId}/preview?shape=${shape}&debugStage=1&v=${updatedAt.getTime()}`;
-  }
-
-  if (assetUrl) {
-    const separator = assetUrl.includes("?") ? "&" : "?";
-    return `${assetUrl}${separator}v=${updatedAt.getTime()}`;
   }
 
   return `/api/projects/${projectId}/generations/${generationId}/preview?shape=${shape}&v=${updatedAt.getTime()}`;
@@ -1099,6 +992,28 @@ export default async function ProjectGenerationsPage({
     },
     orderBy: [{ round: "desc" }, { createdAt: "asc" }]
   });
+  const generationValidationById = new Map(
+    generations.map((generation) => [
+      generation.id,
+      resolveProductionValidOption({
+        output: generation.output,
+        dbStatus: generation.status,
+        assets: generation.assets
+      })
+    ])
+  );
+  const finalDesignGeneration = project.finalDesign?.generationId
+    ? generations.find((generation) => generation.id === project.finalDesign?.generationId) || null
+    : null;
+  const finalDesignValidation = finalDesignGeneration ? generationValidationById.get(finalDesignGeneration.id) || null : null;
+  const finalDesignDownloadsEnabled = Boolean(project.finalDesign && finalDesignValidation?.valid);
+  const finalBundleDownloadsEnabled = Boolean(project.finalDesign && finalDesignValidation?.export.eligible);
+  const finalDesignInvalidReasonLabels = finalDesignValidation
+    ? summarizeProductionInvalidReasons(finalDesignValidation.invalidReasons, 3)
+    : [];
+  const finalBundleInvalidReasonLabels = finalDesignValidation
+    ? summarizeProductionInvalidReasons(finalDesignValidation.export.invalidReasons, 3)
+    : [];
 
   const rounds = new Map<number, typeof generations>();
   for (const generation of generations) {
@@ -1139,11 +1054,24 @@ export default async function ProjectGenerationsPage({
             )}
           </div>
           <div className="flex flex-wrap gap-2">
-            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/pptx`} label="Download PPTX" disabled={!project.finalDesign} />
-            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/svg`} label="Download SVG" disabled={!project.finalDesign} />
-            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/bundle`} label="Download ZIP" disabled={!project.finalDesign} />
+            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/pptx`} label="Download PPTX" disabled={!finalDesignDownloadsEnabled} />
+            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/svg`} label="Download SVG" disabled={!finalDesignDownloadsEnabled} />
+            <DeliverableDownloadLink href={`/api/projects/${project.id}/final/bundle`} label="Download ZIP" disabled={!finalBundleDownloadsEnabled} />
           </div>
-          {!project.finalDesign ? <p className="w-full text-right text-xs text-slate-500">Finalize to unlock downloads.</p> : null}
+          {!project.finalDesign ? (
+            <p className="w-full text-right text-xs text-slate-500">Finalize to unlock downloads.</p>
+          ) : !finalDesignDownloadsEnabled ? (
+            <p className="w-full text-right text-xs text-rose-600">
+              Approved design is not production-valid anymore.
+              {finalDesignGeneration
+                ? ` ${finalDesignInvalidReasonLabels.join(" · ") || "Re-finalize a canonical option."}`
+                : " Approved source generation is missing. Re-finalize a canonical option."}
+            </p>
+          ) : !finalBundleDownloadsEnabled ? (
+            <p className="w-full text-right text-xs text-rose-600">
+              ZIP export is blocked. {finalBundleInvalidReasonLabels.join(" · ") || "Canonical bundle assets are incomplete."}
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -1154,9 +1082,13 @@ export default async function ProjectGenerationsPage({
       ) : (
         <div className="space-y-8">
           {roundEntries.map(([round, roundGenerations], roundIndex) => {
-            const roundDesignSummaries = roundGenerations.map((generation) =>
-              readDesignSpecSummary(generation.output, generation.status)
-            );
+            const roundDesignSummaries = roundGenerations.map((generation) => {
+              const validation = generationValidationById.get(generation.id);
+              return readDesignSpecSummary(
+                generation.output,
+                validation?.status ?? resolveOptionGenerationStatus(generation.output, generation.status, generation.assets)
+              );
+            });
             const persistedRoundStatus =
               roundDesignSummaries.find((summary) => summary.roundStatus === "FAILED")?.roundStatus ||
               roundDesignSummaries.find((summary) => summary.roundStatus === "PARTIAL")?.roundStatus ||
@@ -1239,7 +1171,13 @@ export default async function ProjectGenerationsPage({
                   const optionKey = String.fromCharCode(65 + optionIndex);
                   const label = optionLabel(optionIndex);
                   const tintClass = OPTION_TINTS[optionIndex % OPTION_TINTS.length];
-                  const preview = readAssetPreview(generation.assets);
+                  const generationValidation =
+                    generationValidationById.get(generation.id) ||
+                    resolveProductionValidOption({
+                      output: generation.output,
+                      dbStatus: generation.status,
+                      assets: generation.assets
+                    });
                   const isApprovedFinal =
                     project.finalDesign?.generationId === generation.id ||
                     (project.finalDesign?.round === round && project.finalDesign.optionKey === optionKey);
@@ -1247,18 +1185,24 @@ export default async function ProjectGenerationsPage({
                     generation.output as { meta?: { styleRefCount?: unknown } } | null
                   )?.meta?.styleRefCount;
                   const designSpecSummary =
-                    roundDesignSummaries[optionIndex] || readDesignSpecSummary(generation.output, generation.status);
+                    roundDesignSummaries[optionIndex] || readDesignSpecSummary(generation.output, generationValidation.status);
                   const previewUrls = {
-                    square: getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, preview.square, {
+                    square: getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, {
                       debugStage: debugStageEnabled
                     }),
-                    wide: getGenerationPreviewUrl(project.id, generation.id, "wide", generation.updatedAt, preview.wide, {
+                    wide: getGenerationPreviewUrl(project.id, generation.id, "wide", generation.updatedAt, {
                       debugStage: debugStageEnabled
                     }),
-                    tall: getGenerationPreviewUrl(project.id, generation.id, "tall", generation.updatedAt, preview.tall, {
+                    tall: getGenerationPreviewUrl(project.id, generation.id, "tall", generation.updatedAt, {
                       debugStage: debugStageEnabled
                     })
                   };
+                  const previewModeByFormat = {
+                    square: generationValidation.preview.square.mode,
+                    wide: generationValidation.preview.wide.mode,
+                    tall: generationValidation.preview.tall.mode
+                  } as const;
+                  const failedChecks: ProductionValidationFailedChecks = generationValidation.failedChecks;
                   const finalizeAction = approveFinalDesignAction.bind(null, project.id, generation.id, optionKey);
 
                   return (
@@ -1306,6 +1250,9 @@ export default async function ProjectGenerationsPage({
                       debugBestEffortBackground={designSpecSummary.debugBestEffortBackground}
                       showDebugChips={debugStageEnabled}
                       previewUrls={previewUrls}
+                      previewModeByFormat={previewModeByFormat}
+                      invalidReasons={generationValidation.invalidReasons}
+                      failedChecks={failedChecks}
                       finalizeAction={finalizeAction}
                     />
                   );
