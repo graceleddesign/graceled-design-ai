@@ -129,6 +129,25 @@ export type BackgroundAcceptanceResult = {
   evidence: ProductionBackgroundValidationEvidence;
 };
 
+export type LockupAcceptanceChecks = {
+  sourceCanonical: boolean;
+  textIntegrity: boolean | null;
+  fitPass: boolean | null;
+  insideTitleSafeWithMargin: boolean | null;
+  notTooSmall: boolean | null;
+  validationEvidencePresent: boolean;
+  reuseEvidencePresent: boolean;
+};
+
+export type LockupAcceptanceResult = {
+  accepted: boolean;
+  valid: boolean;
+  invalidReasons: string[];
+  reasons: string[];
+  checks: LockupAcceptanceChecks;
+  evidence: ProductionLockupValidationEvidence;
+};
+
 export type ProductionValidOptionResult = {
   valid: boolean;
   isProductionValid: boolean;
@@ -393,8 +412,14 @@ export function formatProductionInvalidReason(reason: string): string {
   if (code === "lockup_fit_failed") {
     return "Lockup fit validation failed";
   }
+  if (code === "lockup_missing_validation_evidence") {
+    return "Lockup validation evidence is missing";
+  }
   if (code === "lockup_reuse_unvalidated") {
     return "Reused lockup was not fully validated";
+  }
+  if (code === "lockup_fallback_provenance") {
+    return "Lockup came from fallback provenance";
   }
   if (code === "lockup_not_canonical") {
     return "Lockup source is non-canonical";
@@ -909,6 +934,80 @@ function inferLockupValidation(output: unknown): ProductionLockupValidationEvide
   };
 }
 
+function normalizeLockupFitPass(evidence: ProductionLockupValidationEvidence): boolean | null {
+  if (evidence.fitPass === true) {
+    if (evidence.insideTitleSafeWithMargin === false || evidence.notTooSmall === false) {
+      return false;
+    }
+    return true;
+  }
+  if (evidence.fitPass === false) {
+    return false;
+  }
+  if (evidence.insideTitleSafeWithMargin === false || evidence.notTooSmall === false) {
+    return false;
+  }
+  if (evidence.insideTitleSafeWithMargin === true && evidence.notTooSmall === true) {
+    return true;
+  }
+  return null;
+}
+
+export function evaluateLockupAcceptance(params: {
+  evidence: ProductionLockupValidationEvidence;
+}): LockupAcceptanceResult {
+  const { evidence } = params;
+  const invalidReasons: string[] = [];
+  const normalizedFitPass = normalizeLockupFitPass(evidence);
+  const sourceCanonical = evidence.source === "generated" || evidence.source === "reused";
+  const validationEvidencePresent = evidence.textIntegrity !== null && normalizedFitPass !== null;
+  const reuseEvidencePresent =
+    evidence.source !== "reused" ||
+    (Boolean(evidence.sourceGenerationId) && evidence.textIntegrity !== null && normalizedFitPass !== null);
+
+  if (evidence.source === "fallback") {
+    addReason(invalidReasons, "lockup_fallback_provenance");
+    addReason(invalidReasons, "lockup_not_canonical");
+  } else if (!sourceCanonical) {
+    addReason(invalidReasons, "lockup_not_canonical");
+  }
+
+  if (evidence.textIntegrity === false) {
+    addReason(invalidReasons, "lockup_text_integrity_failed");
+  } else if (evidence.textIntegrity !== true) {
+    addReason(invalidReasons, "lockup_missing_validation_evidence");
+  }
+
+  if (normalizedFitPass === false) {
+    addReason(invalidReasons, "lockup_fit_failed");
+  } else if (normalizedFitPass !== true) {
+    addReason(invalidReasons, "lockup_missing_validation_evidence");
+  }
+
+  if (evidence.source === "reused" && (!reuseEvidencePresent || evidence.textIntegrity !== true || normalizedFitPass !== true)) {
+    addReason(invalidReasons, "lockup_reuse_unvalidated");
+  }
+
+  const reasons = dedupeReasons(invalidReasons);
+
+  return {
+    accepted: reasons.length === 0,
+    valid: reasons.length === 0,
+    invalidReasons: reasons,
+    reasons,
+    checks: {
+      sourceCanonical,
+      textIntegrity: evidence.textIntegrity,
+      fitPass: normalizedFitPass,
+      insideTitleSafeWithMargin: evidence.insideTitleSafeWithMargin,
+      notTooSmall: evidence.notTooSmall,
+      validationEvidencePresent,
+      reuseEvidencePresent
+    },
+    evidence
+  };
+}
+
 function validateBackground(output: unknown): ComponentValidationResult<ProductionBackgroundValidationEvidence> {
   const evidence = inferBackgroundValidation(output);
   const acceptance = evaluateBackgroundAcceptance({
@@ -926,26 +1025,15 @@ function validateBackground(output: unknown): ComponentValidationResult<Producti
 
 function validateLockup(output: unknown): ComponentValidationResult<ProductionLockupValidationEvidence> {
   const evidence = inferLockupValidation(output);
-  const invalidReasons: string[] = [];
-
-  if (evidence.source === "fallback") {
-    addReason(invalidReasons, "lockup_not_canonical");
-  }
-  if (evidence.textIntegrity !== true) {
-    addReason(invalidReasons, "lockup_text_integrity_failed");
-  }
-  if (evidence.fitPass === false) {
-    addReason(invalidReasons, "lockup_fit_failed");
-  }
-  if (evidence.source === "reused" && evidence.fitPass !== true) {
-    addReason(invalidReasons, "lockup_reuse_unvalidated");
-  }
+  const acceptance = evaluateLockupAcceptance({
+    evidence
+  });
 
   return {
     ...evidence,
-    valid: invalidReasons.length === 0,
-    invalidReasons,
-    reasons: invalidReasons
+    valid: acceptance.accepted,
+    invalidReasons: acceptance.invalidReasons,
+    reasons: acceptance.reasons
   };
 }
 

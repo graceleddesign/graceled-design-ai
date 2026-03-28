@@ -97,6 +97,7 @@ import {
   ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN,
   buildProductionBlockedMessage,
   evaluateBackgroundAcceptance,
+  evaluateLockupAcceptance,
   isProductionValidOption,
   normalizeAssetPathForCompletenessCheck,
   readCanonicalDesignDocFromOutput,
@@ -104,6 +105,7 @@ import {
   resolveProductionValidOptionStatus,
   type BackgroundAcceptanceResult,
   type GenerationAssetRecord,
+  type LockupAcceptanceResult,
   type ProductionBackgroundValidationEvidence,
   type ProductionLockupValidationEvidence,
   type ProductionValidationSnapshot,
@@ -4150,6 +4152,25 @@ function buildProductionLockupValidationEvidence(params: {
   };
 }
 
+function buildLockupAcceptanceResult(params: {
+  source: DebugAssetSource;
+  sourceGenerationId: string | null;
+  reusableValidation: ProductionLockupValidationEvidence | null;
+  textValidation: LockupSvgTextValidation | null;
+  fit: LockupFitCheck;
+}): {
+  evidence: ProductionLockupValidationEvidence;
+  acceptance: LockupAcceptanceResult;
+} {
+  const evidence = buildProductionLockupValidationEvidence(params);
+  return {
+    evidence,
+    acceptance: evaluateLockupAcceptance({
+      evidence
+    })
+  };
+}
+
 type StyleBrief = {
   layout: string;
   typography: {
@@ -6050,6 +6071,7 @@ type BackgroundAttemptDebug = {
 type LockupRerankCandidateDebug = {
   url: string;
   score: number;
+  invalidReasons: string[];
   checks: {
     textIntegrity: boolean;
     fitPass: boolean;
@@ -6065,6 +6087,16 @@ type LockupRerankCandidateDebug = {
     safeCoverage: number;
     textOverrideRetried: boolean;
   };
+};
+
+type LockupComputationSelection = {
+  renderResult: { png: Buffer; width: number; height: number };
+  effectivePrompt: string;
+  textValidation: LockupSvgTextValidation | null;
+  textOverrideRetried: boolean;
+  fit: LockupFitCheck;
+  evidence: ProductionLockupValidationEvidence;
+  acceptance: LockupAcceptanceResult;
 };
 
 type RerankDebugMeta = {
@@ -8504,12 +8536,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         feedbackControls.regenerateBackground === false &&
         reusableAssets?.backgroundAccepted === true &&
         Boolean(reusableAssets?.masterBackgroundPng);
-      const shouldReuseLockup =
+      let shouldReuseLockup =
         feedbackControls.regenerateLockup === false &&
         reusableAssets?.lockupAccepted === true &&
         Boolean(reusableAssets?.lockupPng);
       const backgroundSourceForSuccess: DebugAssetSource = shouldReuseBackground ? "reused" : "generated";
-      const lockupSourceForSuccess: DebugAssetSource = shouldReuseLockup ? "reused" : "generated";
       const initialDirectionStyleFields = resolveDirectionStyleFields(directionSpec);
       let effectiveDirectionStyleFamily =
         (shouldReuseBackground || shouldReuseLockup) && reusableAssets?.styleFamily
@@ -8531,18 +8562,19 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           : initialDirectionStyleFields.styleMedium ||
             (effectiveDirectionStyleFamily ? STYLE_FAMILY_BANK[effectiveDirectionStyleFamily].medium : null);
       let backgroundDirectionSpec = directionSpec;
-      const lockupRecipeForRender = shouldReuseLockup
-        ? sourceLockupRecipe
-        : applyLockupRecipeGuardrails({
-            lockupRecipe: sourceLockupRecipe,
-            styleMode: lockupStyleMode,
-            lockupLayout
-          });
+      const generatedLockupRecipeForRender = applyLockupRecipeGuardrails({
+        lockupRecipe: sourceLockupRecipe,
+        styleMode: lockupStyleMode,
+        lockupLayout
+      });
+      let lockupRecipeForRender = shouldReuseLockup ? sourceLockupRecipe : generatedLockupRecipeForRender;
       const typographicRecipe = lockupTypographicRecipeForArchetype(lockupLayout);
       const titleSafeBoxForDirection = (targetDirectionSpec?: PlannedDirectionSpec | null): TitleSafeBox =>
         resolveTitleSafeBoxForDirection(OPTION_MASTER_BACKGROUND_SHAPE, targetDirectionSpec);
       let rerankMeta: RerankDebugMeta = {};
       let backgroundAttemptDiagnostics: BackgroundAttemptDebug[] = [];
+      let lockupReuseValidation: LockupComputationSelection | null = null;
+      let lockupReuseBlockedReasons: string[] = [];
 
       const resolveToneTargetFromDirectionSpec = (targetDirectionSpec?: PlannedDirectionSpec | null) => {
         const styleTone = resolveDirectionStyleFields(targetDirectionSpec).styleTone;
@@ -9559,6 +9591,46 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const selectedVariationTemplateKey =
         backgroundDirectionSpec?.variationTemplateKey || directionSpec?.variationTemplateKey || null;
       noteRound1SelectedTemplate(plannedGeneration.round, selectedVariationTemplateKey);
+      if (shouldReuseLockup && reusableAssets?.lockupPng) {
+        const reusableLockupWidth = Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).width || 1));
+        const reusableLockupHeight = Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).height || 1));
+        const reusableFit = evaluateLockupFit({
+          lockupWidth: reusableLockupWidth,
+          lockupHeight: reusableLockupHeight,
+          shape: OPTION_MASTER_BACKGROUND_SHAPE,
+          canvasWidth: masterDimensions.width,
+          canvasHeight: masterDimensions.height,
+          marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
+          titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
+        });
+        const { evidence, acceptance } = buildLockupAcceptanceResult({
+          source: "reused",
+          sourceGenerationId: reusableAssets.sourceGenerationId,
+          reusableValidation: reusableAssets.lockupValidation,
+          textValidation: null,
+          fit: reusableFit
+        });
+
+        if (acceptance.accepted) {
+          lockupReuseValidation = {
+            renderResult: {
+              png: reusableAssets.lockupPng,
+              width: reusableLockupWidth,
+              height: reusableLockupHeight
+            },
+            effectivePrompt: lockupPrompt,
+            textValidation: null,
+            textOverrideRetried: false,
+            fit: reusableFit,
+            evidence,
+            acceptance
+          };
+        } else {
+          shouldReuseLockup = false;
+          lockupRecipeForRender = generatedLockupRecipeForRender;
+          lockupReuseBlockedReasons = acceptance.invalidReasons;
+        }
+      }
       lockupPrompt = buildLockupGenerationPrompt({
         title: content.title,
         subtitle: content.subtitle,
@@ -9616,16 +9688,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           lockupPrompt
         });
       };
-      const lockupRenderComputation = shouldReuseLockup && reusableAssets?.lockupPng
+      const lockupRenderComputation: LockupComputationSelection = lockupReuseValidation
         ? {
-            renderResult: {
-              png: reusableAssets.lockupPng,
-              width: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).width || 1)),
-              height: Math.max(1, Math.round((await sharp(reusableAssets.lockupPng).metadata()).height || 1))
-            },
-            effectivePrompt: lockupPrompt,
-            textValidation: null as LockupSvgTextValidation | null,
-            textOverrideRetried: false
+            ...lockupReuseValidation,
+            effectivePrompt: lockupPrompt
           }
         : shouldRunExplorationToneCheck
           ? await (async () => {
@@ -9634,9 +9700,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 Array.from({ length: lockupCandidateCount }, (_, candidateIndex) =>
                   lockupCandidateLimit(async () => {
                     const computation = await renderLockupAttempt(`${fontSeedBase}|lockup-candidate-${candidateIndex}`);
-                    const validation = computation.textValidation;
-                    const textIntegrity =
-                      validation.valid && validation.unexpected.length === 0 && validation.missing.length === 0;
                     const fit = evaluateLockupFit({
                       lockupWidth: computation.renderResult.width,
                       lockupHeight: computation.renderResult.height,
@@ -9646,9 +9709,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                       marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
                       titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
                     });
+                    const { evidence, acceptance } = buildLockupAcceptanceResult({
+                      source: "generated",
+                      sourceGenerationId: null,
+                      reusableValidation: null,
+                      textValidation: computation.textValidation,
+                      fit
+                    });
                     let score = 0;
-                    score += textIntegrity ? 130 : -130;
-                    score += fit.fitPass ? 95 : -95;
+                    score += acceptance.checks.textIntegrity === true ? 130 : -130;
+                    score += acceptance.checks.fitPass === true ? 95 : -95;
                     score += fit.notTooSmall ? 26 : -26;
                     score += fit.score * 28;
                     score -= computation.textOverrideRetried ? 4 : 0;
@@ -9661,29 +9731,39 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                       computation,
                       score,
                       checks: {
-                        textIntegrity,
-                        fitPass: fit.fitPass,
+                        textIntegrity: acceptance.checks.textIntegrity === true,
+                        fitPass: acceptance.checks.fitPass === true,
                         insideTitleSafeWithMargin: fit.insideTitleSafeWithMargin,
                         notTooSmall: fit.notTooSmall
                       },
                       fit,
+                      evidence,
+                      acceptance,
                       debugUrl
                     };
                   })
                 )
               );
 
-              const eligible = candidates
-                .map((candidate, index) => ({ candidate, index }))
-                .filter((entry) => entry.candidate.checks.textIntegrity && entry.candidate.checks.fitPass);
-              const pool = eligible.length > 0 ? eligible : candidates.map((candidate, index) => ({ candidate, index }));
-              const winner = pool.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), pool[0]);
+              const indexedCandidates = candidates.map((candidate, index) => ({ candidate, index }));
+              const eligible = indexedCandidates.filter((entry) => entry.candidate.acceptance.accepted);
+              const bestCandidate = indexedCandidates.reduce(
+                (best, current) => (current.candidate.score > best.candidate.score ? current : best),
+                indexedCandidates[0]
+              );
+              const winner = eligible.length > 0
+                ? eligible.reduce(
+                    (best, current) => (current.candidate.score > best.candidate.score ? current : best),
+                    eligible[0]
+                  )
+                : null;
 
               rerankMeta = {
                 ...rerankMeta,
                 lockupCandidates: candidates.map((candidate) => ({
                   url: candidate.debugUrl,
                   score: candidate.score,
+                  invalidReasons: candidate.acceptance.invalidReasons,
                   checks: candidate.checks,
                   stats: {
                     width: candidate.computation.renderResult.width,
@@ -9695,25 +9775,55 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                     textOverrideRetried: candidate.computation.textOverrideRetried
                   }
                 })),
-                lockupWinnerIndex: winner.index
+                ...(winner
+                  ? {
+                      lockupWinnerIndex: winner.index
+                    }
+                  : {})
               };
 
-              return winner.candidate.computation;
+              const selectedCandidate = winner?.candidate || bestCandidate.candidate;
+              return {
+                renderResult: selectedCandidate.computation.renderResult,
+                effectivePrompt: selectedCandidate.computation.effectivePrompt,
+                textValidation: selectedCandidate.computation.textValidation,
+                textOverrideRetried: selectedCandidate.computation.textOverrideRetried,
+                fit: selectedCandidate.fit,
+                evidence: selectedCandidate.evidence,
+                acceptance: selectedCandidate.acceptance
+              };
             })()
-          : await renderLockupAttempt(fontSeedBase);
+          : await (async () => {
+              const computation = await renderLockupAttempt(fontSeedBase);
+              const fit = evaluateLockupFit({
+                lockupWidth: computation.renderResult.width,
+                lockupHeight: computation.renderResult.height,
+                shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                canvasWidth: masterDimensions.width,
+                canvasHeight: masterDimensions.height,
+                marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
+                titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
+              });
+              const { evidence, acceptance } = buildLockupAcceptanceResult({
+                source: "generated",
+                sourceGenerationId: null,
+                reusableValidation: null,
+                textValidation: computation.textValidation,
+                fit
+              });
+              return {
+                ...computation,
+                fit,
+                evidence,
+                acceptance
+              };
+            })();
       const lockupRenderResult = lockupRenderComputation.renderResult;
       const effectiveLockupPrompt = lockupRenderComputation.effectivePrompt;
       const lockupTextValidation = lockupRenderComputation.textValidation;
       const lockupTextOverrideRetried = lockupRenderComputation.textOverrideRetried;
-      const currentLockupFit = evaluateLockupFit({
-        lockupWidth: lockupRenderResult.width,
-        lockupHeight: lockupRenderResult.height,
-        shape: OPTION_MASTER_BACKGROUND_SHAPE,
-        canvasWidth: masterDimensions.width,
-        canvasHeight: masterDimensions.height,
-        marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
-        titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
-      });
+      const currentLockupEvidence = lockupRenderComputation.evidence;
+      const currentLockupAcceptance = lockupRenderComputation.acceptance;
       const lockupPngForComposite =
         shouldRunExplorationToneCheck && !shouldReuseLockup
           ? await padLockupForSafeMargin(lockupRenderResult.png, ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO)
@@ -9839,7 +9949,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           ? `[rerank-background: winner=${(rerankMeta.backgroundWinnerIndex ?? 0) + 1}/${rerankMeta.backgroundCandidates.length}]`
           : "",
         rerankMeta.lockupCandidates
-          ? `[rerank-lockup: winner=${(rerankMeta.lockupWinnerIndex ?? 0) + 1}/${rerankMeta.lockupCandidates.length}]`
+          ? typeof rerankMeta.lockupWinnerIndex === "number"
+            ? `[rerank-lockup: winner=${rerankMeta.lockupWinnerIndex + 1}/${rerankMeta.lockupCandidates.length}]`
+            : `[rerank-lockup: winner=none/${rerankMeta.lockupCandidates.length}]`
           : "",
         originalityRetried ? "[retry: originality-guard]" : "",
         masterAttempt.textRetryCount > 0 ? `[retry: no-text x${masterAttempt.textRetryCount}]` : "",
@@ -9949,6 +10061,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           }
         ];
       });
+      const lockupSourceForSuccess: DebugAssetSource = currentLockupEvidence.source;
       const productionValidation = {
         version: 1 as const,
         background: buildProductionBackgroundValidationEvidence({
@@ -9959,13 +10072,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           toneCheck: masterAttempt.toneCheck || null,
           backgroundTextCheck: masterAttempt.backgroundTextCheck || null
         }),
-        lockup: buildProductionLockupValidationEvidence({
-          source: lockupSourceForSuccess,
-          sourceGenerationId: shouldReuseLockup && reusableAssets ? reusableAssets.sourceGenerationId : null,
-          reusableValidation: shouldReuseLockup ? reusableAssets?.lockupValidation || null : null,
-          textValidation: lockupTextValidation,
-          fit: currentLockupFit
-        }),
+        lockup: currentLockupEvidence,
         aspects: {
           widescreen: {
             provenance: "rendered" as const
@@ -9979,9 +10086,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         }
       };
       const usedReferenceIds = [...new Set(backgroundStyleRefs.map((reference) => reference.referenceId))];
-      const warnings = imageCallCapReached
-        ? appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, ROUND1_IMAGE_CALL_CAP_WARNING)
-        : fallbackOutput.meta.debug?.warnings;
+      const lockupReuseBlockedWarning =
+        lockupReuseBlockedReasons.length > 0
+          ? `Lockup reuse blocked by hard gate: ${lockupReuseBlockedReasons.join(", ")}.`
+          : null;
+      const warnings = appendUniqueDebugWarning(
+        imageCallCapReached
+          ? appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, ROUND1_IMAGE_CALL_CAP_WARNING)
+          : fallbackOutput.meta.debug?.warnings,
+        lockupReuseBlockedWarning
+      );
       const refinementDebugPayload = buildRefinementDebugPayload({
         input: plannedGeneration.input,
         directionSpec: backgroundDirectionSpec || directionSpec
@@ -10035,8 +10149,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           usedStylePaths: backgroundStyleRefs.map((reference) => reference.sourcePath),
           usedReferenceIds,
           lockupValidation: {
-            ok: lockupTextValidation?.valid ?? true,
-            reasons: lockupTextValidation?.reasons || [],
+            ok: currentLockupEvidence.textIntegrity === true,
+            reasons:
+              lockupTextValidation && lockupTextValidation.reasons.length > 0
+                ? lockupTextValidation.reasons
+                : currentLockupEvidence.textIntegrity === true
+                  ? []
+                  : currentLockupAcceptance.invalidReasons,
             retried: lockupTextOverrideRetried
           },
           productionValidation,
