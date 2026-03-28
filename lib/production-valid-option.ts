@@ -111,6 +111,24 @@ type ComponentValidationResult<T> = T & {
   reasons: string[];
 };
 
+export type BackgroundAcceptanceChecks = {
+  sourceCanonical: boolean;
+  textFree: boolean | null;
+  scaffoldFree: boolean | null;
+  motifPresent: boolean | null;
+  toneFit: boolean | null;
+  referenceFit: boolean | null;
+};
+
+export type BackgroundAcceptanceResult = {
+  accepted: boolean;
+  valid: boolean;
+  invalidReasons: string[];
+  reasons: string[];
+  checks: BackgroundAcceptanceChecks;
+  evidence: ProductionBackgroundValidationEvidence;
+};
+
 export type ProductionValidOptionResult = {
   valid: boolean;
   isProductionValid: boolean;
@@ -339,11 +357,20 @@ export function formatProductionInvalidReason(reason: string): string {
   if (code === "background_text_detected") {
     return "Background contains text";
   }
+  if (code === "background_text_check_missing") {
+    return "Background text-free acceptance evidence is missing";
+  }
   if (code === "background_scaffold_like") {
     return "Background still looks scaffold-like";
   }
+  if (code === "background_scaffold_check_missing") {
+    return "Background scaffold rejection evidence is missing";
+  }
   if (code === "background_blank_or_motif_weak") {
     return "Background motif is too weak or blank-like";
+  }
+  if (code === "background_motif_check_missing") {
+    return "Background motif-presence evidence is missing";
   }
   if (code === "background_tone_fit_failed") {
     return "Background tone fit failed";
@@ -760,6 +787,75 @@ function inferBackgroundValidation(output: unknown): ProductionBackgroundValidat
   };
 }
 
+export function evaluateBackgroundAcceptance(params: {
+  evidence: ProductionBackgroundValidationEvidence;
+  backgroundFailureReason?: string | null;
+}): BackgroundAcceptanceResult {
+  const { evidence } = params;
+  const invalidReasons: string[] = [];
+  const backgroundFailureReason = params.backgroundFailureReason || null;
+
+  if (evidence.source === "fallback") {
+    addReason(invalidReasons, "background_not_canonical");
+  }
+  if (backgroundFailureReason) {
+    if (backgroundFailureReason === "ALL_TEXT") {
+      addReason(invalidReasons, "background_text_detected");
+    } else if (backgroundFailureReason === "ALL_SCAFFOLD") {
+      addReason(invalidReasons, "background_scaffold_like");
+    } else {
+      addReason(invalidReasons, `background_generation_failed:${backgroundFailureReason}`);
+    }
+  }
+
+  if (evidence.textFree === false) {
+    addReason(invalidReasons, "background_text_detected");
+  } else if (evidence.textFree !== true) {
+    addReason(invalidReasons, "background_text_check_missing");
+  }
+
+  if (evidence.scaffoldFree === false) {
+    addReason(invalidReasons, "background_scaffold_like");
+  } else if (evidence.scaffoldFree !== true) {
+    addReason(invalidReasons, "background_scaffold_check_missing");
+  }
+
+  if (evidence.motifPresent === false) {
+    addReason(invalidReasons, "background_blank_or_motif_weak");
+  } else if (evidence.motifPresent !== true) {
+    addReason(invalidReasons, "background_motif_check_missing");
+  }
+
+  if (evidence.toneFit === false) {
+    addReason(invalidReasons, "background_tone_fit_failed");
+  }
+  if (evidence.referenceFit === false) {
+    addReason(invalidReasons, "background_reference_fit_failed");
+  }
+  if (
+    evidence.source === "reused" &&
+    (evidence.textFree !== true || evidence.scaffoldFree !== true || evidence.motifPresent !== true)
+  ) {
+    addReason(invalidReasons, "background_reuse_unvalidated");
+  }
+
+  return {
+    accepted: invalidReasons.length === 0,
+    valid: invalidReasons.length === 0,
+    invalidReasons,
+    reasons: invalidReasons,
+    checks: {
+      sourceCanonical: evidence.source !== "fallback",
+      textFree: evidence.textFree,
+      scaffoldFree: evidence.scaffoldFree,
+      motifPresent: evidence.motifPresent,
+      toneFit: evidence.toneFit,
+      referenceFit: evidence.referenceFit
+    },
+    evidence
+  };
+}
+
 function readLockupRerankChecks(output: unknown): {
   textIntegrity: boolean | null;
   fitPass: boolean | null;
@@ -815,52 +911,16 @@ function inferLockupValidation(output: unknown): ProductionLockupValidationEvide
 
 function validateBackground(output: unknown): ComponentValidationResult<ProductionBackgroundValidationEvidence> {
   const evidence = inferBackgroundValidation(output);
-  const invalidReasons: string[] = [];
-  const backgroundFailureReason = readBackgroundFailureReason(output);
-
-  if (evidence.source === "fallback") {
-    addReason(invalidReasons, "background_not_canonical");
-  }
-  if (backgroundFailureReason) {
-    if (backgroundFailureReason === "ALL_TEXT") {
-      addReason(invalidReasons, "background_text_detected");
-    } else if (backgroundFailureReason === "ALL_SCAFFOLD") {
-      addReason(invalidReasons, "background_scaffold_like");
-    } else {
-      addReason(invalidReasons, `background_generation_failed:${backgroundFailureReason}`);
-    }
-  }
-  if (evidence.textFree === false) {
-    addReason(invalidReasons, "background_text_detected");
-  }
-  if (evidence.scaffoldFree === false) {
-    addReason(invalidReasons, "background_scaffold_like");
-  }
-  if (evidence.motifPresent === false) {
-    addReason(invalidReasons, "background_blank_or_motif_weak");
-  }
-  if (evidence.toneFit === false) {
-    addReason(invalidReasons, "background_tone_fit_failed");
-  }
-  if (evidence.referenceFit === false) {
-    addReason(invalidReasons, "background_reference_fit_failed");
-  }
-  if (
-    evidence.source === "reused" &&
-    evidence.textFree === null &&
-    evidence.scaffoldFree === null &&
-    evidence.motifPresent === null &&
-    evidence.toneFit === null &&
-    evidence.referenceFit === null
-  ) {
-    addReason(invalidReasons, "background_reuse_unvalidated");
-  }
+  const acceptance = evaluateBackgroundAcceptance({
+    evidence,
+    backgroundFailureReason: readBackgroundFailureReason(output)
+  });
 
   return {
     ...evidence,
-    valid: invalidReasons.length === 0,
-    invalidReasons,
-    reasons: invalidReasons
+    valid: acceptance.accepted,
+    invalidReasons: acceptance.invalidReasons,
+    reasons: acceptance.reasons
   };
 }
 

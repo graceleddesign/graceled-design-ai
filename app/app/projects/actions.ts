@@ -96,11 +96,13 @@ import {
 import {
   ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN,
   buildProductionBlockedMessage,
+  evaluateBackgroundAcceptance,
   isProductionValidOption,
   normalizeAssetPathForCompletenessCheck,
   readCanonicalDesignDocFromOutput,
   resolveProductionValidOption,
   resolveProductionValidOptionStatus,
+  type BackgroundAcceptanceResult,
   type GenerationAssetRecord,
   type ProductionBackgroundValidationEvidence,
   type ProductionLockupValidationEvidence,
@@ -3811,6 +3813,8 @@ type ReusableGenerationAssets = {
   styleBucket: StyleBucketKey | null;
   styleTone: StyleToneKey | null;
   styleMedium: StyleMediumKey | null;
+  backgroundAccepted: boolean;
+  lockupAccepted: boolean;
   backgroundValidation: ProductionBackgroundValidationEvidence | null;
   lockupValidation: ProductionLockupValidationEvidence | null;
 };
@@ -3873,9 +3877,6 @@ async function loadReusableAssetsFromGeneration(params: {
     dbStatus: generation.status,
     assets: generation.assets
   });
-  if (!sourceValidation.valid) {
-    return null;
-  }
 
   const backgroundPath =
     pickAssetPathBySlots(generation.assets, ["wide_bg", "widescreen_bg", "square_bg", "tall_bg", "vertical_bg"], [
@@ -3919,6 +3920,8 @@ async function loadReusableAssetsFromGeneration(params: {
     styleBucket: readStyleBucketFromGenerationOutput(generation.output),
     styleTone: readStyleToneFromGenerationOutput(generation.output),
     styleMedium: readStyleMediumFromGenerationOutput(generation.output),
+    backgroundAccepted: sourceValidation.background.valid,
+    lockupAccepted: sourceValidation.lockup.valid,
     backgroundValidation: {
       source: sourceValidation.background.source,
       sourceGenerationId: generation.id,
@@ -3996,7 +3999,7 @@ function readSelectedBackgroundChecks(
       scaffoldFree: winner.checks.scaffoldOk,
       motifPresent: winner.checks.motifOk,
       toneFit: winner.checks.toneOk,
-      referenceFit: null
+      referenceFit: winner.checks.referenceOk ?? null
     };
   }
 
@@ -4006,6 +4009,91 @@ function readSelectedBackgroundChecks(
     motifPresent: null,
     toneFit: null,
     referenceFit: null
+  };
+}
+
+function buildBackgroundAttemptFailureReason(invalidReasons: string[]): BackgroundAttemptFailureReason {
+  if (invalidReasons.includes("background_text_detected")) {
+    return "ALL_TEXT";
+  }
+  if (
+    invalidReasons.includes("background_scaffold_like") ||
+    invalidReasons.includes("background_blank_or_motif_weak")
+  ) {
+    return "ALL_SCAFFOLD";
+  }
+  return "UNKNOWN";
+}
+
+async function evaluateBackgroundAttempt(params: {
+  attempt: {
+    backgroundPng: Buffer;
+    textCheckPassed: boolean;
+    toneCheck: ToneCheckSummary | null;
+  };
+  titleSafeBox: TitleSafeBox;
+  toneTarget: "light" | "vivid" | "dark" | "mono" | null;
+  referenceCluster?: ReferenceCluster | null;
+  source: DebugAssetSource;
+  sourceGenerationId: string | null;
+}): Promise<BackgroundAttemptEvaluation> {
+  const toneStats =
+    params.attempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(params.attempt.backgroundPng));
+  const tonePass = params.toneTarget
+    ? toneStats
+      ? evaluateToneCompliance(params.toneTarget, toneStats).passed
+      : false
+    : true;
+  const textArtifactDetected = await detectTextArtifactsHeuristic(params.attempt.backgroundPng);
+  const textFree = params.attempt.textCheckPassed && !textArtifactDetected;
+  const designPresencePass = passesDesignPresence(toneStats);
+  const hardFail = await computeBackgroundHardFailStatsFromBuffer(
+    params.attempt.backgroundPng,
+    params.titleSafeBox,
+    params.referenceCluster || null
+  );
+  const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
+  const focalMotifPresent = hardFail?.focalMotifPresent === true;
+  const frameScaffoldTriggered =
+    hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
+  const hardFailScaffold = frameScaffoldTriggered;
+  const hardFailBlankDesign = !hardFail || !hardFail.passes;
+  const scaffoldOk = designPresencePass && meaningfulStructurePass && !hardFailScaffold && !hardFailBlankDesign;
+  const evidence: ProductionBackgroundValidationEvidence = {
+    source: params.source,
+    sourceGenerationId: params.sourceGenerationId,
+    textFree,
+    scaffoldFree: scaffoldOk,
+    motifPresent: focalMotifPresent,
+    toneFit: params.toneTarget ? tonePass : null,
+    referenceFit: null
+  };
+
+  return {
+    evidence,
+    acceptance: evaluateBackgroundAcceptance({
+      evidence
+    }),
+    textArtifactDetected,
+    checks: {
+      textFree,
+      tonePass,
+      designPresencePass,
+      meaningfulStructurePass,
+      focalMotifPresent,
+      frameScaffoldTriggered,
+      hardFailScaffold,
+      hardFailBlankDesign
+    },
+    stats: {
+      tone: toneStats,
+      titleSafe: await scoreTitleSafeRegion(
+        pngBufferToDataUrl(params.attempt.backgroundPng),
+        params.titleSafeBox
+      ),
+      midtoneRange: await scoreMidtoneRangeFromBuffer(params.attempt.backgroundPng),
+      hardFail
+    }
   };
 }
 
@@ -5895,6 +5983,28 @@ type ImageCallDebugSummary = {
   retries: number;
 };
 
+type BackgroundAttemptEvaluation = {
+  evidence: ProductionBackgroundValidationEvidence;
+  acceptance: BackgroundAcceptanceResult;
+  textArtifactDetected: boolean;
+  checks: {
+    textFree: boolean;
+    tonePass: boolean;
+    designPresencePass: boolean;
+    meaningfulStructurePass: boolean;
+    focalMotifPresent: boolean;
+    frameScaffoldTriggered: boolean;
+    hardFailScaffold: boolean;
+    hardFailBlankDesign: boolean;
+  };
+  stats: {
+    tone: ImageToneStats | null;
+    titleSafe: Awaited<ReturnType<typeof scoreTitleSafeRegion>>;
+    midtoneRange: Awaited<ReturnType<typeof scoreMidtoneRangeFromBuffer>>;
+    hardFail: Awaited<ReturnType<typeof computeBackgroundHardFailStatsFromBuffer>>;
+  };
+};
+
 class Round1ImageCallCapReachedError extends Error {
   constructor() {
     super("ROUND1_IMAGE_CALL_CAP_REACHED");
@@ -5913,7 +6023,8 @@ type BackgroundAttemptCandidateDebug = {
     textOk: boolean;
     scaffoldOk: boolean;
     motifOk: boolean;
-    toneOk: boolean;
+    toneOk: boolean | null;
+    referenceOk?: boolean | null;
   };
   scores: {
     total: number;
@@ -7819,6 +7930,7 @@ async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
   output: GenerationOutputPayload;
+  backgroundValidation?: ProductionBackgroundValidationEvidence | null;
   failureReason?: BackgroundAttemptFailureReason;
 }): Promise<GenerationOptionStatus> {
   const designDocByShape = params.output.designDocByShape;
@@ -7887,13 +7999,16 @@ async function completeGenerationWithFallbackOutput(params: {
       productionValidation: {
         version: 1,
         background: {
+          ...(params.backgroundValidation || {
+            sourceGenerationId: null,
+            textFree: null,
+            scaffoldFree: null,
+            motifPresent: null,
+            toneFit: null,
+            referenceFit: null
+          }),
           source: "fallback",
-          sourceGenerationId: null,
-          textFree: false,
-          scaffoldFree: false,
-          motifPresent: null,
-          toneFit: null,
-          referenceFit: null
+          sourceGenerationId: params.backgroundValidation?.sourceGenerationId || null
         },
         lockup: {
           source: "fallback",
@@ -8386,8 +8501,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         reusableAssets = reusableAssetsByGenerationId.get(feedbackControls.chosenGenerationId) || null;
       }
       const shouldReuseBackground =
-        feedbackControls.regenerateBackground === false && Boolean(reusableAssets?.masterBackgroundPng);
-      const shouldReuseLockup = feedbackControls.regenerateLockup === false && Boolean(reusableAssets?.lockupPng);
+        feedbackControls.regenerateBackground === false &&
+        reusableAssets?.backgroundAccepted === true &&
+        Boolean(reusableAssets?.masterBackgroundPng);
+      const shouldReuseLockup =
+        feedbackControls.regenerateLockup === false &&
+        reusableAssets?.lockupAccepted === true &&
+        Boolean(reusableAssets?.lockupPng);
       const backgroundSourceForSuccess: DebugAssetSource = shouldReuseBackground ? "reused" : "generated";
       const lockupSourceForSuccess: DebugAssetSource = shouldReuseLockup ? "reused" : "generated";
       const initialDirectionStyleFields = resolveDirectionStyleFields(directionSpec);
@@ -8762,6 +8882,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               winnerIndex: 0,
               failureReason: null
             } as BackgroundAttemptDebug,
+            backgroundValidation: null as ProductionBackgroundValidationEvidence | null,
             failureReason: null as BackgroundAttemptFailureReason | null,
             textScrub: attempt.textScrubDebug || null,
             winnerDirectionSpec:
@@ -8802,22 +8923,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           frameScaffoldPenalty: number;
           score: number;
           textScrub: TextScrubDebug | null;
-          checks: {
-            textFree: boolean;
-            tonePass: boolean;
-            designPresencePass: boolean;
-            meaningfulStructurePass: boolean;
-            focalMotifPresent: boolean;
-            frameScaffoldTriggered: boolean;
-            hardFailScaffold: boolean;
-            hardFailBlankDesign: boolean;
-          };
-          stats: {
-            tone: ImageToneStats | null;
-            titleSafe: Awaited<ReturnType<typeof scoreTitleSafeRegion>>;
-            midtoneRange: Awaited<ReturnType<typeof scoreMidtoneRangeFromBuffer>>;
-            hardFail: Awaited<ReturnType<typeof computeBackgroundHardFailStatsFromBuffer>>;
-          };
+          evaluation: BackgroundAttemptEvaluation;
           debugUrl: string;
         }>;
         const evaluateCandidate = async (
@@ -8826,57 +8932,38 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           candidateTitleSafeBox: TitleSafeBox,
           candidateVariationTemplateKey: string | null
         ) => {
-          const toneStats =
-            candidateAttempt.toneCheck?.statsAfter || (await computeImageToneStatsFromBuffer(candidateAttempt.backgroundPng));
-          const tonePass = toneTargetForCompliance
-            ? toneStats
-              ? evaluateToneCompliance(toneTargetForCompliance, toneStats).passed
-              : false
-            : true;
-          const textArtifactDetected = await detectTextArtifactsHeuristic(candidateAttempt.backgroundPng);
-          const textFree = candidateAttempt.textCheckPassed;
-          const designPresencePass = passesDesignPresence(toneStats);
-          const hardFail = await computeBackgroundHardFailStatsFromBuffer(
-            candidateAttempt.backgroundPng,
-            candidateTitleSafeBox,
-            candidateDirectionSpec?.referenceCluster || null
-          );
-          const meaningfulStructurePass = hardFail?.meaningfulStructurePass === true;
-          const focalMotifPresent = hardFail?.focalMotifPresent === true;
-          const meaningfulStructureScore = Math.max(0, hardFail?.meaningfulStructureScore || 0);
-          const frameScaffoldTriggered =
-            hardFail?.mostEdgesAreLongStraightBorders === true && hardFail?.nonTitleLowDetail === true;
-          const hardFailScaffold = frameScaffoldTriggered;
-          const frameScaffoldPenalty = frameScaffoldTriggered
+          const evaluation = await evaluateBackgroundAttempt({
+            attempt: candidateAttempt,
+            titleSafeBox: candidateTitleSafeBox,
+            toneTarget: toneTargetForCompliance,
+            referenceCluster: candidateDirectionSpec?.referenceCluster || null,
+            source: "generated",
+            sourceGenerationId: null
+          });
+          const meaningfulStructureScore = Math.max(0, evaluation.stats.hardFail?.meaningfulStructureScore || 0);
+          const frameScaffoldPenalty = evaluation.checks.frameScaffoldTriggered
             ? ROUND1_RERANK_FRAME_SCAFFOLD_HEAVY_PENALTY
-            : hardFail?.mostEdgesAreLongStraightBorders
+            : evaluation.stats.hardFail?.mostEdgesAreLongStraightBorders
               ? ROUND1_RERANK_FRAME_SCAFFOLD_LIGHT_PENALTY
               : 0;
-          const hardFailBlankDesign = !hardFail || !hardFail.passes;
-          const scaffoldOk = designPresencePass && meaningfulStructurePass && !hardFailScaffold && !hardFailBlankDesign;
-          const titleSafe = await scoreTitleSafeRegion(
-            pngBufferToDataUrl(candidateAttempt.backgroundPng),
-            candidateTitleSafeBox
-          );
-          const midtoneRange = await scoreMidtoneRangeFromBuffer(candidateAttempt.backgroundPng);
           let score = 0;
-          score += tonePass ? ROUND1_RERANK_TONE_PASS_BONUS : 0;
-          score += textFree ? 140 : -140;
-          score += designPresencePass ? 90 : -90;
-          score += meaningfulStructurePass
+          score += evaluation.checks.tonePass ? ROUND1_RERANK_TONE_PASS_BONUS : 0;
+          score += evaluation.evidence.textFree === true ? 140 : -140;
+          score += evaluation.checks.designPresencePass ? 90 : -90;
+          score += evaluation.checks.meaningfulStructurePass
             ? ROUND1_RERANK_MEANINGFUL_STRUCTURE_PASS_BONUS
             : -ROUND1_RERANK_MEANINGFUL_STRUCTURE_FAIL_PENALTY;
-          score += focalMotifPresent ? 120 : 0;
+          score += evaluation.evidence.motifPresent === true ? 120 : 0;
           score += meaningfulStructureScore * ROUND1_RERANK_MEANINGFUL_STRUCTURE_SCORE_WEIGHT;
-          score += hardFailBlankDesign ? -240 : 120;
-          score += (titleSafe?.score || 0) * ROUND1_RERANK_TITLE_SAFE_WEIGHT;
-          score += (midtoneRange?.score || 0) * ROUND1_RERANK_MIDTONE_RANGE_WEIGHT;
-          score -= scaffoldOk ? 0 : ROUND1_RERANK_SCAFFOLD_FAIL_PENALTY;
-          score -= focalMotifPresent ? 0 : ROUND1_RERANK_MOTIF_FAIL_PENALTY;
-          score -= tonePass ? 0 : ROUND1_RERANK_TONE_FAIL_PENALTY;
+          score += evaluation.checks.hardFailBlankDesign ? -240 : 120;
+          score += (evaluation.stats.titleSafe?.score || 0) * ROUND1_RERANK_TITLE_SAFE_WEIGHT;
+          score += (evaluation.stats.midtoneRange?.score || 0) * ROUND1_RERANK_MIDTONE_RANGE_WEIGHT;
+          score -= evaluation.evidence.scaffoldFree === true ? 0 : ROUND1_RERANK_SCAFFOLD_FAIL_PENALTY;
+          score -= evaluation.evidence.motifPresent === true ? 0 : ROUND1_RERANK_MOTIF_FAIL_PENALTY;
+          score -= evaluation.checks.tonePass ? 0 : ROUND1_RERANK_TONE_FAIL_PENALTY;
           score -= candidateAttempt.textRetryCount * 2;
           score -= candidateAttempt.textArtifactRetryCount * 4;
-          score -= textArtifactDetected ? 42 : 0;
+          score -= evaluation.textArtifactDetected ? 42 : 0;
           score -= frameScaffoldPenalty;
           const layoutDiversityPenalty = layoutDiversityPenaltyForTemplate(
             plannedGeneration.round,
@@ -8888,22 +8975,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             score,
             layoutDiversityPenalty,
             frameScaffoldPenalty,
-            checks: {
-              textFree,
-              tonePass,
-              designPresencePass,
-              meaningfulStructurePass,
-              focalMotifPresent,
-              frameScaffoldTriggered,
-              hardFailScaffold,
-              hardFailBlankDesign
-            },
-            stats: {
-              tone: toneStats,
-              titleSafe,
-              midtoneRange,
-              hardFail
-            }
+            evaluation
           };
         };
         for (let candidateIndex = 0; candidateIndex < backgroundCandidateCount; candidateIndex += 1) {
@@ -8932,13 +9004,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           );
           let textScrub: TextScrubDebug | null = null;
           const failsOnlyText =
-            !evaluation.checks.textFree &&
-            evaluation.checks.tonePass &&
-            evaluation.checks.designPresencePass &&
-            evaluation.checks.meaningfulStructurePass &&
-            evaluation.checks.focalMotifPresent &&
-            !evaluation.checks.hardFailScaffold &&
-            !evaluation.checks.hardFailBlankDesign;
+            evaluation.evaluation.acceptance.invalidReasons.length > 0 &&
+            evaluation.evaluation.acceptance.invalidReasons.every((reason) => reason === "background_text_detected");
 
           if (failsOnlyText) {
             const scrubResult = await runLocalTextScrubPass(attempt.backgroundPng);
@@ -8987,8 +9054,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             frameScaffoldPenalty: evaluation.frameScaffoldPenalty,
             score: evaluation.score,
             textScrub,
-            checks: evaluation.checks,
-            stats: evaluation.stats,
+            evaluation: evaluation.evaluation,
             debugUrl
           });
         }
@@ -8997,21 +9063,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         }
 
         const indexedCandidates = candidates.map((candidate, index) => ({ candidate, index }));
-        const eligible = indexedCandidates.filter((entry) => entry.candidate.checks.textFree);
+        const eligible = indexedCandidates.filter((entry) => entry.candidate.evaluation.acceptance.accepted);
         const winner = eligible.length > 0
           ? eligible.reduce((best, current) => (current.candidate.score > best.candidate.score ? current : best), eligible[0])
           : null;
+        const bestCandidate = indexedCandidates.reduce(
+          (best, current) => (current.candidate.score > best.candidate.score ? current : best),
+          indexedCandidates[0]
+        );
         const bestScore = winner?.candidate.score ?? Number.NEGATIVE_INFINITY;
-        const hardFailReadableText = eligible.length <= 0;
+        const hardFailReadableText =
+          indexedCandidates.length > 0 &&
+          indexedCandidates.every((entry) =>
+            entry.candidate.evaluation.acceptance.invalidReasons.includes("background_text_detected")
+          );
         const eligiblePoolEmpty = eligible.length <= 0;
-        const laneFailed = hardFailReadableText;
+        const laneFailed = eligiblePoolEmpty;
         const failureReason: BackgroundAttemptFailureReason | null = winner
           ? null
-          : hardFailReadableText
-            ? "ALL_TEXT"
-            : eligiblePoolEmpty
-              ? "UNKNOWN"
-              : null;
+          : buildBackgroundAttemptFailureReason(bestCandidate.candidate.evaluation.acceptance.invalidReasons);
         const attemptDebug: BackgroundAttemptDebug = {
           attemptIndex: params.attemptNumber,
           styleFamily: styleFields.styleFamily,
@@ -9019,11 +9089,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             visualAnchorSrc: attemptVisualAnchorSrc
           },
           candidates: candidates.map((candidate) => {
-            const scaffoldOk =
-              candidate.checks.designPresencePass &&
-              candidate.checks.meaningfulStructurePass &&
-              !candidate.checks.hardFailScaffold &&
-              !candidate.checks.hardFailBlankDesign;
             return {
               url: candidate.debugUrl,
               ...(candidate.textScrub
@@ -9032,18 +9097,19 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                   }
                 : {}),
               checks: {
-                textOk: candidate.checks.textFree,
-                scaffoldOk,
-                motifOk: candidate.checks.focalMotifPresent,
-                toneOk: candidate.checks.tonePass
+                textOk: candidate.evaluation.evidence.textFree === true,
+                scaffoldOk: candidate.evaluation.evidence.scaffoldFree === true,
+                motifOk: candidate.evaluation.evidence.motifPresent === true,
+                toneOk: candidate.evaluation.evidence.toneFit,
+                referenceOk: candidate.evaluation.evidence.referenceFit
               },
               scores: {
                 total: candidate.score,
                 layoutDiversityPenalty: candidate.layoutDiversityPenalty,
                 frameScaffoldPenalty: candidate.frameScaffoldPenalty,
-                meaningfulStructure: Math.max(0, candidate.stats.hardFail?.meaningfulStructureScore || 0),
-                titleSafe: candidate.stats.titleSafe?.score || 0,
-                midtoneRange: candidate.stats.midtoneRange?.score || 0
+                meaningfulStructure: Math.max(0, candidate.evaluation.stats.hardFail?.meaningfulStructureScore || 0),
+                titleSafe: candidate.evaluation.stats.titleSafe?.score || 0,
+                midtoneRange: candidate.evaluation.stats.midtoneRange?.score || 0
               }
             };
           }),
@@ -9052,8 +9118,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         };
 
         return {
-          attempt: winner?.candidate.attempt || eligible[0]?.candidate.attempt || candidates[0].attempt,
-          winnerIndex: winner?.index || 0,
+          attempt: winner?.candidate.attempt || bestCandidate.candidate.attempt,
+          winnerIndex: winner ? winner.index : null,
           bestScore,
           laneFailed,
           hardFailReadableText,
@@ -9073,15 +9139,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                   textScrub: candidate.textScrub
                 }
               : {}),
-            checks: candidate.checks,
+            checks: candidate.evaluation.checks,
             stats: {
               textRetryCount: candidate.attempt.textRetryCount,
               toneRetryCount: candidate.attempt.toneRetryCount,
               closestDistance: candidate.attempt.closestDistance,
-              tone: candidate.stats.tone,
-              titleSafe: candidate.stats.titleSafe,
-              midtoneRange: candidate.stats.midtoneRange,
-              hardFail: candidate.stats.hardFail
+              tone: candidate.evaluation.stats.tone,
+              titleSafe: candidate.evaluation.stats.titleSafe,
+              midtoneRange: candidate.evaluation.stats.midtoneRange,
+              hardFail: candidate.evaluation.stats.hardFail
             }
           })),
           winner: winner
@@ -9097,6 +9163,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               }
             : null,
           attemptDebug,
+          backgroundValidation: winner?.candidate.evaluation.evidence || bestCandidate.candidate.evaluation.evidence,
           failureReason,
           textScrub: winner
             ? winner.candidate.textScrub || null
@@ -9111,16 +9178,94 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
       const selectBackgroundWinner = async (originalityBoost?: string) => {
         if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
+          const activeDirectionSpec = backgroundDirectionSpec;
           const attempt = await renderMasterAttempt({ originalityBoost });
-          return {
+          if (shouldReuseBackground) {
+            const reusableValidation =
+              reusableAssets?.backgroundValidation
+                ? {
+                    ...reusableAssets.backgroundValidation,
+                    source: "reused" as const,
+                    sourceGenerationId: reusableAssets.sourceGenerationId
+                  }
+                : {
+                    source: "reused" as const,
+                    sourceGenerationId: reusableAssets?.sourceGenerationId || null,
+                    textFree: null,
+                    scaffoldFree: null,
+                    motifPresent: null,
+                    toneFit: null,
+                    referenceFit: null
+                  };
+            const acceptance = evaluateBackgroundAcceptance({
+              evidence: reusableValidation
+            });
+            return {
+              attempt: acceptance.accepted ? attempt : null,
+              winnerIndex: acceptance.accepted ? 0 : null,
+              laneFailed: !acceptance.accepted,
+              eligiblePoolEmpty: !acceptance.accepted,
+              winnerDirectionSpec: activeDirectionSpec,
+              backgroundAttempts: [] as BackgroundAttemptDebug[],
+              backgroundValidation: reusableValidation,
+              textScrub: attempt.textScrubDebug || null,
+              fallbackFailureReason: acceptance.accepted
+                ? (null as BackgroundAttemptFailureReason | null)
+                : buildBackgroundAttemptFailureReason(acceptance.invalidReasons)
+            };
+          }
+
+          const attemptEvaluation = await evaluateBackgroundAttempt({
             attempt,
-            winnerIndex: 0,
-            laneFailed: false,
-            eligiblePoolEmpty: false,
-            winnerDirectionSpec: backgroundDirectionSpec,
-            backgroundAttempts: [] as BackgroundAttemptDebug[],
+            titleSafeBox: titleSafeBoxForDirection(activeDirectionSpec),
+            toneTarget: resolveToneTargetFromDirectionSpec(activeDirectionSpec),
+            referenceCluster: activeDirectionSpec?.referenceCluster || null,
+            source: "generated",
+            sourceGenerationId: null
+          });
+          const attemptDebug: BackgroundAttemptDebug = {
+            attemptIndex: 1,
+            styleFamily: resolveDirectionStyleFields(activeDirectionSpec).styleFamily,
+            anchorUsed: {
+              visualAnchorSrc: null
+            },
+            candidates: [
+              {
+                url: "",
+                checks: {
+                  textOk: attemptEvaluation.evidence.textFree === true,
+                  scaffoldOk: attemptEvaluation.evidence.scaffoldFree === true,
+                  motifOk: attemptEvaluation.evidence.motifPresent === true,
+                  toneOk: attemptEvaluation.evidence.toneFit,
+                  referenceOk: attemptEvaluation.evidence.referenceFit
+                },
+                scores: {
+                  total: 0,
+                  layoutDiversityPenalty: 0,
+                  frameScaffoldPenalty: 0,
+                  meaningfulStructure: Math.max(0, attemptEvaluation.stats.hardFail?.meaningfulStructureScore || 0),
+                  titleSafe: attemptEvaluation.stats.titleSafe?.score || 0,
+                  midtoneRange: attemptEvaluation.stats.midtoneRange?.score || 0
+                }
+              }
+            ],
+            winnerIndex: attemptEvaluation.acceptance.accepted ? 0 : null,
+            failureReason: attemptEvaluation.acceptance.accepted
+              ? null
+              : buildBackgroundAttemptFailureReason(attemptEvaluation.acceptance.invalidReasons)
+          };
+          return {
+            attempt: attemptEvaluation.acceptance.accepted ? attempt : null,
+            winnerIndex: attemptEvaluation.acceptance.accepted ? 0 : null,
+            laneFailed: !attemptEvaluation.acceptance.accepted,
+            eligiblePoolEmpty: !attemptEvaluation.acceptance.accepted,
+            winnerDirectionSpec: activeDirectionSpec,
+            backgroundAttempts: [attemptDebug],
+            backgroundValidation: attemptEvaluation.evidence,
             textScrub: attempt.textScrubDebug || null,
-            fallbackFailureReason: null as BackgroundAttemptFailureReason | null
+            fallbackFailureReason: attemptEvaluation.acceptance.accepted
+              ? (null as BackgroundAttemptFailureReason | null)
+              : buildBackgroundAttemptFailureReason(attemptEvaluation.acceptance.invalidReasons)
           };
         }
 
@@ -9215,6 +9360,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             eligiblePoolEmpty: true,
             winnerDirectionSpec: activeDirectionSpec,
             backgroundAttempts,
+            backgroundValidation: null as ProductionBackgroundValidationEvidence | null,
             textScrub: null as TextScrubDebug | null,
             fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
           };
@@ -9254,6 +9400,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               eligiblePoolEmpty: true,
               winnerDirectionSpec: activeDirectionSpec,
               backgroundAttempts,
+              backgroundValidation: latestSelection?.backgroundValidation || null,
               textScrub: latestSelection?.textScrub || null,
               fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
             };
@@ -9282,6 +9429,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             eligiblePoolEmpty: true,
             winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec,
             backgroundAttempts,
+            backgroundValidation: finalSelection.backgroundValidation,
             textScrub: finalSelection.textScrub || null,
             fallbackFailureReason: finalFailureReason || "UNKNOWN"
           };
@@ -9302,6 +9450,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           laneFailed: finalSelection.laneFailed,
           winnerDirectionSpec: finalSelection.winnerDirectionSpec || activeDirectionSpec,
           backgroundAttempts,
+          backgroundValidation: finalSelection.backgroundValidation,
           textScrub: finalSelection.textScrub || finalSelection.attempt.textScrubDebug || null,
           fallbackFailureReason: null as BackgroundAttemptFailureReason | null
         };
@@ -9310,6 +9459,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const completeWithBackgroundFallback = async (fallbackParams: {
         failureReason: BackgroundAttemptFailureReason;
         backgroundAttempts: BackgroundAttemptDebug[];
+        backgroundValidation?: ProductionBackgroundValidationEvidence | null;
         textScrub?: TextScrubDebug | null;
       }): Promise<{ optionStatus: GenerationOptionStatus; failureReason: BackgroundAttemptFailureReason }> => {
         const resolvedFailureReason: BackgroundAttemptFailureReason = imageCallCapReached
@@ -9352,6 +9502,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           projectId: params.project.id,
           generationId: plannedGeneration.id,
           output: fallbackOutput,
+          backgroundValidation: fallbackParams.backgroundValidation || null,
           failureReason: resolvedFailureReason
         });
         return {
@@ -9366,6 +9517,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const fallbackResult = await completeWithBackgroundFallback({
           failureReason: initialMasterSelection.fallbackFailureReason || "UNKNOWN",
           backgroundAttempts: initialMasterSelection.backgroundAttempts,
+          backgroundValidation: initialMasterSelection.backgroundValidation || null,
           textScrub: initialMasterSelection.textScrub || null
         });
         return {
@@ -9387,6 +9539,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const fallbackResult = await completeWithBackgroundFallback({
             failureReason: originalityMasterSelection.fallbackFailureReason || "UNKNOWN",
             backgroundAttempts: originalityMasterSelection.backgroundAttempts,
+            backgroundValidation: originalityMasterSelection.backgroundValidation || null,
             textScrub: originalityMasterSelection.textScrub || selectedBackgroundTextScrub
           });
           return {
