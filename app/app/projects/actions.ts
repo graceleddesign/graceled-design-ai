@@ -42,6 +42,16 @@ import { buildFinalSvg } from "@/lib/final-deliverables";
 import { resizeCoverWithFocalPoint, type FocalPoint } from "@/lib/image-cover";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
 import { isOpenAiRateLimitError } from "@/lib/gptImageRateLimit";
+import {
+  type GenerationFailureReason,
+  type GenerationLifecycleState,
+  type GenerationOptionStatus,
+  type GenerationRoundFailureReason,
+  type GenerationRoundStatus,
+  type ProviderFailureReason,
+  isProviderFailureReason
+} from "@/lib/generation-state";
+import { preflightImageProvider, resolveImageProviderConfig, type ImageProviderPreflightResult } from "@/lib/image-provider";
 import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
 import { generatePngFromPrompt } from "@/lib/openai-image";
 import { openai } from "@/lib/openai";
@@ -168,6 +178,7 @@ const generateRoundTwoSchema = z.object({
 });
 const ROUND_OPTION_COUNT = 3;
 const ROUND1_NON_FALLBACK_MAX_ATTEMPTS = 8;
+const FINALIST_ASPECT_RECOVERY_LIMIT = 2;
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
 type FinalAssetSlot = "square" | "wide" | "tall";
 type LegacyPreviewAssetSlot = "square_main" | "wide_main" | "tall_main" | "widescreen_main" | "vertical_main";
@@ -4282,6 +4293,45 @@ function withOutputStatus(output: GenerationOutputPayload, status: GenerationOpt
   };
 }
 
+function readProviderFailureReasonFromError(error: unknown): ProviderFailureReason | null {
+  if (!error || typeof error !== "object" || !("failureReason" in error)) {
+    return null;
+  }
+
+  const failureReason = (error as { failureReason?: unknown }).failureReason;
+  return isProviderFailureReason(failureReason) ? failureReason : null;
+}
+
+function resolveGenerationLifecycleStateForFailure(reason: BackgroundAttemptFailureReason | null | undefined): GenerationLifecycleState {
+  return isProviderFailureReason(reason) ? "GENERATION_FAILED_PROVIDER" : "GENERATION_FAILED_CREATIVE";
+}
+
+function resolveBackgroundAttemptFailureReason(error: unknown, imageCallCapReached = false): BackgroundAttemptFailureReason {
+  if (imageCallCapReached) {
+    return "BUDGET";
+  }
+
+  return readProviderFailureReasonFromError(error) || (isOpenAiRateLimitError(error) ? "PROVIDER_QUOTA_OR_RATE_LIMIT" : "UNKNOWN");
+}
+
+function buildImageProviderDebugMeta(preflight?: ImageProviderPreflightResult | null): NonNullable<GenerationOutputPayload["meta"]["debug"]>["imageProvider"] {
+  const config = resolveImageProviderConfig();
+
+  return {
+    provider: config.provider,
+    model: config.model,
+    providerPath: config.providerPath,
+    usingDefaultModel: config.usingDefaultModel,
+    ...(preflight
+      ? {
+          preflightCheckedAt: preflight.checkedAt,
+          preflightOk: preflight.ok,
+          preflightFailureReason: preflight.failureReason
+        }
+      : {})
+  };
+}
+
 function readMotifFocusFromGenerationOutput(output: unknown): string[] {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
     return [];
@@ -5969,24 +6019,32 @@ type BackgroundRerankFallbackDebug = {
 };
 
 type DebugAssetSource = "generated" | "reused" | "fallback";
-type BackgroundAttemptFailureReason =
-  | "ALL_TEXT"
-  | "ALL_SCAFFOLD"
-  | "API_ERROR"
-  | "RATE_LIMIT"
-  | "BUDGET"
-  | "MISSING_ASPECT_ASSET"
-  | "UNKNOWN";
+type BackgroundAttemptFailureReason = GenerationFailureReason;
 type ImageCallStage = "background" | "lockup";
 type ImageCallAspect = "wide" | "square" | "vertical";
-type GenerationOptionStatus = "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
-type GenerationRoundStatus = "COMPLETED" | "PARTIAL" | "FAILED";
-type GenerationRoundFailureReason = "INSUFFICIENT_NONFALLBACK_OPTIONS" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN";
 type AspectAssetStatus = "ok" | "missing" | "placeholder";
 type AspectAssetStatusByOutputAspect = {
   widescreen: AspectAssetStatus;
   square: AspectAssetStatus;
   vertical: AspectAssetStatus;
+};
+
+type FinalistCanonicalizationShapePaths = {
+  backgroundPath: string | null;
+  finalPath: string | null;
+  designDoc: DesignDoc;
+};
+
+type FinalistCanonicalizationResult = {
+  byShape: Record<PreviewShape, FinalistCanonicalizationShapePaths>;
+  aspectAssets: AspectAssetStatusByOutputAspect;
+  completionEligible: boolean;
+  finalistCanonicalizationAttempted: boolean;
+  finalistCanonicalizationSucceeded: boolean;
+  aspectRecoveryAttemptsByShape: Record<PreviewShape, number>;
+  aspectRecoveryReasonsByShape: Record<PreviewShape, string[]>;
+  canonicalAssetPathsByShape: Record<PreviewShape, string | null>;
+  canonicalizationFailureReasons: string[];
 };
 
 type TextScrubDebug = {
@@ -6134,12 +6192,29 @@ type GenerationOutputPayload = {
       imageCalls?: ImageCallDebugSummary;
       rateLimitWaitMs?: number;
       aspectAssets?: AspectAssetStatusByOutputAspect;
+      finalistCanonicalizationAttempted?: boolean;
+      finalistCanonicalizationSucceeded?: boolean;
+      aspectRecoveryAttemptsByShape?: Record<PreviewShape, number>;
+      aspectRecoveryReasonsByShape?: Record<PreviewShape, string[]>;
+      canonicalAssetPathsByShape?: Record<PreviewShape, string | null>;
+      canonicalizationFailureReasons?: string[];
       roundHasFallback?: boolean;
       roundStatus?: GenerationRoundStatus;
       roundCompletedCount?: number;
       roundAttemptCount?: number;
       roundRequiredCompletedCount?: number;
       roundFailureReason?: GenerationRoundFailureReason | null;
+      roundOperationalFailureReason?: ProviderFailureReason | null;
+      generationLifecycleState?: GenerationLifecycleState;
+      imageProvider?: {
+        provider: "openai";
+        model: string;
+        providerPath: string;
+        usingDefaultModel: boolean;
+        preflightCheckedAt?: string;
+        preflightOk?: boolean;
+        preflightFailureReason?: ProviderFailureReason | null;
+      };
       fallbackPreview?: {
         square: string;
         wide: string;
@@ -7689,10 +7764,8 @@ async function generateCleanMinimalBackgroundPng(params: {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
-      const quotaLikeError = /\binsufficient[_-]?quota\b|\bquota\b/i.test(message);
       if (
-        isOpenAiRateLimitError(error) ||
-        (params.disablePromptOnlyFallbackForRateLimit && quotaLikeError) ||
+        isProviderFailureReason(readProviderFailureReasonFromError(error)) ||
         isRound1ImageCallCapReachedError(error)
       ) {
         throw error;
@@ -7958,12 +8031,215 @@ async function evaluateAspectAssetsForCompletion(params: {
   return byOutputAspect;
 }
 
+function formatCanonicalizationStatusReason(shape: PreviewShape, status: AspectAssetStatus, attemptLabel: string): string {
+  const shapeLabel = shape === "wide" ? "wide" : shape;
+  if (status === "missing") {
+    return `${shapeLabel} canonical asset missing after ${attemptLabel}`;
+  }
+  if (status === "placeholder") {
+    return `${shapeLabel} canonical asset was placeholder-like after ${attemptLabel}`;
+  }
+  return `${shapeLabel} canonical asset status=${status} after ${attemptLabel}`;
+}
+
+async function ensureCanonicalFinalistOutputs(params: {
+  generationId: string;
+  optionIndex: number;
+  optionStyleFamily: StyleFamily;
+  templateBrief: TemplateBrief;
+  content: ReturnType<typeof buildOverlayDisplayContent>;
+  lockupRecipe: LockupRecipe | undefined;
+  lockupPresetId: string;
+  fontSeed: string;
+  lockupIntegrationMode: LockupIntegrationMode;
+  directionSpec: PlannedDirectionSpec | null;
+  masterBackgroundPng: Buffer;
+  lockupPng: Buffer;
+  resolvedLockupPalette: ResolvedLockupPalette;
+}): Promise<FinalistCanonicalizationResult> {
+  const createFallbackDesignDoc = (shape: PreviewShape): DesignDoc =>
+    renderTemplate(params.optionStyleFamily, params.templateBrief, params.optionIndex, shape, {
+      backgroundImagePath: null,
+      textPalette: DEFAULT_FALLBACK_TEXT_PALETTE
+    });
+
+  const byShape: Record<PreviewShape, FinalistCanonicalizationShapePaths> = {
+    square: {
+      backgroundPath: null,
+      finalPath: null,
+      designDoc: createFallbackDesignDoc("square")
+    },
+    wide: {
+      backgroundPath: null,
+      finalPath: null,
+      designDoc: createFallbackDesignDoc("wide")
+    },
+    tall: {
+      backgroundPath: null,
+      finalPath: null,
+      designDoc: createFallbackDesignDoc("tall")
+    }
+  };
+  const aspectRecoveryAttemptsByShape: Record<PreviewShape, number> = {
+    square: 0,
+    wide: 0,
+    tall: 0
+  };
+  const aspectRecoveryReasonsByShape: Record<PreviewShape, string[]> = {
+    square: [],
+    wide: [],
+    tall: []
+  };
+
+  const renderShape = async (shape: PreviewShape, recoveryAttempt: number): Promise<void> => {
+    const dimensions = PREVIEW_DIMENSIONS[shape];
+    const backgroundPng =
+      shape === OPTION_MASTER_BACKGROUND_SHAPE
+        ? params.masterBackgroundPng
+        : await normalizePngToShape(params.masterBackgroundPng, shape, resolveRecipeFocalPoint(params.lockupRecipe, shape));
+    const layout = computeCleanMinimalLayout({
+      width: dimensions.width,
+      height: dimensions.height,
+      content: params.content,
+      lockupRecipe: params.lockupRecipe,
+      lockupPresetId: params.lockupPresetId,
+      styleFamily: params.optionStyleFamily,
+      fontSeed: params.fontSeed
+    });
+    const textPalette = await chooseTextPaletteForBackground({
+      backgroundPng,
+      sampleRegion: layout.textRegion,
+      width: dimensions.width,
+      height: dimensions.height,
+      resolvedPalette: params.resolvedLockupPalette
+    });
+    const titleBlock = layout.blocks.find((block) => block.key === "title");
+    const shapeSafeBox = resolveTitleSafeBoxForDirection(shape, params.directionSpec);
+    const selectedVariationTemplate = resolveVariationTemplateFromDirectionSpec(params.directionSpec);
+    const templateAlign =
+      !selectedVariationTemplate
+        ? null
+        : selectedVariationTemplate.typeRegion === "right"
+          ? "right"
+          : selectedVariationTemplate.typeRegion === "center" || selectedVariationTemplate.overlayAnchor === "center"
+            ? "center"
+            : "left";
+    const finalPng = await composeLockupOnBackground({
+      backgroundPng,
+      lockupPng: params.lockupPng,
+      shape,
+      width: dimensions.width,
+      height: dimensions.height,
+      align: templateAlign || titleBlock?.align || "left",
+      integrationMode: params.lockupIntegrationMode,
+      safeRegionOverride: shapeSafeBox,
+      renderDebugGuides: false
+    });
+    const recoverySuffix = recoveryAttempt > 0 ? `-recovery-${recoveryAttempt}` : "";
+    const backgroundPath = await writeGenerationPreviewFiles({
+      fileName: `${params.generationId}-${shape}-bg${recoverySuffix}.png`,
+      png: backgroundPng
+    });
+    const finalPath = await writeGenerationPreviewFiles({
+      fileName: `${params.generationId}-${shape}${recoverySuffix}.png`,
+      png: finalPng
+    });
+
+    byShape[shape] = {
+      backgroundPath,
+      finalPath,
+      designDoc: renderTemplate(params.optionStyleFamily, params.templateBrief, params.optionIndex, shape, {
+        backgroundImagePath: backgroundPath,
+        textPalette
+      })
+    };
+  };
+
+  const renderShapeWithCapture = async (shape: PreviewShape, recoveryAttempt: number): Promise<void> => {
+    try {
+      await renderShape(shape, recoveryAttempt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown canonicalization error";
+      const attemptLabel = recoveryAttempt > 0 ? `recovery ${recoveryAttempt}` : "initial render";
+      aspectRecoveryReasonsByShape[shape].push(`${shape} canonicalization ${attemptLabel} failed: ${message}`);
+    }
+  };
+
+  await Promise.all(PREVIEW_SHAPES.map((shape) => renderShapeWithCapture(shape, 0)));
+
+  let aspectAssets = await evaluateAspectAssetsForCompletion({
+    pathsByShape: {
+      square: byShape.square.finalPath,
+      wide: byShape.wide.finalPath,
+      tall: byShape.tall.finalPath
+    }
+  });
+
+  for (const shape of PREVIEW_SHAPES) {
+    let status = aspectAssets[outputAspectForShape(shape)];
+    if (status === "ok") {
+      continue;
+    }
+
+    aspectRecoveryReasonsByShape[shape].push(formatCanonicalizationStatusReason(shape, status, "initial render"));
+
+    for (let recoveryAttempt = 1; recoveryAttempt <= FINALIST_ASPECT_RECOVERY_LIMIT; recoveryAttempt += 1) {
+      aspectRecoveryAttemptsByShape[shape] = recoveryAttempt;
+      await renderShapeWithCapture(shape, recoveryAttempt);
+      aspectAssets = await evaluateAspectAssetsForCompletion({
+        pathsByShape: {
+          square: byShape.square.finalPath,
+          wide: byShape.wide.finalPath,
+          tall: byShape.tall.finalPath
+        }
+      });
+      status = aspectAssets[outputAspectForShape(shape)];
+      if (status === "ok") {
+        break;
+      }
+      aspectRecoveryReasonsByShape[shape].push(formatCanonicalizationStatusReason(shape, status, `recovery ${recoveryAttempt}`));
+    }
+  }
+
+  const canonicalAssetPathsByShape: Record<PreviewShape, string | null> = {
+    square: byShape.square.finalPath,
+    wide: byShape.wide.finalPath,
+    tall: byShape.tall.finalPath
+  };
+  const canonicalizationFailureReasons = PREVIEW_SHAPES.flatMap((shape) => {
+    const status = aspectAssets[outputAspectForShape(shape)];
+    if (status === "ok") {
+      return [];
+    }
+
+    return [
+      `${shape} canonicalization failed after ${aspectRecoveryAttemptsByShape[shape]} recovery attempt(s): ${status}`
+    ];
+  });
+  const finalistCanonicalizationSucceeded = PREVIEW_SHAPES.every(
+    (shape) => aspectAssets[outputAspectForShape(shape)] === "ok"
+  );
+
+  return {
+    byShape,
+    aspectAssets,
+    completionEligible: finalistCanonicalizationSucceeded,
+    finalistCanonicalizationAttempted: true,
+    finalistCanonicalizationSucceeded,
+    aspectRecoveryAttemptsByShape,
+    aspectRecoveryReasonsByShape,
+    canonicalAssetPathsByShape,
+    canonicalizationFailureReasons
+  };
+}
+
 async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
   output: GenerationOutputPayload;
   backgroundValidation?: ProductionBackgroundValidationEvidence | null;
   failureReason?: BackgroundAttemptFailureReason;
+  providerPreflight?: ImageProviderPreflightResult | null;
 }): Promise<GenerationOptionStatus> {
   const designDocByShape = params.output.designDocByShape;
   const [squarePng, widePng, tallPng, lockupResult] = await Promise.all([
@@ -8007,11 +8283,13 @@ async function completeGenerationWithFallbackOutput(params: {
   const fallbackDebugMeta = mergeGenerationDebugMeta(outputWithStatus.meta.debug, {
     backgroundSource: "fallback",
     lockupSource: "fallback",
+    generationLifecycleState: resolveGenerationLifecycleStateForFailure(params.failureReason || null),
     aspectAssets: {
       widescreen: "placeholder",
       square: "placeholder",
       vertical: "placeholder"
     },
+    imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
     ...(params.failureReason
       ? {
           backgroundFailureReason: params.failureReason
@@ -8111,6 +8389,7 @@ function withRoundDebugStatusOutput(
     roundAttemptCount: number;
     roundRequiredCompletedCount: number;
     roundFailureReason: GenerationRoundFailureReason | null;
+    roundOperationalFailureReason: ProviderFailureReason | null;
   }
 ): Prisma.InputJsonValue | null {
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -8138,7 +8417,8 @@ function withRoundDebugStatusOutput(
         roundCompletedCount: params.roundCompletedCount,
         roundAttemptCount: params.roundAttemptCount,
         roundRequiredCompletedCount: params.roundRequiredCompletedCount,
-        roundFailureReason: params.roundFailureReason
+        roundFailureReason: params.roundFailureReason,
+        roundOperationalFailureReason: params.roundOperationalFailureReason
       }
     }
   } as Prisma.InputJsonValue;
@@ -8152,6 +8432,7 @@ async function persistRoundDebugStatusForGenerations(params: {
   roundAttemptCount: number;
   roundRequiredCompletedCount: number;
   roundFailureReason: GenerationRoundFailureReason | null;
+  roundOperationalFailureReason: ProviderFailureReason | null;
 }): Promise<void> {
   if (params.generationIds.length === 0) {
     return;
@@ -8176,7 +8457,8 @@ async function persistRoundDebugStatusForGenerations(params: {
       roundCompletedCount: params.roundCompletedCount,
       roundAttemptCount: params.roundAttemptCount,
       roundRequiredCompletedCount: params.roundRequiredCompletedCount,
-      roundFailureReason: params.roundFailureReason
+      roundFailureReason: params.roundFailureReason,
+      roundOperationalFailureReason: params.roundOperationalFailureReason
     });
     if (!outputWithRoundMeta) {
       continue;
@@ -8198,10 +8480,102 @@ async function persistRoundDebugStatusForGenerations(params: {
   }
 }
 
+function pickRoundOperationalFailureReason(
+  failureReasons: Array<BackgroundAttemptFailureReason | null | undefined>
+): ProviderFailureReason | null {
+  if (failureReasons.some((reason) => reason === "PROVIDER_QUOTA_OR_RATE_LIMIT")) {
+    return "PROVIDER_QUOTA_OR_RATE_LIMIT";
+  }
+  if (failureReasons.some((reason) => reason === "PROVIDER_MODEL_UNAVAILABLE")) {
+    return "PROVIDER_MODEL_UNAVAILABLE";
+  }
+  if (failureReasons.some((reason) => reason === "PROVIDER_AUTH_OR_CONFIG_ERROR")) {
+    return "PROVIDER_AUTH_OR_CONFIG_ERROR";
+  }
+  if (failureReasons.some((reason) => reason === "PROVIDER_TRANSIENT_ERROR")) {
+    return "PROVIDER_TRANSIENT_ERROR";
+  }
+
+  return null;
+}
+
+async function persistFinalRoundOutcome(params: {
+  generationIds: string[];
+  results: PlannedGenerationRunResult[];
+  roundAttemptCount: number;
+  roundRequiredCompletedCount: number;
+}): Promise<void> {
+  const completedCount = params.results.filter((result) => result.optionStatus === "COMPLETED").length;
+  const roundHasFallback = params.results.some((result) => result.optionStatus === "FALLBACK");
+  const roundOperationalFailureReason = pickRoundOperationalFailureReason(params.results.map((result) => result.failureReason));
+  const roundFailureReason: GenerationRoundFailureReason | null =
+    roundOperationalFailureReason
+      ? "ROUND_ABORTED_PROVIDER_FAILURE"
+      : completedCount >= params.roundRequiredCompletedCount
+        ? null
+        : "ROUND_INSUFFICIENT_VALID_OPTIONS";
+  const roundStatus: GenerationRoundStatus =
+    completedCount >= params.roundRequiredCompletedCount
+      ? "COMPLETED"
+      : completedCount > 0
+        ? "PARTIAL"
+        : "FAILED";
+
+  await persistRoundDebugStatusForGenerations({
+    generationIds: params.generationIds,
+    roundHasFallback,
+    roundStatus,
+    roundCompletedCount: completedCount,
+    roundAttemptCount: params.roundAttemptCount,
+    roundRequiredCompletedCount: params.roundRequiredCompletedCount,
+    roundFailureReason,
+    roundOperationalFailureReason
+  });
+}
+
+async function abortRoundForProviderFailure(params: {
+  projectId: string;
+  plannedGenerations: PlannedGeneration[];
+  providerPreflight: ImageProviderPreflightResult;
+}): Promise<PlannedGenerationRunResult[]> {
+  const failureReason = params.providerPreflight.failureReason || "PROVIDER_TRANSIENT_ERROR";
+  const results = await Promise.all(
+    params.plannedGenerations.map(async (plannedGeneration) => {
+      const optionStatus = await completeGenerationWithFallbackOutput({
+        projectId: params.projectId,
+        generationId: plannedGeneration.id,
+        output: plannedGeneration.fallbackOutput,
+        failureReason,
+        providerPreflight: params.providerPreflight
+      });
+
+      return {
+        generationId: plannedGeneration.id,
+        optionStatus,
+        failureReason
+      } satisfies PlannedGenerationRunResult;
+    })
+  );
+
+  await persistRoundDebugStatusForGenerations({
+    generationIds: params.plannedGenerations.map((generation) => generation.id),
+    roundHasFallback: true,
+    roundStatus: "FAILED",
+    roundCompletedCount: 0,
+    roundAttemptCount: 0,
+    roundRequiredCompletedCount: ROUND_OPTION_COUNT,
+    roundFailureReason: "ROUND_ABORTED_PROVIDER_FAILURE",
+    roundOperationalFailureReason: failureReason
+  });
+
+  return results;
+}
+
 async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   organizationId: string;
   project: GenerationProjectContext & { id: string };
   plannedGenerations: PlannedGeneration[];
+  providerPreflight: ImageProviderPreflightResult;
   bibleCreativeBrief?: BibleCreativeBrief | null;
   motifBankContext?: MotifBankContext;
 }): Promise<PlannedGenerationRunResult[]> {
@@ -8282,12 +8656,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           projectId: params.project.id,
           generationId: plannedGeneration.id,
           output: fallbackOutput,
-          failureReason: "UNKNOWN"
+          failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR",
+          providerPreflight: params.providerPreflight
         });
         return {
           generationId: plannedGeneration.id,
           optionStatus,
-          failureReason: "UNKNOWN"
+          failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR"
         };
       }
 
@@ -9314,6 +9689,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const buildApiErrorAttemptDebug = (params: {
           attemptIndex: number;
           directionSpec: PlannedDirectionSpec | null;
+          failureReason: BackgroundAttemptFailureReason;
         }): BackgroundAttemptDebug => ({
           attemptIndex: params.attemptIndex,
           styleFamily: resolveDirectionStyleFields(params.directionSpec).styleFamily,
@@ -9329,7 +9705,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           },
           candidates: [],
           winnerIndex: null,
-          failureReason: "API_ERROR"
+          failureReason: params.failureReason
         });
 
         const persistBackgroundRerankMeta = (params: {
@@ -9371,13 +9747,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           appendAttempt(latestSelection);
         } catch (error) {
           const message = error instanceof Error ? error.message : "Unknown rerank attempt error";
+          const failureReason = resolveBackgroundAttemptFailureReason(error);
           console.warn(
             `[background-rerank-attempt] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} stage=primary attempt=${fallback.attempts} error=${message}`
           );
           backgroundAttempts.push(
             buildApiErrorAttemptDebug({
               attemptIndex: fallback.attempts,
-              directionSpec: activeDirectionSpec
+              directionSpec: activeDirectionSpec,
+              failureReason
             })
           );
         }
@@ -9394,7 +9772,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundAttempts,
             backgroundValidation: null as ProductionBackgroundValidationEvidence | null,
             textScrub: null as TextScrubDebug | null,
-            fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
+            fallbackFailureReason: backgroundAttempts[backgroundAttempts.length - 1]?.failureReason || "UNKNOWN"
           };
         }
         let bestEligibleSelection = latestSelection.winner ? latestSelection : null;
@@ -9413,13 +9791,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             appendAttempt(latestSelection);
           } catch (error) {
             const message = error instanceof Error ? error.message : "Unknown rerank attempt error";
+            const failureReason = resolveBackgroundAttemptFailureReason(error);
             console.warn(
               `[background-rerank-attempt] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} stage=text_retry attempt=${fallback.attempts} error=${message}`
             );
             backgroundAttempts.push(
               buildApiErrorAttemptDebug({
                 attemptIndex: fallback.attempts,
-                directionSpec: activeDirectionSpec
+                directionSpec: activeDirectionSpec,
+                failureReason
               })
             );
             persistBackgroundRerankMeta({
@@ -9434,7 +9814,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               backgroundAttempts,
               backgroundValidation: latestSelection?.backgroundValidation || null,
               textScrub: latestSelection?.textScrub || null,
-              fallbackFailureReason: "API_ERROR" as BackgroundAttemptFailureReason
+              fallbackFailureReason: backgroundAttempts[backgroundAttempts.length - 1]?.failureReason || "UNKNOWN"
             };
           }
           if (latestSelection.winner) {
@@ -9505,8 +9885,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const fallbackDebugMeta = mergeGenerationDebugMeta(fallbackOutput.meta.debug, {
           backgroundSource: "fallback",
           lockupSource: "fallback",
+          generationLifecycleState: resolveGenerationLifecycleStateForFailure(resolvedFailureReason),
           backgroundFailureReason: resolvedFailureReason,
           backgroundAttempts: fallbackParams.backgroundAttempts,
+          imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
           ...(fallbackParams.textScrub
             ? {
                 textScrub: fallbackParams.textScrub
@@ -9535,7 +9917,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           generationId: plannedGeneration.id,
           output: fallbackOutput,
           backgroundValidation: fallbackParams.backgroundValidation || null,
-          failureReason: resolvedFailureReason
+          failureReason: resolvedFailureReason,
+          providerPreflight: params.providerPreflight
         });
         return {
           optionStatus,
@@ -9832,80 +10215,29 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         fileName: `${plannedGeneration.id}-lockup.png`,
         png: lockupRenderResult.png
       });
-      const shapesToRender: readonly PreviewShape[] = shouldUseCheapRound1Mode
-        ? [OPTION_MASTER_BACKGROUND_SHAPE]
-        : PREVIEW_SHAPES;
-
-      const shapeResults = await Promise.all(
-        shapesToRender.map(async (shape) => {
-          const dimensions = PREVIEW_DIMENSIONS[shape];
-          const backgroundPng =
-            shape === OPTION_MASTER_BACKGROUND_SHAPE
-              ? masterAttempt.backgroundPng
-              : await normalizePngToShape(
-                  masterAttempt.backgroundPng,
-                  shape,
-                  resolveRecipeFocalPoint(lockupRecipeForRender, shape)
-                );
-          const layout = computeCleanMinimalLayout({
-            width: dimensions.width,
-            height: dimensions.height,
-            content,
-            lockupRecipe: lockupRecipeForRender,
-            lockupPresetId,
-            styleFamily: optionStyleFamily,
-            fontSeed: fontSeedBase
-          });
-          const textPalette = await chooseTextPaletteForBackground({
-            backgroundPng,
-            sampleRegion: layout.textRegion,
-            width: dimensions.width,
-            height: dimensions.height,
-            resolvedPalette: resolvedLockupPalette
-          });
-          const titleBlock = layout.blocks.find((block) => block.key === "title");
-          const shapeSafeBox = resolveTitleSafeBoxForDirection(shape, backgroundDirectionSpec);
-          const selectedVariationTemplate = resolveVariationTemplateFromDirectionSpec(backgroundDirectionSpec);
-          const templateAlign =
-            !selectedVariationTemplate
-              ? null
-              : selectedVariationTemplate.typeRegion === "right"
-                ? "right"
-                : selectedVariationTemplate.typeRegion === "center" || selectedVariationTemplate.overlayAnchor === "center"
-                  ? "center"
-                  : "left";
-          const finalPng = await composeLockupOnBackground({
-            backgroundPng,
-            lockupPng: lockupPngForComposite,
-            shape,
-            width: dimensions.width,
-            height: dimensions.height,
-            align: templateAlign || titleBlock?.align || "left",
-            integrationMode: lockupIntegrationMode,
-            safeRegionOverride: shapeSafeBox,
-            renderDebugGuides: false
-          });
-          const backgroundPath = await writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-${shape}-bg.png`,
-            png: backgroundPng
-          });
-          const finalPath = await writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-${shape}.png`,
-            png: finalPng
-          });
-
-          return {
-            shape,
-            backgroundPath,
-            finalPath,
-            designDoc: renderTemplate(optionStyleFamily, templateBrief, plannedGeneration.optionIndex, shape, {
-              backgroundImagePath: backgroundPath,
-              textPalette
-            })
-          };
-        })
-      );
       const finalDirectionSpec = backgroundDirectionSpec || directionSpec;
+      const finalistCanonicalization = await ensureCanonicalFinalistOutputs({
+        generationId: plannedGeneration.id,
+        optionIndex: plannedGeneration.optionIndex,
+        optionStyleFamily,
+        templateBrief,
+        content,
+        lockupRecipe: lockupRecipeForRender,
+        lockupPresetId,
+        fontSeed: fontSeedBase,
+        lockupIntegrationMode,
+        directionSpec: finalDirectionSpec,
+        masterBackgroundPng: masterAttempt.backgroundPng,
+        lockupPng: lockupPngForComposite,
+        resolvedLockupPalette
+      });
+      const aspectRecoverySummary = PREVIEW_SHAPES.flatMap((shape) => {
+        const attempts = finalistCanonicalization.aspectRecoveryAttemptsByShape[shape];
+        if (attempts <= 0) {
+          return [];
+        }
+        return [`${shape} x${attempts}`];
+      }).join(", ");
 
       const promptUsed = [
         `master(${OPTION_MASTER_BACKGROUND_SHAPE}): ${masterAttempt.prompt}`,
@@ -9958,81 +10290,43 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         masterAttempt.paletteRetryCount > 0 ? `[retry: brand-palette x${masterAttempt.paletteRetryCount}]` : "",
         masterAttempt.toneRetryCount > 0 ? `[retry: tone-compliance x${masterAttempt.toneRetryCount}]` : "",
         masterAttempt.textArtifactRetryCount > 0 ? `[retry: text-artifact x${masterAttempt.textArtifactRetryCount}]` : "",
+        finalistCanonicalization.finalistCanonicalizationSucceeded
+          ? "[finalist-canonicalization: passed]"
+          : "[finalist-canonicalization: failed]",
+        aspectRecoverySummary ? `[aspect-recovery: ${aspectRecoverySummary}]` : "",
         shouldUseCheapRound1Mode
-          ? "cheap mode: widescreen-first generation with derived square/tall composites for round 1."
-          : "derived variants: square/wide/tall from one shared background + one shared lockup."
+          ? "cheap mode: widescreen-first exploration only; completion requires canonical finalist wide/square/tall assets."
+          : "finalist completion uses canonical wide/square/tall renders from one shared background + one shared lockup."
       ]
         .filter(Boolean)
         .join(" ");
-      const byShape = Object.fromEntries(shapeResults.map((result) => [result.shape, result])) as Partial<
-        Record<PreviewShape, (typeof shapeResults)[number]>
-      >;
-      const wideShapeResult = byShape.wide;
-      if (!wideShapeResult) {
-        throw new Error(`Missing widescreen render result for generation ${plannedGeneration.id}.`);
-      }
-      const squareShapeResult = byShape.square;
-      const tallShapeResult = byShape.tall;
-      const designDocByShape: Record<PreviewShape, DesignDoc> = shouldUseCheapRound1Mode
-        ? {
-            square: adaptDesignDocToDimensions(
-              wideShapeResult.designDoc,
-              PREVIEW_DIMENSIONS.square.width,
-              PREVIEW_DIMENSIONS.square.height
-            ),
-            wide: wideShapeResult.designDoc,
-            tall: adaptDesignDocToDimensions(
-              wideShapeResult.designDoc,
-              PREVIEW_DIMENSIONS.tall.width,
-              PREVIEW_DIMENSIONS.tall.height
-            )
-          }
-        : {
-            square: squareShapeResult?.designDoc || wideShapeResult.designDoc,
-            wide: wideShapeResult.designDoc,
-            tall: tallShapeResult?.designDoc || wideShapeResult.designDoc
-          };
-      const previewPathByShape: Record<PreviewShape, string | null> = {
-        square: shouldUseCheapRound1Mode ? null : squareShapeResult?.finalPath || null,
-        wide: wideShapeResult.finalPath,
-        tall: shouldUseCheapRound1Mode ? null : tallShapeResult?.finalPath || null
+      const byShape = finalistCanonicalization.byShape;
+      const designDocByShape: Record<PreviewShape, DesignDoc> = {
+        square: byShape.square.designDoc,
+        wide: byShape.wide.designDoc,
+        tall: byShape.tall.designDoc
       };
-      if (shouldUseCheapRound1Mode) {
-        const [derivedSquarePng, derivedTallPng] = await Promise.all([
-          renderCompositedPreviewPng(designDocByShape.square, {
-            renderDebugGuides: false
-          }),
-          renderCompositedPreviewPng(designDocByShape.tall, {
-            renderDebugGuides: false
-          })
-        ]);
-        const [derivedSquarePath, derivedTallPath] = await Promise.all([
-          writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-square-derived.png`,
-            png: derivedSquarePng
-          }),
-          writeGenerationPreviewFiles({
-            fileName: `${plannedGeneration.id}-tall-derived.png`,
-            png: derivedTallPng
-          })
-        ]);
-        previewPathByShape.square = derivedSquarePath;
-        previewPathByShape.tall = derivedTallPath;
-      }
-      const aspectAssets = await evaluateAspectAssetsForCompletion({
-        pathsByShape: previewPathByShape
-      });
+      const previewPathByShape = finalistCanonicalization.canonicalAssetPathsByShape;
+      const aspectAssets = finalistCanonicalization.aspectAssets;
 
-      const backgroundAssetRows: Prisma.AssetCreateManyInput[] = shapesToRender.map((shape) => ({
-        projectId: params.project.id,
-        generationId: plannedGeneration.id,
-        kind: "BACKGROUND",
-        slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
-        file_path: byShape[shape]?.backgroundPath || wideShapeResult.backgroundPath,
-        mime_type: "image/png",
-        width: PREVIEW_DIMENSIONS[shape].width,
-        height: PREVIEW_DIMENSIONS[shape].height
-      }));
+      const backgroundAssetRows: Prisma.AssetCreateManyInput[] = PREVIEW_SHAPES.flatMap((shape) => {
+        const backgroundPath = byShape[shape].backgroundPath;
+        if (!backgroundPath) {
+          return [];
+        }
+        return [
+          {
+            projectId: params.project.id,
+            generationId: plannedGeneration.id,
+            kind: "BACKGROUND",
+            slot: BACKGROUND_ASSET_SLOT_BY_SHAPE[shape],
+            file_path: backgroundPath,
+            mime_type: "image/png",
+            width: PREVIEW_DIMENSIONS[shape].width,
+            height: PREVIEW_DIMENSIONS[shape].height
+          }
+        ];
+      });
       const lockupAssetRow: Prisma.AssetCreateManyInput = {
         projectId: params.project.id,
         generationId: plannedGeneration.id,
@@ -10078,10 +10372,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             provenance: "rendered" as const
           },
           square: {
-            provenance: shouldUseCheapRound1Mode ? ("derived" as const) : ("rendered" as const)
+            provenance: "rendered" as const
           },
           vertical: {
-            provenance: shouldUseCheapRound1Mode ? ("derived" as const) : ("rendered" as const)
+            provenance: "rendered" as const
           }
         }
       };
@@ -10105,7 +10399,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         {
           backgroundSource: backgroundSourceForSuccess,
           lockupSource: lockupSourceForSuccess,
+          generationLifecycleState: "GENERATION_COMPLETED",
           backgroundFailureReason: null,
+          imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
           ...(selectedBackgroundTextScrub
             ? {
                 textScrub: selectedBackgroundTextScrub
@@ -10115,6 +10411,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           imageCalls: imageCallSummary,
           rateLimitWaitMs: imageRateLimitDebugMeta.rateLimitWaitMs ?? 0,
           aspectAssets,
+          finalistCanonicalizationAttempted: finalistCanonicalization.finalistCanonicalizationAttempted,
+          finalistCanonicalizationSucceeded: finalistCanonicalization.finalistCanonicalizationSucceeded,
+          aspectRecoveryAttemptsByShape: finalistCanonicalization.aspectRecoveryAttemptsByShape,
+          aspectRecoveryReasonsByShape: finalistCanonicalization.aspectRecoveryReasonsByShape,
+          canonicalAssetPathsByShape: finalistCanonicalization.canonicalAssetPathsByShape,
+          canonicalizationFailureReasons: finalistCanonicalization.canonicalizationFailureReasons,
           ...(shouldRunExplorationToneCheck
             ? {
                 backgroundAttempts: backgroundAttemptDiagnostics
@@ -10291,6 +10593,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           ? "MISSING_ASPECT_ASSET"
           : "UNKNOWN";
         const validationWarning = `Production-validity gate failed: ${completionValidation.invalidReasons.join(", ") || "unknown_reason"}.`;
+        const canonicalizationWarning =
+          finalistCanonicalization.canonicalizationFailureReasons.length > 0
+            ? `Finalist canonicalization failed: ${finalistCanonicalization.canonicalizationFailureReasons.join("; ")}.`
+            : null;
         const failedOutput: GenerationOutputPayload = {
           ...completedOutputWithValidation,
           status: "FAILED_GENERATION",
@@ -10299,10 +10605,15 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             ...completedOutputWithValidation.meta,
             productionValidation: persistedProductionValidation,
             debug: mergeGenerationDebugMeta(completedOutputWithValidation.meta.debug, {
+              generationLifecycleState: resolveGenerationLifecycleStateForFailure(failureReason),
               backgroundFailureReason: failureReason,
+              imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
               aspectAssets,
               warnings: appendUniqueDebugWarning(
-                appendUniqueDebugWarning(completedOutputWithValidation.meta.debug?.warnings, validationWarning),
+                appendUniqueDebugWarning(
+                  appendUniqueDebugWarning(completedOutputWithValidation.meta.debug?.warnings, validationWarning),
+                  canonicalizationWarning
+                ),
                 "Option failed production-validity gate."
               )
             })
@@ -10365,11 +10676,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
-      const failureReason: BackgroundAttemptFailureReason = imageCallCapReached
-        ? "BUDGET"
-        : isOpenAiRateLimitError(error)
-          ? "RATE_LIMIT"
-          : "API_ERROR";
+      const failureReason = resolveBackgroundAttemptFailureReason(error, imageCallCapReached);
       console.error(
         `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
       );
@@ -10378,7 +10685,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           projectId: params.project.id,
           generationId: plannedGeneration.id,
           output: fallbackOutput,
-          failureReason
+          failureReason,
+          providerPreflight: params.providerPreflight
         });
         return {
           generationId: plannedGeneration.id,
@@ -10400,7 +10708,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             debug: mergeGenerationDebugMeta(fallbackOutput.meta.debug, {
               backgroundSource: "fallback",
               lockupSource: "fallback",
+              generationLifecycleState: resolveGenerationLifecycleStateForFailure(failureReason),
               backgroundFailureReason: failureReason,
+              imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
               aspectAssets: {
                 widescreen: "missing",
                 square: "missing",
@@ -10450,30 +10760,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   }))
   );
 
-  const roundHasFallback = optionResults.some((result) => result.optionStatus === "FALLBACK");
-  const completedCount = optionResults.filter((result) => result.optionStatus === "COMPLETED").length;
-  const hasRoundFailures = optionResults.some((result) => result.optionStatus !== "COMPLETED");
-  const roundStatus: GenerationRoundStatus = hasRoundFailures
-    ? completedCount > 0
-      ? "PARTIAL"
-      : "FAILED"
-    : "COMPLETED";
-  const roundFailureReason: GenerationRoundFailureReason | null = hasRoundFailures
-    ? optionResults.some((result) => result.failureReason === "RATE_LIMIT")
-      ? "RATE_LIMIT"
-      : optionResults.some((result) => result.failureReason === "BUDGET")
-        ? "BUDGET"
-        : "UNKNOWN"
-    : null;
-  await persistRoundDebugStatusForGenerations({
-    generationIds: optionResults.map((result) => result.generationId),
-    roundHasFallback,
-    roundStatus,
-    roundCompletedCount: completedCount,
-    roundAttemptCount: optionResults.length,
-    roundRequiredCompletedCount: ROUND_OPTION_COUNT,
-    roundFailureReason
-  });
   return optionResults;
 }
 
@@ -10827,17 +11113,38 @@ export async function generateRoundOneAction(
           projectId: project.id,
           presetId: generationPresetId,
           round: 1,
-          status: "RUNNING",
+          status: "QUEUED",
           input: generationInput
         }
       })
     )
   );
 
+  const providerPreflight = await preflightImageProvider();
+  if (!providerPreflight.ok) {
+    await abortRoundForProviderFailure({
+      projectId: project.id,
+      plannedGenerations,
+      providerPreflight
+    });
+    redirect(`/app/projects/${projectId}/generations`);
+  }
+
+  await prisma.generation.updateMany({
+    where: {
+      id: {
+        in: plannedGenerations.map((generation) => generation.id)
+      }
+    },
+    data: {
+      status: "RUNNING"
+    }
+  });
+
   const shouldEnforceRound1NonFallbackRequirement = !hasDesignNotes;
   const optionResultByGenerationId = new Map<string, PlannedGenerationRunResult>();
   let totalRoundAttemptCount = 0;
-  let hardStopFailureReason: GenerationRoundFailureReason | null = null;
+  let hardStopFailureReason: BackgroundAttemptFailureReason | null = null;
   let retryCursor = 0;
   const upsertResults = (results: PlannedGenerationRunResult[]) => {
     totalRoundAttemptCount += results.length;
@@ -10852,13 +11159,13 @@ export async function generateRoundOneAction(
     organizationId: session.organizationId,
     project,
     plannedGenerations,
+    providerPreflight,
     bibleCreativeBrief,
     motifBankContext
   });
   upsertResults(firstAttemptResults);
-  if (firstAttemptResults.some((result) => result.failureReason === "RATE_LIMIT")) {
-    hardStopFailureReason = "RATE_LIMIT";
-  } else if (firstAttemptResults.some((result) => result.failureReason === "BUDGET")) {
+  hardStopFailureReason = pickRoundOperationalFailureReason(firstAttemptResults.map((result) => result.failureReason));
+  if (!hardStopFailureReason && firstAttemptResults.some((result) => result.failureReason === "BUDGET")) {
     hardStopFailureReason = "BUDGET";
   }
 
@@ -10893,19 +11200,21 @@ export async function generateRoundOneAction(
           }
         },
         data: {
-          status: "RUNNING"
+          status: "RUNNING",
+          output: Prisma.JsonNull
         }
       });
       const retryResults = await createOpenAiPreviewAssetsForPlannedGenerations({
         organizationId: session.organizationId,
         project,
         plannedGenerations: retryBatch,
+        providerPreflight,
         bibleCreativeBrief,
         motifBankContext
       });
       upsertResults(retryResults);
-      if (retryResults.some((result) => result.failureReason === "RATE_LIMIT")) {
-        hardStopFailureReason = "RATE_LIMIT";
+      hardStopFailureReason = pickRoundOperationalFailureReason(retryResults.map((result) => result.failureReason));
+      if (hardStopFailureReason) {
         break;
       }
       if (retryResults.some((result) => result.failureReason === "BUDGET")) {
@@ -10913,37 +11222,24 @@ export async function generateRoundOneAction(
         break;
       }
     }
-
-    const finalResults = plannedGenerations.map((generation) => {
-      const known = optionResultByGenerationId.get(generation.id);
-      return (
-        known || {
-          generationId: generation.id,
-          optionStatus: "FAILED_GENERATION" as GenerationOptionStatus,
-          failureReason: "UNKNOWN" as BackgroundAttemptFailureReason
-        }
-      );
-    });
-    const completedCount = finalResults.filter((result) => result.optionStatus === "COMPLETED").length;
-    const roundHasFallback = finalResults.some((result) => result.optionStatus === "FALLBACK");
-    const finalFailureReason: GenerationRoundFailureReason | null =
-      completedCount >= ROUND_OPTION_COUNT
-        ? null
-        : hardStopFailureReason || (finalResults.some((result) => result.failureReason === "RATE_LIMIT")
-            ? "RATE_LIMIT"
-            : finalResults.some((result) => result.failureReason === "BUDGET")
-              ? "BUDGET"
-              : "INSUFFICIENT_NONFALLBACK_OPTIONS");
-    await persistRoundDebugStatusForGenerations({
-      generationIds: plannedGenerations.map((generation) => generation.id),
-      roundHasFallback,
-      roundStatus: completedCount >= ROUND_OPTION_COUNT ? "COMPLETED" : "FAILED",
-      roundCompletedCount: completedCount,
-      roundAttemptCount: totalRoundAttemptCount,
-      roundRequiredCompletedCount: ROUND_OPTION_COUNT,
-      roundFailureReason: finalFailureReason
-    });
   }
+
+  const finalResults = plannedGenerations.map((generation) => {
+    const known = optionResultByGenerationId.get(generation.id);
+    return (
+      known || {
+        generationId: generation.id,
+        optionStatus: "FAILED_GENERATION" as GenerationOptionStatus,
+        failureReason: "UNKNOWN" as BackgroundAttemptFailureReason
+      }
+    );
+  });
+  await persistFinalRoundOutcome({
+    generationIds: plannedGenerations.map((generation) => generation.id),
+    results: finalResults,
+    roundAttemptCount: totalRoundAttemptCount,
+    roundRequiredCompletedCount: ROUND_OPTION_COUNT
+  });
 
   redirect(`/app/projects/${projectId}/generations`);
 }
@@ -11309,19 +11605,47 @@ export async function generateRoundTwoAction(
           projectId: project.id,
           presetId: generationPresetId,
           round,
-          status: "RUNNING",
+          status: "QUEUED",
           input: generationInput
         }
       })
     )
   );
 
-  await createOpenAiPreviewAssetsForPlannedGenerations({
+  const providerPreflight = await preflightImageProvider();
+  if (!providerPreflight.ok) {
+    await abortRoundForProviderFailure({
+      projectId: project.id,
+      plannedGenerations,
+      providerPreflight
+    });
+    redirect(`/app/projects/${projectId}/generations`);
+  }
+
+  await prisma.generation.updateMany({
+    where: {
+      id: {
+        in: plannedGenerations.map((generation) => generation.id)
+      }
+    },
+    data: {
+      status: "RUNNING"
+    }
+  });
+
+  const results = await createOpenAiPreviewAssetsForPlannedGenerations({
     organizationId: session.organizationId,
     project,
     plannedGenerations,
+    providerPreflight,
     bibleCreativeBrief,
     motifBankContext
+  });
+  await persistFinalRoundOutcome({
+    generationIds: plannedGenerations.map((generation) => generation.id),
+    results,
+    roundAttemptCount: results.length,
+    roundRequiredCompletedCount: ROUND_OPTION_COUNT
   });
 
   redirect(`/app/projects/${projectId}/generations`);

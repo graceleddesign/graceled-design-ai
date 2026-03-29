@@ -5,6 +5,12 @@ import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { GenerationPreviewPane } from "@/components/generation-preview-pane";
 import {
+  type GenerationFailureReason,
+  type GenerationLifecycleState,
+  type GenerationOptionStatus,
+  isProviderFailureReason
+} from "@/lib/generation-state";
+import {
   summarizeProductionInvalidReasons,
   type ProductionValidationFailedChecks
 } from "@/lib/production-valid-option";
@@ -12,6 +18,14 @@ import {
 type DirectionPreviewFormat = "wide" | "square" | "tall";
 type AspectAssetStatus = "ok" | "missing" | "placeholder";
 type PreviewMode = "canonical_asset" | "fallback_asset" | "fallback_composite" | "fallback_design_doc";
+type DebugFinalistCanonicalization = {
+  attempted: boolean;
+  succeeded: boolean | null;
+  aspectRecoveryAttemptsByShape: Record<DirectionPreviewFormat, number>;
+  aspectRecoveryReasonsByShape: Record<DirectionPreviewFormat, string[]>;
+  canonicalAssetPathsByShape: Record<DirectionPreviewFormat, string | null>;
+  canonicalizationFailureReasons: string[];
+};
 
 const PREVIEW_FORMATS: readonly DirectionPreviewFormat[] = ["wide", "square", "tall"];
 
@@ -44,7 +58,8 @@ type DirectionOptionCardProps = {
   projectId: string;
   round: number;
   generationId: string;
-  generationStatus: "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
+  generationStatus: GenerationOptionStatus;
+  generationLifecycleState: GenerationLifecycleState;
   optionLabel: string;
   tintClass: string;
   isApprovedFinal: boolean;
@@ -70,20 +85,13 @@ type DirectionOptionCardProps = {
   debugLockupAnchorSrc?: string | null;
   debugBackgroundSource?: "generated" | "reused" | "fallback" | null;
   debugLockupSource?: "generated" | "reused" | "fallback" | null;
-  debugBackgroundFailureReason?:
-    | "ALL_TEXT"
-    | "ALL_SCAFFOLD"
-    | "API_ERROR"
-    | "RATE_LIMIT"
-    | "BUDGET"
-    | "MISSING_ASPECT_ASSET"
-    | "UNKNOWN"
-    | null;
+  debugBackgroundFailureReason?: GenerationFailureReason | null;
   debugAspectAssets?: {
     widescreen: AspectAssetStatus;
     square: AspectAssetStatus;
     vertical: AspectAssetStatus;
   } | null;
+  debugFinalistCanonicalization?: DebugFinalistCanonicalization | null;
   debugWarning?: string | null;
   debugImageCalls?: {
     total: number;
@@ -108,15 +116,7 @@ type DirectionOptionCardProps = {
     imageUrl: string;
     score: number | null;
     failedChecks: Array<"textOk" | "scaffoldOk" | "motifOk" | "toneOk">;
-    failureReason:
-      | "ALL_TEXT"
-      | "ALL_SCAFFOLD"
-      | "API_ERROR"
-      | "RATE_LIMIT"
-      | "BUDGET"
-      | "MISSING_ASPECT_ASSET"
-      | "UNKNOWN"
-      | null;
+    failureReason: GenerationFailureReason | null;
     eligibleCount: number;
     totalCandidates: number;
     failureCounts: {
@@ -139,6 +139,7 @@ export function DirectionOptionCard({
   round,
   generationId,
   generationStatus,
+  generationLifecycleState,
   optionLabel,
   tintClass,
   isApprovedFinal,
@@ -166,6 +167,7 @@ export function DirectionOptionCard({
   debugLockupSource = null,
   debugBackgroundFailureReason = null,
   debugAspectAssets = null,
+  debugFinalistCanonicalization = null,
   debugWarning = null,
   debugImageCalls = null,
   debugRateLimitWaitMs = null,
@@ -189,21 +191,46 @@ export function DirectionOptionCard({
   const titleId = useId();
   const descriptionId = useId();
   const canRefineOrFinalize = generationStatus === "COMPLETED";
+  const isInProgress = generationStatus === "IN_PROGRESS" || generationLifecycleState === "GENERATION_IN_PROGRESS";
   const isFallbackOption = generationStatus === "FALLBACK";
   const isFailedOption = generationStatus === "FAILED_GENERATION";
-  const showGenerationFailureWarning = isFallbackOption || isFailedOption;
+  const isProviderFailure = generationLifecycleState === "GENERATION_FAILED_PROVIDER" || isProviderFailureReason(debugBackgroundFailureReason);
+  const showGenerationFailureWarning = !isInProgress && (isFallbackOption || isFailedOption);
   const activeMeta = FORMAT_META[activeFormat];
   const activePreviewMode = previewModeByFormat[activeFormat];
   const activePreviewLabel =
-    activePreviewMode === "canonical_asset"
-      ? "Canonical production preview"
-      : activePreviewMode === "fallback_composite"
-        ? "Fallback recomposited preview"
-        : activePreviewMode === "fallback_design_doc"
-          ? "Fallback design-doc preview"
-          : "Fallback preview asset";
+    isInProgress
+      ? "Generation in progress"
+      : activePreviewMode === "canonical_asset"
+        ? "Canonical production preview"
+        : activePreviewMode === "fallback_composite"
+          ? "Settled fallback recomposited preview"
+          : activePreviewMode === "fallback_design_doc"
+            ? "Settled fallback design-doc preview"
+            : "Settled fallback preview asset";
   const activePreviewToneClass =
-    activePreviewMode === "canonical_asset" ? "text-emerald-700" : "text-amber-700";
+    isInProgress ? "text-sky-700" : activePreviewMode === "canonical_asset" ? "text-emerald-700" : "text-amber-700";
+  const aspectRecoverySummary = debugFinalistCanonicalization
+    ? PREVIEW_FORMATS.flatMap((format) => {
+        const attempts = debugFinalistCanonicalization.aspectRecoveryAttemptsByShape[format];
+        if (attempts <= 0) {
+          return [];
+        }
+        return [`${format} x${attempts}`];
+      }).join(", ")
+    : "";
+  const canonicalizationStatusLine =
+    showDebugChips && debugFinalistCanonicalization?.attempted
+      ? debugFinalistCanonicalization.succeeded === true
+        ? aspectRecoverySummary
+          ? `Finalist canonicalization passed after recovery: ${aspectRecoverySummary}`
+          : "Finalist canonicalization passed without aspect recovery."
+        : debugFinalistCanonicalization.succeeded === false
+          ? `Finalist canonicalization failed: ${
+              debugFinalistCanonicalization.canonicalizationFailureReasons.join("; ") || "canonical assets remained invalid"
+            }`
+          : "Finalist canonicalization ran."
+      : null;
   const infoChips = [
     isTitleStage ? "Title-Integrated" : null,
     wantsSeriesMark ? "Series Mark Attempt" : null,
@@ -225,6 +252,16 @@ export function DirectionOptionCard({
     showDebugChips && debugBackgroundSource ? `Background src: ${debugBackgroundSource}` : null,
     showDebugChips && debugLockupSource ? `Lockup src: ${debugLockupSource}` : null,
     showDebugChips && debugBackgroundFailureReason ? `Background fail: ${debugBackgroundFailureReason}` : null,
+    showDebugChips && debugFinalistCanonicalization?.attempted
+      ? `Canonical finalist: ${
+          debugFinalistCanonicalization.succeeded === true
+            ? "passed"
+            : debugFinalistCanonicalization.succeeded === false
+              ? "failed"
+              : "ran"
+        }`
+      : null,
+    showDebugChips && aspectRecoverySummary ? `Aspect recovery: ${aspectRecoverySummary}` : null,
     showDebugChips && debugImageCalls
       ? `Image calls: ${debugImageCalls.total} (retry ${debugImageCalls.retries})`
       : null,
@@ -245,7 +282,7 @@ export function DirectionOptionCard({
     showDebugChips && (debugBackgroundAnchorSrc || debugLockupAnchorSrc) ? "Anchor sources attached" : null
   ].filter((chip): chip is string => Boolean(chip));
   const canShowBestEffortBackground =
-    showDebugChips && debugBackgroundSource === "fallback" && Boolean(debugBestEffortBackground?.imageUrl);
+    !isInProgress && showDebugChips && debugBackgroundSource === "fallback" && Boolean(debugBestEffortBackground?.imageUrl);
   const aspectCompletenessLine =
     showDebugChips && debugAspectAssets
       ? `Aspect completeness: wide ${debugAspectAssets.widescreen}, square ${debugAspectAssets.square}, vertical ${debugAspectAssets.vertical}`
@@ -279,14 +316,19 @@ export function DirectionOptionCard({
         <div className="flex items-center justify-between gap-2">
           <h3 className="text-base font-semibold text-slate-900">{optionLabel}</h3>
           <div className="flex items-center gap-2">
+            {isInProgress ? (
+              <span className="rounded-full border border-sky-300 bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
+                Generating
+              </span>
+            ) : null}
             {isFallbackOption ? (
               <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
-                Generation failed (fallback)
+                {isProviderFailure ? "Provider failed (fallback)" : "Generation failed (fallback)"}
               </span>
             ) : null}
             {isFailedOption ? (
               <span className="rounded-full border border-rose-300 bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-800">
-                Generation failed
+                {isProviderFailure ? "Provider failed" : "Generation failed"}
               </span>
             ) : null}
             {isApprovedFinal ? <span className="rounded-full bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">Final</span> : null}
@@ -303,12 +345,14 @@ export function DirectionOptionCard({
           ))}
         </div>
         {aspectCompletenessLine ? <p className="mt-1 text-xs text-slate-600">{aspectCompletenessLine}</p> : null}
+        {canonicalizationStatusLine ? <p className="mt-1 text-xs text-slate-600">{canonicalizationStatusLine}</p> : null}
       </div>
 
       <div className="space-y-2">
         <GenerationPreviewPane
           label={activeMeta.label}
           imageUrl={previewUrls[activeFormat]}
+          executionState={generationLifecycleState}
           aspectClass={activeMeta.heroAspectClass ?? activeMeta.aspectClass}
           tintClass={tintClass}
           width={activeMeta.width}
@@ -332,6 +376,7 @@ export function DirectionOptionCard({
                 <GenerationPreviewPane
                   label={formatMeta.label}
                   imageUrl={previewUrls[format]}
+                  executionState={generationLifecycleState}
                   aspectClass={formatMeta.aspectClass}
                   tintClass={tintClass}
                   width={formatMeta.width}
@@ -341,13 +386,19 @@ export function DirectionOptionCard({
                 />
                 <span className="mt-1 block px-1 text-[11px] font-medium text-slate-500">
                   {formatMeta.label}
-                  {previewMode === "canonical_asset" ? "" : " • fallback"}
+                  {isInProgress ? " • generating" : previewMode === "canonical_asset" ? "" : " • fallback"}
                 </span>
               </button>
             );
           })}
         </div>
       </div>
+
+      {isInProgress ? (
+        <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-medium text-sky-900">
+          Generation is still in progress. Preview cards are intentionally held in a generating state until this option settles.
+        </div>
+      ) : null}
 
       {canShowBestEffortBackground && debugBestEffortBackground ? (
         <div className="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-2.5">
@@ -366,6 +417,7 @@ export function DirectionOptionCard({
               <GenerationPreviewPane
                 label="Best-effort"
                 imageUrl={debugBestEffortBackground.imageUrl}
+                executionState="GENERATION_FAILED_CREATIVE"
                 aspectClass={FORMAT_META.wide.aspectClass}
                 tintClass={tintClass}
                 width={FORMAT_META.wide.width}
@@ -402,7 +454,7 @@ export function DirectionOptionCard({
       ) : null}
       {showGenerationFailureWarning ? (
         <div className="rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-900">
-          <p>{isFallbackOption ? "Generation failed (fallback)" : "Generation failed."}</p>
+          <p>{isProviderFailure ? (isFallbackOption ? "Provider failed (fallback)." : "Provider failed.") : isFallbackOption ? "Generation failed (fallback)." : "Generation failed."}</p>
           {topInvalidReasonLabels.length > 0 ? (
             <ul className="mt-2 space-y-1 text-[11px] font-medium text-rose-900/90">
               {topInvalidReasonLabels.map((reasonLabel) => (
@@ -429,6 +481,14 @@ export function DirectionOptionCard({
               <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">failedChecks</p>
               <pre className="overflow-x-auto rounded bg-white p-2 text-[11px] text-slate-700">
                 {JSON.stringify(failedChecks, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+          {debugFinalistCanonicalization ? (
+            <div className="mt-2 space-y-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">finalistCanonicalization</p>
+              <pre className="overflow-x-auto rounded bg-white p-2 text-[11px] text-slate-700">
+                {JSON.stringify(debugFinalistCanonicalization, null, 2)}
               </pre>
             </div>
           ) : null}

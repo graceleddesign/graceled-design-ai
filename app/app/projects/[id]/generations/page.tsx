@@ -3,6 +3,20 @@ import { notFound } from "next/navigation";
 import { approveFinalDesignAction } from "@/app/app/projects/actions";
 import { DirectionOptionCard } from "@/components/direction-option-card";
 import { requireSession } from "@/lib/auth";
+import {
+  type GenerationFailureReason,
+  type GenerationLifecycleState,
+  type GenerationOptionStatus,
+  type GenerationRoundFailureReason,
+  type GenerationRoundStatus,
+  type ProviderFailureReason,
+  isGenerationFailureReason,
+  isGenerationLifecycleState,
+  isGenerationRoundFailureReason,
+  isGenerationRoundStatus,
+  isProviderFailureReason,
+  resolveGenerationLifecycleState
+} from "@/lib/generation-state";
 import { optionLabel } from "@/lib/option-label";
 import { prisma } from "@/lib/prisma";
 import {
@@ -25,14 +39,25 @@ type DebugAspectAssets = {
   vertical: AspectAssetStatus;
 };
 
+type DebugFinalistCanonicalization = {
+  attempted: boolean;
+  succeeded: boolean | null;
+  aspectRecoveryAttemptsByShape: Record<"square" | "wide" | "tall", number>;
+  aspectRecoveryReasonsByShape: Record<"square" | "wide" | "tall", string[]>;
+  canonicalAssetPathsByShape: Record<"square" | "wide" | "tall", string | null>;
+  canonicalizationFailureReasons: string[];
+};
+
 type OptionDesignSpecSummary = {
-  optionStatus: "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
+  optionStatus: GenerationOptionStatus;
+  generationLifecycleState: GenerationLifecycleState;
   roundHasFallback: boolean;
-  roundStatus: "COMPLETED" | "PARTIAL" | "FAILED" | null;
+  roundStatus: GenerationRoundStatus | null;
   roundCompletedCount: number | null;
   roundAttemptCount: number | null;
   roundRequiredCompletedCount: number | null;
-  roundFailureReason: "INSUFFICIENT_NONFALLBACK_OPTIONS" | "RATE_LIMIT" | "BUDGET" | "UNKNOWN" | null;
+  roundFailureReason: GenerationRoundFailureReason | null;
+  roundOperationalFailureReason: ProviderFailureReason | null;
   wantsTitleStage: boolean;
   wantsSeriesMark: boolean;
   styleBucket: string | null;
@@ -53,16 +78,9 @@ type OptionDesignSpecSummary = {
   debugLockupAnchorSrc: string | null;
   debugBackgroundSource: "generated" | "reused" | "fallback" | null;
   debugLockupSource: "generated" | "reused" | "fallback" | null;
-  debugBackgroundFailureReason:
-    | "ALL_TEXT"
-    | "ALL_SCAFFOLD"
-    | "API_ERROR"
-    | "RATE_LIMIT"
-    | "BUDGET"
-    | "MISSING_ASPECT_ASSET"
-    | "UNKNOWN"
-    | null;
+  debugBackgroundFailureReason: GenerationFailureReason | null;
   debugAspectAssets: DebugAspectAssets | null;
+  debugFinalistCanonicalization: DebugFinalistCanonicalization | null;
   debugWarning: string | null;
   debugImageCalls: {
     total: number;
@@ -87,15 +105,7 @@ type OptionDesignSpecSummary = {
     imageUrl: string;
     score: number | null;
     failedChecks: Array<"textOk" | "scaffoldOk" | "motifOk" | "toneOk">;
-    failureReason:
-      | "ALL_TEXT"
-      | "ALL_SCAFFOLD"
-      | "API_ERROR"
-      | "RATE_LIMIT"
-      | "BUDGET"
-      | "MISSING_ASPECT_ASSET"
-      | "UNKNOWN"
-      | null;
+    failureReason: GenerationFailureReason | null;
     eligibleCount: number;
     totalCandidates: number;
     failureCounts: {
@@ -116,26 +126,12 @@ const OPTION_TINTS = [
   "from-slate-300 to-slate-100"
 ];
 
-const BACKGROUND_FAILURE_REASONS = [
-  "ALL_TEXT",
-  "ALL_SCAFFOLD",
-  "API_ERROR",
-  "RATE_LIMIT",
-  "BUDGET",
-  "MISSING_ASPECT_ASSET",
-  "UNKNOWN"
-] as const;
 const BACKGROUND_CHECK_KEYS = ["textOk", "scaffoldOk", "motifOk", "toneOk"] as const;
 const ROUND1_IMAGE_CALL_CAP_WARNING = "Image call cap reached; returning best available.";
 const REQUIRED_COMPLETED_OPTIONS_PER_ROUND = 3;
 const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 
-type BackgroundFailureReason = (typeof BACKGROUND_FAILURE_REASONS)[number];
 type BackgroundCheckKey = (typeof BACKGROUND_CHECK_KEYS)[number];
-
-function isRoundStatus(value: unknown): value is "COMPLETED" | "PARTIAL" | "FAILED" {
-  return value === "COMPLETED" || value === "PARTIAL" || value === "FAILED";
-}
 
 function isAspectAssetStatus(value: unknown): value is AspectAssetStatus {
   return value === "ok" || value === "missing" || value === "placeholder";
@@ -233,20 +229,86 @@ function deriveAspectAssetsFromPreview(output: unknown): DebugAspectAssets | nul
   };
 }
 
+function parseDebugFinalistCanonicalization(debug: unknown): DebugFinalistCanonicalization | null {
+  if (!debug || typeof debug !== "object" || Array.isArray(debug)) {
+    return null;
+  }
+
+  const value = debug as {
+    finalistCanonicalizationAttempted?: unknown;
+    finalistCanonicalizationSucceeded?: unknown;
+    aspectRecoveryAttemptsByShape?: unknown;
+    aspectRecoveryReasonsByShape?: unknown;
+    canonicalAssetPathsByShape?: unknown;
+    canonicalizationFailureReasons?: unknown;
+  };
+  const attempted = value.finalistCanonicalizationAttempted === true;
+  const succeededCandidate = value.finalistCanonicalizationSucceeded;
+  const succeeded =
+    succeededCandidate === true ? true : succeededCandidate === false ? false : null;
+  const attemptsObject =
+    value.aspectRecoveryAttemptsByShape && typeof value.aspectRecoveryAttemptsByShape === "object" && !Array.isArray(value.aspectRecoveryAttemptsByShape)
+      ? (value.aspectRecoveryAttemptsByShape as Record<string, unknown>)
+      : null;
+  const reasonsObject =
+    value.aspectRecoveryReasonsByShape && typeof value.aspectRecoveryReasonsByShape === "object" && !Array.isArray(value.aspectRecoveryReasonsByShape)
+      ? (value.aspectRecoveryReasonsByShape as Record<string, unknown>)
+      : null;
+  const assetPathsObject =
+    value.canonicalAssetPathsByShape && typeof value.canonicalAssetPathsByShape === "object" && !Array.isArray(value.canonicalAssetPathsByShape)
+      ? (value.canonicalAssetPathsByShape as Record<string, unknown>)
+      : null;
+  const canonicalizationFailureReasons = Array.isArray(value.canonicalizationFailureReasons)
+    ? value.canonicalizationFailureReasons.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+  if (!attempted && succeeded === null && !attemptsObject && !reasonsObject && !assetPathsObject && canonicalizationFailureReasons.length === 0) {
+    return null;
+  }
+
+  const readAttemptCount = (shape: "square" | "wide" | "tall"): number => {
+    const candidate = attemptsObject?.[shape];
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : 0;
+  };
+  const readReasonList = (shape: "square" | "wide" | "tall"): string[] => {
+    const candidate = reasonsObject?.[shape];
+    return Array.isArray(candidate)
+      ? candidate.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      : [];
+  };
+  const readAssetPath = (shape: "square" | "wide" | "tall"): string | null => normalizeAssetPathForCompletenessCheck(assetPathsObject?.[shape]);
+
+  return {
+    attempted,
+    succeeded,
+    aspectRecoveryAttemptsByShape: {
+      square: readAttemptCount("square"),
+      wide: readAttemptCount("wide"),
+      tall: readAttemptCount("tall")
+    },
+    aspectRecoveryReasonsByShape: {
+      square: readReasonList("square"),
+      wide: readReasonList("wide"),
+      tall: readReasonList("tall")
+    },
+    canonicalAssetPathsByShape: {
+      square: readAssetPath("square"),
+      wide: readAssetPath("wide"),
+      tall: readAssetPath("tall")
+    },
+    canonicalizationFailureReasons
+  };
+}
+
 function resolveOptionGenerationStatus(
   output: unknown,
   dbStatus?: string,
   assets?: Array<{ kind: string; slot: string | null; file_path: string }>
-): "COMPLETED" | "FAILED_GENERATION" | "FALLBACK" {
+): GenerationOptionStatus {
   return resolveProductionValidOptionStatus({
     output,
     dbStatus,
     assets
   });
-}
-
-function isBackgroundFailureReason(value: unknown): value is BackgroundFailureReason {
-  return typeof value === "string" && BACKGROUND_FAILURE_REASONS.includes(value as BackgroundFailureReason);
 }
 
 function normalizeAssetUrl(filePath: string): string {
@@ -264,16 +326,22 @@ function normalizeAssetUrl(filePath: string): string {
 
 function readDesignSpecSummary(
   output: unknown,
-  optionStatus: "COMPLETED" | "FAILED_GENERATION" | "FALLBACK"
+  optionStatus: GenerationOptionStatus,
+  dbStatus?: string | null
 ): OptionDesignSpecSummary {
   const fallback: OptionDesignSpecSummary = {
     optionStatus,
+    generationLifecycleState: resolveGenerationLifecycleState({
+      dbStatus,
+      optionStatus
+    }),
     roundHasFallback: false,
     roundStatus: null,
     roundCompletedCount: null,
     roundAttemptCount: null,
     roundRequiredCompletedCount: null,
     roundFailureReason: null,
+    roundOperationalFailureReason: null,
     wantsTitleStage: false,
     wantsSeriesMark: false,
     styleBucket: null,
@@ -296,6 +364,7 @@ function readDesignSpecSummary(
     debugLockupSource: null,
     debugBackgroundFailureReason: null,
     debugAspectAssets: null,
+    debugFinalistCanonicalization: null,
     debugWarning: null,
     debugImageCalls: null,
     debugRateLimitWaitMs: null,
@@ -325,6 +394,9 @@ function readDesignSpecSummary(
     ? (debugObject as { roundRequiredCompletedCount?: unknown }).roundRequiredCompletedCount
     : null;
   const roundFailureReasonCandidate = debugObject ? (debugObject as { roundFailureReason?: unknown }).roundFailureReason : null;
+  const roundOperationalFailureReasonCandidate = debugObject
+    ? (debugObject as { roundOperationalFailureReason?: unknown }).roundOperationalFailureReason
+    : null;
   const debugBackgroundSourceCandidate = debugObject
     ? (debugObject as { backgroundSource?: unknown }).backgroundSource
     : null;
@@ -332,24 +404,11 @@ function readDesignSpecSummary(
   const debugBackgroundFailureReasonCandidate = debugObject
     ? (debugObject as { backgroundFailureReason?: unknown }).backgroundFailureReason
     : null;
-  const debugAspectAssetsCandidate = debugObject ? (debugObject as { aspectAssets?: unknown }).aspectAssets : null;
-  const debugAspectAssets =
-    debugAspectAssetsCandidate && typeof debugAspectAssetsCandidate === "object" && !Array.isArray(debugAspectAssetsCandidate)
-      ? (() => {
-          const aspectAssetsObject = debugAspectAssetsCandidate as Record<string, unknown>;
-          const widescreen = aspectAssetsObject.widescreen;
-          const square = aspectAssetsObject.square;
-          const vertical = aspectAssetsObject.vertical;
-          if (!isAspectAssetStatus(widescreen) || !isAspectAssetStatus(square) || !isAspectAssetStatus(vertical)) {
-            return null;
-          }
-          return {
-            widescreen,
-            square,
-            vertical
-          } satisfies DebugAspectAssets;
-        })()
-      : deriveAspectAssetsFromPreview(output);
+  const generationLifecycleStateCandidate = debugObject
+    ? (debugObject as { generationLifecycleState?: unknown }).generationLifecycleState
+    : null;
+  const debugAspectAssets = parseDebugAspectAssets(output) || deriveAspectAssetsFromPreview(output);
+  const debugFinalistCanonicalization = parseDebugFinalistCanonicalization(debugObject);
   const warningsCandidate = debugObject ? (debugObject as { warnings?: unknown }).warnings : null;
   const warnings = Array.isArray(warningsCandidate)
     ? warningsCandidate.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -438,7 +497,7 @@ function readDesignSpecSummary(
   const latestAttemptFailureReasonCandidate = latestAttemptObject
     ? (latestAttemptObject as { failureReason?: unknown }).failureReason
     : null;
-  const latestAttemptFailureReason = isBackgroundFailureReason(latestAttemptFailureReasonCandidate)
+  const latestAttemptFailureReason = isGenerationFailureReason(latestAttemptFailureReasonCandidate)
     ? latestAttemptFailureReasonCandidate
     : null;
   const parsedAttemptCandidates = (() => {
@@ -515,7 +574,7 @@ function readDesignSpecSummary(
             imageUrl: bestEffortCandidate.imageUrl,
             score: Number.isFinite(bestEffortCandidate.score) ? bestEffortCandidate.score : null,
             failedChecks: BACKGROUND_CHECK_KEYS.filter((checkKey) => !bestEffortCandidate.checks[checkKey]),
-            failureReason: latestAttemptFailureReason || (isBackgroundFailureReason(debugBackgroundFailureReasonCandidate)
+            failureReason: latestAttemptFailureReason || (isGenerationFailureReason(debugBackgroundFailureReasonCandidate)
               ? debugBackgroundFailureReasonCandidate
               : null),
             eligibleCount,
@@ -572,7 +631,7 @@ function readDesignSpecSummary(
     return {
       ...fallback,
       roundHasFallback: roundHasFallbackCandidate === true,
-      roundStatus: isRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
+      roundStatus: isGenerationRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
       roundCompletedCount:
         typeof roundCompletedCountCandidate === "number" && Number.isFinite(roundCompletedCountCandidate)
           ? roundCompletedCountCandidate
@@ -585,13 +644,17 @@ function readDesignSpecSummary(
         typeof roundRequiredCompletedCountCandidate === "number" && Number.isFinite(roundRequiredCompletedCountCandidate)
           ? roundRequiredCompletedCountCandidate
           : null,
-      roundFailureReason:
-        roundFailureReasonCandidate === "INSUFFICIENT_NONFALLBACK_OPTIONS" ||
-        roundFailureReasonCandidate === "RATE_LIMIT" ||
-        roundFailureReasonCandidate === "BUDGET" ||
-        roundFailureReasonCandidate === "UNKNOWN"
-          ? roundFailureReasonCandidate
-          : null,
+      roundFailureReason: isGenerationRoundFailureReason(roundFailureReasonCandidate) ? roundFailureReasonCandidate : null,
+      roundOperationalFailureReason: isProviderFailureReason(roundOperationalFailureReasonCandidate)
+        ? roundOperationalFailureReasonCandidate
+        : null,
+      generationLifecycleState: isGenerationLifecycleState(generationLifecycleStateCandidate)
+        ? generationLifecycleStateCandidate
+        : resolveGenerationLifecycleState({
+            dbStatus,
+            optionStatus,
+            failureReason: isGenerationFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null
+          }),
       debugBackgroundAnchorSrc,
       debugLockupAnchorSrc,
       debugBackgroundSource:
@@ -606,9 +669,9 @@ function readDesignSpecSummary(
         debugLockupSourceCandidate === "fallback"
           ? debugLockupSourceCandidate
           : null,
-      debugBackgroundFailureReason:
-        isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+      debugBackgroundFailureReason: isGenerationFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
       debugAspectAssets,
+      debugFinalistCanonicalization,
       debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
       debugImageCalls,
       debugRateLimitWaitMs,
@@ -794,8 +857,15 @@ function readDesignSpecSummary(
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
     wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
     optionStatus,
+    generationLifecycleState: isGenerationLifecycleState(generationLifecycleStateCandidate)
+      ? generationLifecycleStateCandidate
+      : resolveGenerationLifecycleState({
+          dbStatus,
+          optionStatus,
+          failureReason: isGenerationFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null
+        }),
     roundHasFallback: roundHasFallbackCandidate === true,
-    roundStatus: isRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
+    roundStatus: isGenerationRoundStatus(roundStatusCandidate) ? roundStatusCandidate : null,
     roundCompletedCount:
       typeof roundCompletedCountCandidate === "number" && Number.isFinite(roundCompletedCountCandidate)
         ? roundCompletedCountCandidate
@@ -808,13 +878,10 @@ function readDesignSpecSummary(
       typeof roundRequiredCompletedCountCandidate === "number" && Number.isFinite(roundRequiredCompletedCountCandidate)
         ? roundRequiredCompletedCountCandidate
         : null,
-    roundFailureReason:
-      roundFailureReasonCandidate === "INSUFFICIENT_NONFALLBACK_OPTIONS" ||
-      roundFailureReasonCandidate === "RATE_LIMIT" ||
-      roundFailureReasonCandidate === "BUDGET" ||
-      roundFailureReasonCandidate === "UNKNOWN"
-        ? roundFailureReasonCandidate
-        : null,
+    roundFailureReason: isGenerationRoundFailureReason(roundFailureReasonCandidate) ? roundFailureReasonCandidate : null,
+    roundOperationalFailureReason: isProviderFailureReason(roundOperationalFailureReasonCandidate)
+      ? roundOperationalFailureReasonCandidate
+      : null,
     styleBucket: styleBucketCandidate,
     styleTone: styleToneCandidate,
     styleMedium: styleMediumCandidate,
@@ -845,9 +912,9 @@ function readDesignSpecSummary(
       debugLockupSourceCandidate === "fallback"
         ? debugLockupSourceCandidate
         : null,
-    debugBackgroundFailureReason:
-      isBackgroundFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
+    debugBackgroundFailureReason: isGenerationFailureReason(debugBackgroundFailureReasonCandidate) ? debugBackgroundFailureReasonCandidate : null,
     debugAspectAssets,
+    debugFinalistCanonicalization,
     debugWarning: debugWarning && debugWarning.trim() ? debugWarning.trim() : null,
     debugImageCalls,
     debugRateLimitWaitMs,
@@ -1086,15 +1153,22 @@ export default async function ProjectGenerationsPage({
               const validation = generationValidationById.get(generation.id);
               return readDesignSpecSummary(
                 generation.output,
-                validation?.status ?? resolveOptionGenerationStatus(generation.output, generation.status, generation.assets)
+                validation?.status ?? resolveOptionGenerationStatus(generation.output, generation.status, generation.assets),
+                generation.status
               );
             });
+            const roundHasActiveGenerations = roundGenerations.some(
+              (generation) => generation.status === "RUNNING" || generation.status === "QUEUED"
+            );
             const persistedRoundStatus =
+              roundDesignSummaries.find((summary) => summary.roundStatus === "RUNNING")?.roundStatus ||
               roundDesignSummaries.find((summary) => summary.roundStatus === "FAILED")?.roundStatus ||
               roundDesignSummaries.find((summary) => summary.roundStatus === "PARTIAL")?.roundStatus ||
               roundDesignSummaries.find((summary) => summary.roundStatus === "COMPLETED")?.roundStatus ||
               null;
-            const hasFailedOptions = roundDesignSummaries.some((summary) => summary.optionStatus !== "COMPLETED");
+            const hasFailedOptions = roundDesignSummaries.some(
+              (summary) => summary.optionStatus === "FAILED_GENERATION" || summary.optionStatus === "FALLBACK"
+            );
             const persistedCompletedCount = roundDesignSummaries.find((summary) => summary.roundCompletedCount !== null)?.roundCompletedCount ?? null;
             const persistedAttemptCount = roundDesignSummaries.find((summary) => summary.roundAttemptCount !== null)?.roundAttemptCount ?? null;
             const persistedRequiredCompletedCount =
@@ -1102,25 +1176,35 @@ export default async function ProjectGenerationsPage({
               REQUIRED_COMPLETED_OPTIONS_PER_ROUND;
             const roundFailureReason =
               roundDesignSummaries.find((summary) => summary.roundFailureReason !== null)?.roundFailureReason || null;
+            const roundOperationalFailureReason =
+              roundDesignSummaries.find((summary) => summary.roundOperationalFailureReason !== null)?.roundOperationalFailureReason || null;
             const computedCompletedCount = roundDesignSummaries.filter((summary) => summary.optionStatus === "COMPLETED").length;
             const roundCompletedCount = persistedCompletedCount ?? computedCompletedCount;
-            const computedRoundStatus = persistedRoundStatus || (hasFailedOptions
-              ? roundDesignSummaries.some((summary) => summary.optionStatus === "COMPLETED")
-                ? "PARTIAL"
-                : "FAILED"
-              : "COMPLETED");
+            const computedRoundStatus: GenerationRoundStatus = roundHasActiveGenerations
+              ? "RUNNING"
+              : persistedRoundStatus ||
+                (hasFailedOptions
+                  ? roundDesignSummaries.some((summary) => summary.optionStatus === "COMPLETED")
+                    ? "PARTIAL"
+                    : "FAILED"
+                  : "COMPLETED");
             const roundHasFallback = roundDesignSummaries.some(
               (summary) => summary.roundHasFallback || summary.optionStatus === "FALLBACK"
             );
             const roundNeedsRetry =
-              computedRoundStatus === "FAILED" || roundCompletedCount < persistedRequiredCompletedCount;
+              computedRoundStatus !== "RUNNING" &&
+              (computedRoundStatus === "FAILED" || roundCompletedCount < persistedRequiredCompletedCount);
             const retryHref = round === 1 ? `/app/projects/${project.id}` : `/app/projects/${project.id}/feedback?round=${round}`;
             const roundFailureMessage =
-              roundFailureReason === "RATE_LIMIT"
-                ? "Rate limit reached before 3 real options were completed."
-                : roundFailureReason === "BUDGET"
-                  ? "Generation budget was reached before 3 real options were completed."
-                  : "Couldn’t produce 3 real options. Retry.";
+              roundFailureReason === "ROUND_ABORTED_PROVIDER_FAILURE"
+                ? roundOperationalFailureReason === "PROVIDER_MODEL_UNAVAILABLE"
+                  ? "The configured image model was unavailable, so the round aborted before 3 valid options could finish."
+                  : roundOperationalFailureReason === "PROVIDER_QUOTA_OR_RATE_LIMIT"
+                    ? "Image generation hit quota or rate limits, so the round aborted before 3 valid options could finish."
+                    : roundOperationalFailureReason === "PROVIDER_AUTH_OR_CONFIG_ERROR"
+                      ? "Image provider auth or config failed, so the round aborted before 3 valid options could finish."
+                      : "The image provider failed upstream, so the round aborted before 3 valid options could finish."
+                : "Couldn’t produce 3 valid options after a live provider path. Retry.";
 
             return (
               <div key={round} className="space-y-3">
@@ -1128,6 +1212,11 @@ export default async function ProjectGenerationsPage({
                   <h2 className="text-lg font-semibold">Round {round}</h2>
                   {roundIndex === 0 ? (
                     <span className="rounded-full bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">Latest</span>
+                  ) : null}
+                  {computedRoundStatus === "RUNNING" ? (
+                    <span className="rounded-full border border-sky-300 bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
+                      In progress
+                    </span>
                   ) : null}
                   {computedRoundStatus === "PARTIAL" ? (
                     <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
@@ -1150,6 +1239,11 @@ export default async function ProjectGenerationsPage({
                     </span>
                   ) : null}
                 </div>
+                {computedRoundStatus === "RUNNING" ? (
+                  <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900">
+                    Round work is still in flight. In-progress options are intentionally shown as generating instead of settled fallback failures.
+                  </div>
+                ) : null}
                 {roundNeedsRetry ? (
                   <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2">
                     <p className="text-sm text-rose-900">
@@ -1185,7 +1279,7 @@ export default async function ProjectGenerationsPage({
                     generation.output as { meta?: { styleRefCount?: unknown } } | null
                   )?.meta?.styleRefCount;
                   const designSpecSummary =
-                    roundDesignSummaries[optionIndex] || readDesignSpecSummary(generation.output, generationValidation.status);
+                    roundDesignSummaries[optionIndex] || readDesignSpecSummary(generation.output, generationValidation.status, generation.status);
                   const previewUrls = {
                     square: getGenerationPreviewUrl(project.id, generation.id, "square", generation.updatedAt, {
                       debugStage: debugStageEnabled
@@ -1212,6 +1306,7 @@ export default async function ProjectGenerationsPage({
                       round={round}
                       generationId={generation.id}
                       generationStatus={designSpecSummary.optionStatus}
+                      generationLifecycleState={designSpecSummary.generationLifecycleState}
                       optionLabel={label}
                       tintClass={tintClass}
                       isApprovedFinal={isApprovedFinal}
@@ -1239,6 +1334,7 @@ export default async function ProjectGenerationsPage({
                       debugLockupSource={designSpecSummary.debugLockupSource}
                       debugBackgroundFailureReason={designSpecSummary.debugBackgroundFailureReason}
                       debugAspectAssets={designSpecSummary.debugAspectAssets}
+                      debugFinalistCanonicalization={designSpecSummary.debugFinalistCanonicalization}
                       debugWarning={designSpecSummary.debugWarning}
                       debugImageCalls={designSpecSummary.debugImageCalls}
                       debugRateLimitWaitMs={designSpecSummary.debugRateLimitWaitMs}

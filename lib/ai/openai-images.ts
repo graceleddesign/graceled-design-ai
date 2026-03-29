@@ -2,8 +2,7 @@ import "server-only";
 
 import OpenAI from "openai";
 import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
-
-const DEFAULT_IMAGE_MODEL = "gpt-image-1.5";
+import { normalizeImageProviderError, resolveImageProviderConfig } from "@/lib/image-provider";
 
 export type OpenAiImageSize = "1024x1024" | "1792x1024" | "1024x1792";
 export type OpenAiImageQuality = "low" | "medium" | "high" | "auto";
@@ -46,26 +45,30 @@ export async function generateBackgroundPng(params: {
   quality?: OpenAiImageQuality;
 }): Promise<Buffer> {
   const client = getOpenAiClient();
-  const model = process.env.OPENAI_IMAGE_MODEL?.trim() || DEFAULT_IMAGE_MODEL;
+  const providerConfig = resolveImageProviderConfig();
   const style = process.env.OPENAI_IMAGE_STYLE?.trim() || "";
 
-  const response = await runWithGptImage429Retry(() =>
-    runWithGptImageBudget(() =>
-      client.images.generate({
-        model,
-        prompt: params.prompt,
-        size: params.size,
-        quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? "high"),
-        response_format: "b64_json",
-        ...(style ? { style } : {})
-      } as never)
-    )
-  );
+  try {
+    const response = await runWithGptImage429Retry(() =>
+      runWithGptImageBudget(() =>
+        client.images.generate({
+          model: providerConfig.model,
+          prompt: params.prompt,
+          size: params.size,
+          quality: normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? "high"),
+          response_format: "b64_json",
+          ...(style ? { style } : {})
+        } as never)
+      )
+    );
 
-  const b64 = response.data?.[0]?.b64_json;
-  if (!b64) {
-    throw new Error("OpenAI images.generate returned no image data");
+    const b64 = response.data?.[0]?.b64_json;
+    if (!b64) {
+      throw new Error("OpenAI images.generate returned no image data");
+    }
+
+    return Buffer.from(b64, "base64");
+  } catch (error) {
+    throw normalizeImageProviderError(error, providerConfig);
   }
-
-  return Buffer.from(b64, "base64");
 }

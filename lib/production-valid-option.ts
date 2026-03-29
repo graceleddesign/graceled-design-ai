@@ -1,9 +1,9 @@
 import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
+import { type GenerationFailureReason, type GenerationOptionStatus } from "@/lib/generation-state";
 
 export const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 const ASPECT_ASSET_DERIVED_PATH_PATTERN = /(^|[-_/])derived([\-_.\/]|$)/i;
 
-export type GenerationOptionStatus = "COMPLETED" | "FAILED_GENERATION" | "FALLBACK";
 export type AspectAssetStatus = "ok" | "missing" | "placeholder";
 export type OutputAspect = "widescreen" | "square" | "vertical";
 export type PreviewShape = "square" | "wide" | "tall";
@@ -314,18 +314,24 @@ function formatPreviewModeLabel(mode: string | null | undefined): string {
   return "non-canonical preview";
 }
 
-function formatBackgroundFailureReasonLabel(reason: string | null | undefined): string {
+function formatBackgroundFailureReasonLabel(reason: GenerationFailureReason | string | null | undefined): string {
   if (reason === "ALL_TEXT") {
     return "all candidates contained text";
   }
   if (reason === "ALL_SCAFFOLD") {
     return "all candidates looked scaffold-like";
   }
-  if (reason === "API_ERROR") {
-    return "image generation API error";
+  if (reason === "PROVIDER_MODEL_UNAVAILABLE") {
+    return "configured image model was unavailable";
   }
-  if (reason === "RATE_LIMIT") {
-    return "image generation hit a rate limit";
+  if (reason === "PROVIDER_QUOTA_OR_RATE_LIMIT") {
+    return "image generation quota or rate limit was hit";
+  }
+  if (reason === "PROVIDER_AUTH_OR_CONFIG_ERROR") {
+    return "image provider auth or config failed";
+  }
+  if (reason === "PROVIDER_TRANSIENT_ERROR") {
+    return "image provider had a transient upstream failure";
   }
   if (reason === "BUDGET") {
     return "image generation budget was exhausted";
@@ -347,7 +353,7 @@ function formatStatusFailureReasonLabel(reason: string): string {
     return "Generation is marked failed";
   }
   if (reason === "generation_db_status_running") {
-    return "Generation is still marked running";
+    return "Generation is still in progress";
   }
   if (reason === "generation_db_status_queued") {
     return "Generation is still queued";
@@ -1130,9 +1136,10 @@ export function resolveProductionValidOption(params: {
   const backgroundAssetPaths = readBackgroundAssetPaths(params.assets);
   const lockupAssetPath = readLockupAssetPath(params.assets);
   const fallbackLike = readFallbackLikeStatus(params.output);
-  const dbFailedLike =
-    params.dbStatus === "FAILED" || params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED" || !params.output;
+  const dbInProgress = params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED";
+  const dbFailedLike = params.dbStatus === "FAILED" || dbInProgress || !params.output;
   const valid =
+    !dbInProgress &&
     !fallbackLike &&
     !dbFailedLike &&
     hasCanonicalDesignDoc &&
@@ -1317,11 +1324,7 @@ export function resolveProductionValidOption(params: {
     export: exportInvalidReasons,
     exportMissingSlots
   };
-  const status: GenerationOptionStatus = fallbackLike
-    ? "FALLBACK"
-    : valid
-      ? "COMPLETED"
-      : "FAILED_GENERATION";
+  const status: GenerationOptionStatus = dbInProgress ? "IN_PROGRESS" : fallbackLike ? "FALLBACK" : valid ? "COMPLETED" : "FAILED_GENERATION";
 
   return {
     valid,

@@ -1,10 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import { type GenerationLifecycleState } from "@/lib/generation-state";
 
 type GenerationPreviewPaneProps = {
   label: string;
   imageUrl: string;
+  executionState?: GenerationLifecycleState;
   aspectClass: string;
   tintClass: string;
   width: number;
@@ -18,6 +20,7 @@ type GenerationPreviewPaneProps = {
 export function GenerationPreviewPane({
   label,
   imageUrl,
+  executionState,
   aspectClass,
   tintClass,
   width,
@@ -28,7 +31,8 @@ export function GenerationPreviewPane({
   labelClassName
 }: GenerationPreviewPaneProps) {
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
-  const showPlaceholder = !imageUrl || failedUrl === imageUrl;
+  const isInProgress = executionState === "GENERATION_IN_PROGRESS";
+  const showPlaceholder = isInProgress || !imageUrl || failedUrl === imageUrl;
 
   return (
     <div className={`relative overflow-hidden rounded-md border border-slate-200 bg-gradient-to-br ${tintClass} ${aspectClass} ${className ?? ""}`}>
@@ -42,7 +46,12 @@ export function GenerationPreviewPane({
         </span>
       ) : null}
       {showPlaceholder ? (
-        <span className="absolute bottom-2 left-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">Preview unavailable</span>
+        <>
+          {isInProgress ? <div className="absolute inset-0 animate-pulse bg-white/35" aria-hidden="true" /> : null}
+          <span className="absolute bottom-2 left-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+            {isInProgress ? "Generation in progress" : "Preview unavailable"}
+          </span>
+        </>
       ) : (
         <img
           src={imageUrl}

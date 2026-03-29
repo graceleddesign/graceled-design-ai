@@ -1,6 +1,11 @@
 import "server-only";
 
 import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
+import {
+  extractGeneratedImageB64,
+  normalizeImageProviderError,
+  resolveImageProviderConfig
+} from "@/lib/image-provider";
 import { openai } from "@/lib/openai";
 
 export type OpenAiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
@@ -9,7 +14,6 @@ export type OpenAiImageReference = {
   dataUrl: string;
 };
 
-const DEFAULT_IMAGE_MODEL = "gpt-image-1-mini";
 const DEFAULT_IMAGE_QUALITY: OpenAiImageQuality = "medium";
 
 function normalizeQuality(value: string | undefined, fallback: OpenAiImageQuality = DEFAULT_IMAGE_QUALITY): OpenAiImageQuality {
@@ -18,41 +22,6 @@ function normalizeQuality(value: string | undefined, fallback: OpenAiImageQualit
   }
 
   return fallback;
-}
-
-function extractGeneratedImageB64(response: unknown): string {
-  if (!response || typeof response !== "object" || !("output" in response)) {
-    throw new Error("OpenAI response did not include output items");
-  }
-
-  const output = (response as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    throw new Error("OpenAI response output is not an array");
-  }
-
-  for (const item of output) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if ((item as { type?: unknown }).type !== "image_generation_call") {
-      continue;
-    }
-
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === "string" && result.trim()) {
-      return result;
-    }
-  }
-
-  throw new Error("OpenAI response had no image_generation_call result");
-}
-
-function imageGenerationModelCandidates(): string[] {
-  const requested = process.env.OPENAI_IMAGE_MODEL?.trim() || DEFAULT_IMAGE_MODEL;
-  const fallbackMain = process.env.OPENAI_MAIN_MODEL?.trim() || "";
-
-  return Array.from(new Set([requested, fallbackMain, "gpt-4.1-mini", "gpt-4o-mini"].filter(Boolean)));
 }
 
 export async function generatePngFromPrompt(params: {
@@ -72,61 +41,46 @@ export async function generatePngFromPrompt(params: {
   }
 
   const quality = normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? DEFAULT_IMAGE_QUALITY);
-  const models = imageGenerationModelCandidates();
+  const providerConfig = resolveImageProviderConfig();
 
-  let lastError: unknown = null;
+  try {
+    const referenceItems = (params.references || [])
+      .map((reference) => reference.dataUrl?.trim())
+      .filter((value): value is string => Boolean(value) && /^data:image\//i.test(value))
+      .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
+    const input =
+      referenceItems.length > 0
+        ? [
+            {
+              role: "user" as const,
+              content: [{ type: "input_text" as const, text: params.prompt }, ...referenceItems]
+            }
+          ]
+        : params.prompt;
 
-  for (const model of models) {
-    try {
-      const referenceItems = (params.references || [])
-        .map((reference) => reference.dataUrl?.trim())
-        .filter((value): value is string => Boolean(value) && /^data:image\//i.test(value))
-        .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
-      const input =
-        referenceItems.length > 0
-          ? [
+    const runImageCall = () =>
+      runWithGptImageBudget(
+        () =>
+          openai.responses.create({
+            model: providerConfig.model,
+            input,
+            tool_choice: { type: "image_generation" },
+            tools: [
               {
-                role: "user" as const,
-                content: [{ type: "input_text" as const, text: params.prompt }, ...referenceItems]
+                type: "image_generation",
+                size: params.size,
+                quality,
+                background: "opaque"
               }
             ]
-          : params.prompt;
+          }),
+        params.meta
+      );
+    const response = params.disable429Retry ? await runImageCall() : await runWithGptImage429Retry(runImageCall, params.meta);
 
-      const runImageCall = () =>
-        runWithGptImageBudget(
-          () =>
-            openai.responses.create({
-              model,
-              input,
-              tool_choice: { type: "image_generation" },
-              tools: [
-                {
-                  type: "image_generation",
-                  size: params.size,
-                  quality,
-                  background: "opaque"
-                }
-              ]
-            }),
-          params.meta
-        );
-      const response = params.disable429Retry
-        ? await runImageCall()
-        : await runWithGptImage429Retry(runImageCall, params.meta);
-
-      const b64 = extractGeneratedImageB64(response);
-      return Buffer.from(b64, "base64");
-    } catch (error) {
-      lastError = error;
-      const status =
-        typeof error === "object" && error && "status" in error ? (error as { status?: unknown }).status : null;
-      const isAccessOrModelIssue = status === 403 || status === 404;
-
-      if (!isAccessOrModelIssue || model === models[models.length - 1]) {
-        throw error;
-      }
-    }
+    const b64 = extractGeneratedImageB64(response);
+    return Buffer.from(b64, "base64");
+  } catch (error) {
+    throw normalizeImageProviderError(error, providerConfig);
   }
-
-  throw lastError instanceof Error ? lastError : new Error("OpenAI image generation failed");
 }

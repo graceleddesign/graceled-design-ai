@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
+import { normalizeImageProviderError, resolveImageProviderConfig } from "@/lib/image-provider";
 
 type Shape = "square" | "wide" | "tall";
 
@@ -67,25 +68,30 @@ export async function generateBackgroundPng(params: {
   }
 
   const client = new OpenAI({ apiKey });
+  const providerConfig = resolveImageProviderConfig();
   const prompt = buildPrompt(params);
-  const result = await runWithGptImage429Retry(() =>
-    runWithGptImageBudget(() =>
-      client.images.generate({
-        model: process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1-mini",
-        prompt,
-        size: SIZE_BY_SHAPE[params.shape],
-        quality: (process.env.OPENAI_IMAGE_QUALITY as "low" | "medium" | "high" | "auto") ?? "medium",
-        response_format: "b64_json"
-      })
-    )
-  );
+  try {
+    const result = await runWithGptImage429Retry(() =>
+      runWithGptImageBudget(() =>
+        client.images.generate({
+          model: providerConfig.model,
+          prompt,
+          size: SIZE_BY_SHAPE[params.shape],
+          quality: (process.env.OPENAI_IMAGE_QUALITY as "low" | "medium" | "high" | "auto") ?? "medium",
+          response_format: "b64_json"
+        })
+      )
+    );
 
-  const b64 = result.data?.[0]?.b64_json;
-  if (!b64) {
-    throw new Error("No image returned");
+    const b64 = result.data?.[0]?.b64_json;
+    if (!b64) {
+      throw new Error("No image returned");
+    }
+
+    return Buffer.from(b64, "base64");
+  } catch (error) {
+    throw normalizeImageProviderError(error, providerConfig);
   }
-
-  return Buffer.from(b64, "base64");
 }
 
 export type { Shape };

@@ -4,6 +4,11 @@ import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
+import {
+  extractGeneratedImageB64,
+  normalizeImageProviderError,
+  resolveImageProviderConfig
+} from "@/lib/image-provider";
 import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
 import { openai } from "@/lib/openai";
 
@@ -104,75 +109,36 @@ function buildPrompt(params: {
     .join(" ");
 }
 
-function extractGeneratedImageB64(response: unknown): string {
-  if (!response || typeof response !== "object" || !("output" in response)) {
-    throw new Error("OpenAI response did not include output items");
-  }
-
-  const output = (response as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    throw new Error("OpenAI response output is not an array");
-  }
-
-  for (const item of output) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if ((item as { type?: unknown }).type !== "image_generation_call") {
-      continue;
-    }
-
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === "string" && result.trim()) {
-      return result;
-    }
-  }
-
-  throw new Error("OpenAI response had no image_generation_call result");
-}
-
 async function generatePngWithOpenAi(params: {
   prompt: string;
   size: ImageSize;
   quality: ImageQuality;
 }): Promise<Buffer> {
-  const requestedModel = process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1";
-  const models = Array.from(new Set([requestedModel, "gpt-4.1-mini", "gpt-4o-mini"]));
-  let lastError: unknown = null;
+  const providerConfig = resolveImageProviderConfig();
 
-  for (const model of models) {
-    try {
-      const response = await runWithGptImage429Retry(() =>
-        runWithGptImageBudget(() =>
-          openai.responses.create({
-            model,
-            input: params.prompt,
-            tool_choice: { type: "image_generation" },
-            tools: [
-              {
-                type: "image_generation",
-                size: params.size,
-                quality: params.quality,
-                background: "opaque"
-              }
-            ]
-          })
-        )
-      );
-      const b64 = extractGeneratedImageB64(response);
-      return Buffer.from(b64, "base64");
-    } catch (error) {
-      lastError = error;
-      const status = typeof error === "object" && error && "status" in error ? (error as { status?: unknown }).status : null;
-      const isAccessOrModelIssue = status === 403 || status === 404;
-      if (!isAccessOrModelIssue || model === models[models.length - 1]) {
-        throw error;
-      }
-    }
+  try {
+    const response = await runWithGptImage429Retry(() =>
+      runWithGptImageBudget(() =>
+        openai.responses.create({
+          model: providerConfig.model,
+          input: params.prompt,
+          tool_choice: { type: "image_generation" },
+          tools: [
+            {
+              type: "image_generation",
+              size: params.size,
+              quality: params.quality,
+              background: "opaque"
+            }
+          ]
+        })
+      )
+    );
+    const b64 = extractGeneratedImageB64(response);
+    return Buffer.from(b64, "base64");
+  } catch (error) {
+    throw normalizeImageProviderError(error, providerConfig);
   }
-
-  throw lastError instanceof Error ? lastError : new Error("Image generation failed");
 }
 
 async function writeResizedPng(params: {
