@@ -1,5 +1,9 @@
 import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { type GenerationFailureReason, type GenerationOptionStatus } from "@/lib/generation-state";
+import {
+  type GenerationFailureReason,
+  type GenerationOptionStatus,
+  isPersistedGenerationExecutionActive
+} from "@/lib/generation-state";
 
 export const ASPECT_ASSET_PLACEHOLDER_PATH_PATTERN = /(fallback|placeholder|wireframe|guide|debug|stage|scaffold)/i;
 const ASPECT_ASSET_DERIVED_PATH_PATTERN = /(^|[-_/])derived([\-_.\/]|$)/i;
@@ -1136,7 +1140,8 @@ export function resolveProductionValidOption(params: {
   const backgroundAssetPaths = readBackgroundAssetPaths(params.assets);
   const lockupAssetPath = readLockupAssetPath(params.assets);
   const fallbackLike = readFallbackLikeStatus(params.output);
-  const dbInProgress = params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED";
+  const executionActive = isPersistedGenerationExecutionActive(params.output);
+  const dbInProgress = params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED" || executionActive;
   const dbFailedLike = params.dbStatus === "FAILED" || dbInProgress || !params.output;
   const valid =
     !dbInProgress &&
@@ -1273,6 +1278,8 @@ export function resolveProductionValidOption(params: {
     addReason(provenanceReasons, "generation_db_status_running");
   } else if (params.dbStatus === "QUEUED") {
     addReason(provenanceReasons, "generation_db_status_queued");
+  } else if (executionActive) {
+    addReason(provenanceReasons, "generation_execution_retry_running");
   } else if (
     params.dbStatus === "FAILED" &&
     !fallbackLike &&

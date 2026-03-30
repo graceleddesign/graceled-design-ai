@@ -26,6 +26,17 @@ export type GenerationLifecycleState =
   | "GENERATION_COMPLETED"
   | "GENERATION_FAILED_PROVIDER"
   | "GENERATION_FAILED_CREATIVE";
+export type PersistedGenerationExecutionPhase = "RUNNING" | "SETTLED";
+export type PersistedGenerationExecutionState = {
+  version: 1;
+  phase: PersistedGenerationExecutionPhase;
+  activeAttemptToken: string | null;
+  activeAttemptNumber: number | null;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 export function isProviderFailureReason(value: unknown): value is ProviderFailureReason {
   return typeof value === "string" && PROVIDER_FAILURE_REASONS.includes(value as ProviderFailureReason);
@@ -54,6 +65,47 @@ export function isGenerationLifecycleState(value: unknown): value is GenerationL
 
 export function isGenerationDbInProgress(dbStatus: string | null | undefined): boolean {
   return dbStatus === "RUNNING" || dbStatus === "QUEUED";
+}
+
+export function isPersistedGenerationExecutionPhase(value: unknown): value is PersistedGenerationExecutionPhase {
+  return value === "RUNNING" || value === "SETTLED";
+}
+
+export function readPersistedGenerationExecutionState(output: unknown): PersistedGenerationExecutionState | null {
+  if (!isRecord(output)) {
+    return null;
+  }
+
+  const meta = isRecord(output.meta) ? output.meta : null;
+  if (!meta) {
+    return null;
+  }
+
+  const execution = isRecord(meta.execution) ? meta.execution : null;
+  if (!execution || execution.version !== 1 || !isPersistedGenerationExecutionPhase(execution.phase)) {
+    return null;
+  }
+
+  const activeAttemptToken =
+    typeof execution.activeAttemptToken === "string" && execution.activeAttemptToken.trim()
+      ? execution.activeAttemptToken.trim()
+      : null;
+  const activeAttemptNumber =
+    typeof execution.activeAttemptNumber === "number" && Number.isFinite(execution.activeAttemptNumber)
+      ? execution.activeAttemptNumber
+      : null;
+
+  return {
+    version: 1,
+    phase: execution.phase,
+    activeAttemptToken,
+    activeAttemptNumber
+  };
+}
+
+export function isPersistedGenerationExecutionActive(output: unknown): boolean {
+  const execution = readPersistedGenerationExecutionState(output);
+  return execution?.phase === "RUNNING";
 }
 
 export function resolveGenerationLifecycleState(params: {

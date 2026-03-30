@@ -648,7 +648,9 @@ function readDesignSpecSummary(
       roundOperationalFailureReason: isProviderFailureReason(roundOperationalFailureReasonCandidate)
         ? roundOperationalFailureReasonCandidate
         : null,
-      generationLifecycleState: isGenerationLifecycleState(generationLifecycleStateCandidate)
+      generationLifecycleState: optionStatus === "IN_PROGRESS"
+        ? "GENERATION_IN_PROGRESS"
+        : isGenerationLifecycleState(generationLifecycleStateCandidate)
         ? generationLifecycleStateCandidate
         : resolveGenerationLifecycleState({
             dbStatus,
@@ -857,7 +859,9 @@ function readDesignSpecSummary(
     wantsTitleStage: directWantsTitleStage === true || nestedWantsTitleStage === true,
     wantsSeriesMark: directWantsSeriesMark === true || nestedWantsSeriesMark === true,
     optionStatus,
-    generationLifecycleState: isGenerationLifecycleState(generationLifecycleStateCandidate)
+    generationLifecycleState: optionStatus === "IN_PROGRESS"
+      ? "GENERATION_IN_PROGRESS"
+      : isGenerationLifecycleState(generationLifecycleStateCandidate)
       ? generationLifecycleStateCandidate
       : resolveGenerationLifecycleState({
           dbStatus,
@@ -1157,19 +1161,7 @@ export default async function ProjectGenerationsPage({
                 generation.status
               );
             });
-            const roundHasActiveGenerations = roundGenerations.some(
-              (generation) => generation.status === "RUNNING" || generation.status === "QUEUED"
-            );
-            const persistedRoundStatus =
-              roundDesignSummaries.find((summary) => summary.roundStatus === "RUNNING")?.roundStatus ||
-              roundDesignSummaries.find((summary) => summary.roundStatus === "FAILED")?.roundStatus ||
-              roundDesignSummaries.find((summary) => summary.roundStatus === "PARTIAL")?.roundStatus ||
-              roundDesignSummaries.find((summary) => summary.roundStatus === "COMPLETED")?.roundStatus ||
-              null;
-            const hasFailedOptions = roundDesignSummaries.some(
-              (summary) => summary.optionStatus === "FAILED_GENERATION" || summary.optionStatus === "FALLBACK"
-            );
-            const persistedCompletedCount = roundDesignSummaries.find((summary) => summary.roundCompletedCount !== null)?.roundCompletedCount ?? null;
+            const roundHasActiveGenerations = roundDesignSummaries.some((summary) => summary.optionStatus === "IN_PROGRESS");
             const persistedAttemptCount = roundDesignSummaries.find((summary) => summary.roundAttemptCount !== null)?.roundAttemptCount ?? null;
             const persistedRequiredCompletedCount =
               roundDesignSummaries.find((summary) => summary.roundRequiredCompletedCount !== null)?.roundRequiredCompletedCount ??
@@ -1179,18 +1171,15 @@ export default async function ProjectGenerationsPage({
             const roundOperationalFailureReason =
               roundDesignSummaries.find((summary) => summary.roundOperationalFailureReason !== null)?.roundOperationalFailureReason || null;
             const computedCompletedCount = roundDesignSummaries.filter((summary) => summary.optionStatus === "COMPLETED").length;
-            const roundCompletedCount = persistedCompletedCount ?? computedCompletedCount;
+            const roundCompletedCount = computedCompletedCount;
             const computedRoundStatus: GenerationRoundStatus = roundHasActiveGenerations
               ? "RUNNING"
-              : persistedRoundStatus ||
-                (hasFailedOptions
-                  ? roundDesignSummaries.some((summary) => summary.optionStatus === "COMPLETED")
-                    ? "PARTIAL"
-                    : "FAILED"
-                  : "COMPLETED");
-            const roundHasFallback = roundDesignSummaries.some(
-              (summary) => summary.roundHasFallback || summary.optionStatus === "FALLBACK"
-            );
+              : roundCompletedCount >= persistedRequiredCompletedCount
+                ? "COMPLETED"
+                : roundCompletedCount > 0
+                  ? "PARTIAL"
+                  : "FAILED";
+            const roundHasFallback = roundDesignSummaries.some((summary) => summary.optionStatus === "FALLBACK");
             const roundNeedsRetry =
               computedRoundStatus !== "RUNNING" &&
               (computedRoundStatus === "FAILED" || roundCompletedCount < persistedRequiredCompletedCount);

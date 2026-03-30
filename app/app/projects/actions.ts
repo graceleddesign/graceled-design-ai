@@ -48,8 +48,10 @@ import {
   type GenerationOptionStatus,
   type GenerationRoundFailureReason,
   type GenerationRoundStatus,
+  type PersistedGenerationExecutionState,
   type ProviderFailureReason,
-  isProviderFailureReason
+  isProviderFailureReason,
+  readPersistedGenerationExecutionState
 } from "@/lib/generation-state";
 import { preflightImageProvider, resolveImageProviderConfig, type ImageProviderPreflightResult } from "@/lib/image-provider";
 import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
@@ -4293,6 +4295,28 @@ function withOutputStatus(output: GenerationOutputPayload, status: GenerationOpt
   };
 }
 
+function withGenerationExecutionStateOutput(
+  output: GenerationOutputPayload,
+  execution: PersistedGenerationExecutionState
+): GenerationOutputPayload {
+  return {
+    ...output,
+    meta: {
+      ...output.meta,
+      execution
+    }
+  };
+}
+
+function resolveNextGenerationAttemptNumber(output: unknown): number {
+  const execution = readPersistedGenerationExecutionState(output);
+  const previousAttemptNumber =
+    typeof execution?.activeAttemptNumber === "number" && Number.isFinite(execution.activeAttemptNumber)
+      ? execution.activeAttemptNumber
+      : 0;
+  return previousAttemptNumber + 1;
+}
+
 function readProviderFailureReasonFromError(error: unknown): ProviderFailureReason | null {
   if (!error || typeof error !== "object" || !("failureReason" in error)) {
     return null;
@@ -6178,6 +6202,7 @@ type GenerationOutputPayload = {
     usedStylePaths: string[];
     usedReferenceIds?: string[];
     revisedPrompt?: string;
+    execution?: PersistedGenerationExecutionState;
     debug?: {
       styleFamilyFallback?: {
         usedCleanMinFallback: boolean;
@@ -6932,6 +6957,16 @@ type PlannedGeneration = {
   references: ReferenceLibraryItem[];
   input: Prisma.InputJsonValue;
   fallbackOutput: GenerationOutputPayload;
+};
+
+type GenerationAttemptOwner = {
+  token: string;
+  attemptNumber: number;
+  ownerUpdatedAt: Date;
+};
+
+type ClaimedPlannedGeneration = PlannedGeneration & {
+  attemptOwner: GenerationAttemptOwner;
 };
 
 function isOpenAiPreviewGenerationEnabled(): boolean {
@@ -8233,6 +8268,206 @@ async function ensureCanonicalFinalistOutputs(params: {
   };
 }
 
+type PersistedGenerationTruthRow = {
+  id: string;
+  status: string;
+  output: Prisma.JsonValue | null;
+  assets: GenerationAssetRecord[];
+};
+
+async function loadPersistedGenerationTruthRows(generationIds: string[]): Promise<Map<string, PersistedGenerationTruthRow>> {
+  if (generationIds.length === 0) {
+    return new Map<string, PersistedGenerationTruthRow>();
+  }
+
+  const rows = await prisma.generation.findMany({
+    where: {
+      id: {
+        in: generationIds
+      }
+    },
+    select: {
+      id: true,
+      status: true,
+      output: true,
+      assets: {
+        select: {
+          kind: true,
+          slot: true,
+          file_path: true
+        }
+      }
+    }
+  });
+
+  return new Map(rows.map((row) => [row.id, row] as const));
+}
+
+function resolvePersistedGenerationOptionStatusFromRow(row: PersistedGenerationTruthRow): GenerationOptionStatus {
+  return resolveGenerationOptionStatus({
+    output: row.output,
+    dbStatus: row.status,
+    assets: row.assets
+  });
+}
+
+async function readPersistedGenerationOptionStatus(generationId: string): Promise<GenerationOptionStatus> {
+  const persistedRows = await loadPersistedGenerationTruthRows([generationId]);
+  const row = persistedRows.get(generationId);
+  return row ? resolvePersistedGenerationOptionStatusFromRow(row) : "FAILED_GENERATION";
+}
+
+async function claimPlannedGenerationAttempts(params: {
+  plannedGenerations: PlannedGeneration[];
+  mode: "initial" | "retry";
+}): Promise<ClaimedPlannedGeneration[]> {
+  if (params.plannedGenerations.length === 0) {
+    return [];
+  }
+
+  const persistedRows = await prisma.generation.findMany({
+    where: {
+      id: {
+        in: params.plannedGenerations.map((generation) => generation.id)
+      }
+    },
+    select: {
+      id: true,
+      status: true,
+      output: true,
+      updatedAt: true
+    }
+  });
+  const rowById = new Map(persistedRows.map((row) => [row.id, row] as const));
+  const claimed: ClaimedPlannedGeneration[] = [];
+
+  for (const plannedGeneration of params.plannedGenerations) {
+    const persistedRow = rowById.get(plannedGeneration.id);
+    if (!persistedRow) {
+      continue;
+    }
+
+    const attemptOwnerBase = {
+      token: randomUUID(),
+      attemptNumber: resolveNextGenerationAttemptNumber(persistedRow.output)
+    };
+    const updateResult =
+      params.mode === "initial"
+        ? await prisma.generation.updateMany({
+            where: {
+              id: persistedRow.id,
+              updatedAt: persistedRow.updatedAt
+            },
+            data: {
+              status: "RUNNING"
+            }
+          })
+        : await prisma.generation.updateMany({
+            where: {
+              id: persistedRow.id,
+              updatedAt: persistedRow.updatedAt
+            },
+            data: {
+              output: withGenerationExecutionStateOutput(
+                persistedRow.output && typeof persistedRow.output === "object" && !Array.isArray(persistedRow.output)
+                  ? (persistedRow.output as GenerationOutputPayload)
+                  : plannedGeneration.fallbackOutput,
+                {
+                  version: 1,
+                  phase: "RUNNING",
+                  activeAttemptToken: attemptOwnerBase.token,
+                  activeAttemptNumber: attemptOwnerBase.attemptNumber
+                }
+              ) as Prisma.InputJsonValue
+            }
+          });
+
+    if (updateResult.count !== 1) {
+      continue;
+    }
+
+    const claimedRow = await prisma.generation.findUnique({
+      where: {
+        id: persistedRow.id
+      },
+      select: {
+        updatedAt: true
+      }
+    });
+
+    if (!claimedRow) {
+      continue;
+    }
+
+    claimed.push({
+      ...plannedGeneration,
+      attemptOwner: {
+        ...attemptOwnerBase,
+        ownerUpdatedAt: claimedRow.updatedAt
+      }
+    });
+  }
+
+  if (claimed.length !== params.plannedGenerations.length) {
+    throw new Error("Failed to claim one or more generation attempts for settlement.");
+  }
+
+  return claimed;
+}
+
+async function persistGenerationSettlement(params: {
+  generationId: string;
+  status: "COMPLETED" | "FAILED";
+  output: GenerationOutputPayload;
+  input?: Prisma.InputJsonValue;
+  attemptOwner?: GenerationAttemptOwner | null;
+  applyAssetChanges?: (tx: Prisma.TransactionClient) => Promise<void>;
+}): Promise<boolean> {
+  const persistedOutput = params.attemptOwner
+    ? withGenerationExecutionStateOutput(params.output, {
+        version: 1,
+        phase: "SETTLED",
+        activeAttemptToken: null,
+        activeAttemptNumber: params.attemptOwner.attemptNumber
+      })
+    : params.output;
+
+  return prisma.$transaction(async (tx) => {
+    const updateResult = await tx.generation.updateMany({
+      where: params.attemptOwner
+        ? {
+            id: params.generationId,
+            updatedAt: params.attemptOwner.ownerUpdatedAt
+          }
+        : {
+            id: params.generationId,
+            status: {
+              not: "COMPLETED"
+            }
+          },
+      data: {
+        status: params.status,
+        output: persistedOutput as Prisma.InputJsonValue,
+        ...(typeof params.input === "undefined"
+          ? {}
+          : {
+              input: params.input
+            })
+      }
+    });
+
+    if (updateResult.count !== 1) {
+      return false;
+    }
+
+    if (params.applyAssetChanges) {
+      await params.applyAssetChanges(tx);
+    }
+
+    return true;
+  });
+}
+
 async function completeGenerationWithFallbackOutput(params: {
   projectId: string;
   generationId: string;
@@ -8240,6 +8475,7 @@ async function completeGenerationWithFallbackOutput(params: {
   backgroundValidation?: ProductionBackgroundValidationEvidence | null;
   failureReason?: BackgroundAttemptFailureReason;
   providerPreflight?: ImageProviderPreflightResult | null;
+  attemptOwner?: GenerationAttemptOwner | null;
 }): Promise<GenerationOptionStatus> {
   const designDocByShape = params.output.designDocByShape;
   const [squarePng, widePng, tallPng, lockupResult] = await Promise.all([
@@ -8353,25 +8589,24 @@ async function completeGenerationWithFallbackOutput(params: {
     }
   };
 
-  await prisma.$transaction([
-    prisma.asset.deleteMany({
-      where: {
-        generationId: params.generationId,
-        slot: {
-          in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+  const persisted = await persistGenerationSettlement({
+    generationId: params.generationId,
+    status: "FAILED",
+    output: persistedFallbackOutput,
+    attemptOwner: params.attemptOwner,
+    applyAssetChanges: async (tx) => {
+      await tx.asset.deleteMany({
+        where: {
+          generationId: params.generationId,
+          slot: {
+            in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+          }
         }
-      }
-    }),
-    prisma.generation.update({
-      where: { id: params.generationId },
-      data: {
-        status: "FAILED",
-        output: persistedFallbackOutput as Prisma.InputJsonValue
-      }
-    })
-  ]);
+      });
+    }
+  });
 
-  return fallbackStatus;
+  return persisted ? fallbackStatus : readPersistedGenerationOptionStatus(params.generationId);
 }
 
 type PlannedGenerationRunResult = {
@@ -8505,17 +8740,27 @@ async function persistFinalRoundOutcome(params: {
   roundAttemptCount: number;
   roundRequiredCompletedCount: number;
 }): Promise<void> {
-  const completedCount = params.results.filter((result) => result.optionStatus === "COMPLETED").length;
-  const roundHasFallback = params.results.some((result) => result.optionStatus === "FALLBACK");
+  const persistedRows = await loadPersistedGenerationTruthRows(params.generationIds);
+  const persistedStatuses = params.generationIds.map((generationId) => {
+    const persistedRow = persistedRows.get(generationId);
+    return persistedRow ? resolvePersistedGenerationOptionStatusFromRow(persistedRow) : "FAILED_GENERATION";
+  });
+  const completedCount = persistedStatuses.filter((status) => status === "COMPLETED").length;
+  const roundHasFallback = persistedStatuses.some((status) => status === "FALLBACK");
+  const hasInProgressRows = persistedStatuses.some((status) => status === "IN_PROGRESS");
   const roundOperationalFailureReason = pickRoundOperationalFailureReason(params.results.map((result) => result.failureReason));
   const roundFailureReason: GenerationRoundFailureReason | null =
-    roundOperationalFailureReason
+    hasInProgressRows
+      ? null
+      : roundOperationalFailureReason
       ? "ROUND_ABORTED_PROVIDER_FAILURE"
       : completedCount >= params.roundRequiredCompletedCount
         ? null
         : "ROUND_INSUFFICIENT_VALID_OPTIONS";
   const roundStatus: GenerationRoundStatus =
-    completedCount >= params.roundRequiredCompletedCount
+    hasInProgressRows
+      ? "RUNNING"
+      : completedCount >= params.roundRequiredCompletedCount
       ? "COMPLETED"
       : completedCount > 0
         ? "PARTIAL"
@@ -8574,7 +8819,7 @@ async function abortRoundForProviderFailure(params: {
 async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   organizationId: string;
   project: GenerationProjectContext & { id: string };
-  plannedGenerations: PlannedGeneration[];
+  plannedGenerations: ClaimedPlannedGeneration[];
   providerPreflight: ImageProviderPreflightResult;
   bibleCreativeBrief?: BibleCreativeBrief | null;
   motifBankContext?: MotifBankContext;
@@ -8657,7 +8902,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           generationId: plannedGeneration.id,
           output: fallbackOutput,
           failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR",
-          providerPreflight: params.providerPreflight
+          providerPreflight: params.providerPreflight,
+          attemptOwner: plannedGeneration.attemptOwner
         });
         return {
           generationId: plannedGeneration.id,
@@ -9918,7 +10164,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           output: fallbackOutput,
           backgroundValidation: fallbackParams.backgroundValidation || null,
           failureReason: resolvedFailureReason,
-          providerPreflight: params.providerPreflight
+          providerPreflight: params.providerPreflight,
+          attemptOwner: plannedGeneration.attemptOwner
         });
         return {
           optionStatus,
@@ -10619,59 +10866,53 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             })
           }
         };
-        await prisma.$transaction([
-          prisma.asset.deleteMany({
+        const persisted = await persistGenerationSettlement({
+          generationId: plannedGeneration.id,
+          status: "FAILED",
+          output: failedOutput,
+          input: persistedInputWithLockupPalette,
+          attemptOwner: plannedGeneration.attemptOwner,
+          applyAssetChanges: async (tx) => {
+            await tx.asset.deleteMany({
+              where: {
+                generationId: plannedGeneration.id,
+                slot: {
+                  in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+                }
+              }
+            });
+          }
+        });
+        return {
+          generationId: plannedGeneration.id,
+          optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
+          failureReason
+        };
+      }
+
+      const persisted = await persistGenerationSettlement({
+        generationId: plannedGeneration.id,
+        status: "COMPLETED",
+        output: completedOutputWithValidation,
+        input: persistedInputWithLockupPalette,
+        attemptOwner: plannedGeneration.attemptOwner,
+        applyAssetChanges: async (tx) => {
+          await tx.asset.deleteMany({
             where: {
               generationId: plannedGeneration.id,
               slot: {
                 in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
               }
             }
-          }),
-          prisma.generation.update({
-            where: {
-              id: plannedGeneration.id
-            },
-            data: {
-              status: "FAILED",
-              output: failedOutput as Prisma.InputJsonValue,
-              input: persistedInputWithLockupPalette
-            }
-          })
-        ]);
-        return {
-          generationId: plannedGeneration.id,
-          optionStatus: "FAILED_GENERATION",
-          failureReason
-        };
-      }
-
-      await prisma.$transaction([
-        prisma.asset.deleteMany({
-          where: {
-            generationId: plannedGeneration.id,
-            slot: {
-              in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
-            }
-          }
-        }),
-        prisma.asset.createMany({
-          data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
-        }),
-        prisma.generation.update({
-          where: {
-            id: plannedGeneration.id
-          },
-          data: {
-            status: "COMPLETED",
-            output: completedOutputWithValidation as Prisma.InputJsonValue,
-            input: persistedInputWithLockupPalette
-          }
-        })
-      ]);
+          });
+          await tx.asset.createMany({
+            data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
+          });
+        }
+      });
       return {
         generationId: plannedGeneration.id,
-        optionStatus: "COMPLETED",
+        optionStatus: persisted ? "COMPLETED" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
         failureReason: null
       };
     } catch (error) {
@@ -10686,7 +10927,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           generationId: plannedGeneration.id,
           output: fallbackOutput,
           failureReason,
-          providerPreflight: params.providerPreflight
+          providerPreflight: params.providerPreflight,
+          attemptOwner: plannedGeneration.attemptOwner
         });
         return {
           generationId: plannedGeneration.id,
@@ -10731,28 +10973,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             productionValidation: toPersistedProductionValidationSnapshot(failedValidation)
           }
         };
-        await prisma.$transaction([
-          prisma.asset.deleteMany({
-            where: {
-              generationId: plannedGeneration.id,
-              slot: {
-                in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+        const persisted = await persistGenerationSettlement({
+          generationId: plannedGeneration.id,
+          status: "FAILED",
+          output: persistedFailedOutput,
+          attemptOwner: plannedGeneration.attemptOwner,
+          applyAssetChanges: async (tx) => {
+            await tx.asset.deleteMany({
+              where: {
+                generationId: plannedGeneration.id,
+                slot: {
+                  in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+                }
               }
-            }
-          }),
-          prisma.generation.update({
-            where: {
-              id: plannedGeneration.id
-            },
-            data: {
-              status: "FAILED",
-              output: persistedFailedOutput as Prisma.InputJsonValue
-            }
-          })
-        ]);
+            });
+          }
+        });
         return {
           generationId: plannedGeneration.id,
-          optionStatus: "FAILED_GENERATION",
+          optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
           failureReason
         };
       }
@@ -11129,16 +11368,9 @@ export async function generateRoundOneAction(
     });
     redirect(`/app/projects/${projectId}/generations`);
   }
-
-  await prisma.generation.updateMany({
-    where: {
-      id: {
-        in: plannedGenerations.map((generation) => generation.id)
-      }
-    },
-    data: {
-      status: "RUNNING"
-    }
+  const firstAttemptGenerations = await claimPlannedGenerationAttempts({
+    plannedGenerations,
+    mode: "initial"
   });
 
   const shouldEnforceRound1NonFallbackRequirement = !hasDesignNotes;
@@ -11158,7 +11390,7 @@ export async function generateRoundOneAction(
   const firstAttemptResults = await createOpenAiPreviewAssetsForPlannedGenerations({
     organizationId: session.organizationId,
     project,
-    plannedGenerations,
+    plannedGenerations: firstAttemptGenerations,
     providerPreflight,
     bibleCreativeBrief,
     motifBankContext
@@ -11192,22 +11424,14 @@ export async function generateRoundOneAction(
         return incompleteGenerations[index];
       });
       retryCursor = incompleteGenerations.length > 0 ? (retryCursor + batchSize) % incompleteGenerations.length : 0;
-      const retryIds = retryBatch.map((generation) => generation.id);
-      await prisma.generation.updateMany({
-        where: {
-          id: {
-            in: retryIds
-          }
-        },
-        data: {
-          status: "RUNNING",
-          output: Prisma.JsonNull
-        }
+      const claimedRetryBatch = await claimPlannedGenerationAttempts({
+        plannedGenerations: retryBatch,
+        mode: "retry"
       });
       const retryResults = await createOpenAiPreviewAssetsForPlannedGenerations({
         organizationId: session.organizationId,
         project,
-        plannedGenerations: retryBatch,
+        plannedGenerations: claimedRetryBatch,
         providerPreflight,
         bibleCreativeBrief,
         motifBankContext
@@ -11621,22 +11845,15 @@ export async function generateRoundTwoAction(
     });
     redirect(`/app/projects/${projectId}/generations`);
   }
-
-  await prisma.generation.updateMany({
-    where: {
-      id: {
-        in: plannedGenerations.map((generation) => generation.id)
-      }
-    },
-    data: {
-      status: "RUNNING"
-    }
+  const claimedGenerations = await claimPlannedGenerationAttempts({
+    plannedGenerations,
+    mode: "initial"
   });
 
   const results = await createOpenAiPreviewAssetsForPlannedGenerations({
     organizationId: session.organizationId,
     project,
-    plannedGenerations,
+    plannedGenerations: claimedGenerations,
     providerPreflight,
     bibleCreativeBrief,
     motifBankContext
