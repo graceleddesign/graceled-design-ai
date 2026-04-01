@@ -11,6 +11,7 @@ export const GENERATION_FAILURE_REASONS = [
   "ALL_TEXT",
   "ALL_SCAFFOLD",
   ...PROVIDER_FAILURE_REASONS,
+  "CLAIM_TIMEOUT",
   "BUDGET",
   "MISSING_ASPECT_ASSET",
   "UNKNOWN"
@@ -126,6 +127,10 @@ export function resolveGenerationLifecycleState(params: {
   }
 
   if (isProviderFailureReason(params.failureReason)) {
+    return "GENERATION_FAILED_PROVIDER";
+  }
+
+  if (params.failureReason === "CLAIM_TIMEOUT") {
     return "GENERATION_FAILED_PROVIDER";
   }
 

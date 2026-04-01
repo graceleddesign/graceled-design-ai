@@ -339,6 +339,9 @@ function formatBackgroundFailureReasonLabel(reason: GenerationFailureReason | st
   if (reason === "PROVIDER_TRANSIENT_ERROR") {
     return "image provider had a transient upstream failure";
   }
+  if (reason === "CLAIM_TIMEOUT") {
+    return "generation claim lease expired before settlement";
+  }
   if (reason === "BUDGET") {
     return "image generation budget was exhausted";
   }

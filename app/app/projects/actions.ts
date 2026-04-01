@@ -51,6 +51,7 @@ import {
   type GraphicsBackgroundAiAttemptTrace,
   type GraphicsBackgroundAiRunHandle
 } from "@/lib/graphics-domain/generation";
+import { resolveClaimedGenerationExecutionTimeoutMs } from "@/lib/graphics-domain/claim-timeout";
 import {
   GRAPHICS_BACKGROUND_PROMPT_VERSION,
   buildGraphicsBackgroundRunMetadata
@@ -193,7 +194,6 @@ const generateRoundTwoSchema = z.object({
 });
 const ROUND_OPTION_COUNT = 3;
 const ROUND1_NON_FALLBACK_MAX_ATTEMPTS = 8;
-const CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS = 90_000;
 const FINALIST_ASPECT_RECOVERY_LIMIT = 2;
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
 type FinalAssetSlot = "square" | "wide" | "tall";
@@ -4513,7 +4513,9 @@ function readProviderFailureReasonFromError(error: unknown): ProviderFailureReas
 }
 
 function resolveGenerationLifecycleStateForFailure(reason: BackgroundAttemptFailureReason | null | undefined): GenerationLifecycleState {
-  return isProviderFailureReason(reason) ? "GENERATION_FAILED_PROVIDER" : "GENERATION_FAILED_CREATIVE";
+  return isProviderFailureReason(reason) || reason === "CLAIM_TIMEOUT"
+    ? "GENERATION_FAILED_PROVIDER"
+    : "GENERATION_FAILED_CREATIVE";
 }
 
 function resolveBackgroundAttemptFailureReason(error: unknown, imageCallCapReached = false): BackgroundAttemptFailureReason {
@@ -4522,7 +4524,7 @@ function resolveBackgroundAttemptFailureReason(error: unknown, imageCallCapReach
   }
 
   if (isClaimedGenerationExecutionTimeoutError(error)) {
-    return "PROVIDER_TRANSIENT_ERROR";
+    return "CLAIM_TIMEOUT";
   }
 
   return readProviderFailureReasonFromError(error) || (isOpenAiRateLimitError(error) ? "PROVIDER_QUOTA_OR_RATE_LIMIT" : "UNKNOWN");
@@ -9472,9 +9474,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR"
         };
       } else {
+      const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(plannedGeneration.input);
+      const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
+      const shouldRunExplorationToneCheck = plannedGeneration.round === 1 && !hasDesignNotes;
+      const claimedGenerationExecutionTimeoutMs = resolveClaimedGenerationExecutionTimeoutMs({
+        round: plannedGeneration.round,
+        backgroundExploration: shouldRunExplorationToneCheck
+      });
       const executionLease = createClaimedGenerationExecutionTimeoutLease({
         generationId: plannedGeneration.id,
-        timeoutMs: CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS
+        timeoutMs: claimedGenerationExecutionTimeoutMs
       });
       const assertClaimedGenerationExecutionActive = () => executionLease.throwIfTimedOut();
       try {
@@ -9492,9 +9501,6 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const runSeed = readRunSeedFromInput(plannedGeneration.input) || plannedGeneration.id;
       const directionSpec = readDirectionSpecFromInput(plannedGeneration.input, plannedGeneration.optionIndex);
       const inputRefinementLineage = readRefinementLineageFromInput(plannedGeneration.input);
-      const inputSeriesDesignNotes = readSeriesPreferencesDesignNotesFromInput(plannedGeneration.input);
-      const hasDesignNotes = hasDesignDirection(params.project.designNotes, inputSeriesDesignNotes);
-      const shouldRunExplorationToneCheck = plannedGeneration.round === 1 && !hasDesignNotes;
       const shouldUseCheapRound1Mode = DEV_CHEAP_MODE && plannedGeneration.round === 1;
       const shouldUseRound1NoNotesThrottle = plannedGeneration.round === 1 && !hasDesignNotes;
       const shouldDisableToneComplianceRetry = shouldUseRound1NoNotesThrottle;
@@ -11790,11 +11796,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         executionTimeoutId = setTimeout(() => {
           const timeoutError = new ClaimedGenerationExecutionTimeoutError(
             plannedGeneration.id,
-            CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS
+            claimedGenerationExecutionTimeoutMs
           );
           executionLease.abort(timeoutError);
           reject(timeoutError);
-        }, CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS);
+        }, claimedGenerationExecutionTimeoutMs);
       })
       ]);
       } finally {
