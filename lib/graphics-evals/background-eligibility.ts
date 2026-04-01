@@ -94,6 +94,7 @@ export async function persistGraphicsBackgroundEvalResults(params: {
   runId: string;
   attemptId?: string | null;
   subject: GraphicsBackgroundEvalSubject;
+  assertActive?: () => Promise<void> | void;
 }) {
   const definitions: readonly AiEvalDefinition<GraphicsBackgroundEvalSubject>[] = [
     createBackgroundEligibilityEvalDefinition(),
@@ -104,6 +105,7 @@ export async function persistGraphicsBackgroundEvalResults(params: {
     runId: params.runId,
     attemptId: params.attemptId ?? null,
     subject: params.subject,
-    definitions
+    definitions,
+    assertActive: params.assertActive
   });
 }

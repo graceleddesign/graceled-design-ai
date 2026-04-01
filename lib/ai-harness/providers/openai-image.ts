@@ -83,6 +83,7 @@ export async function generateImageWithOpenAiHarness(params: {
   references?: OpenAiImageReference[];
   modelKey?: AiModelKey | null;
   disable429Retry?: boolean;
+  assertActive?: () => Promise<void> | void;
   meta?: {
     debug?: GptImageDebugMeta;
   };
@@ -124,6 +125,7 @@ export async function generateImageWithOpenAiHarness(params: {
     run: params.run,
     route,
     promptVersion: params.promptVersion,
+    assertActive: params.assertActive,
     requestBody: {
       prompt: params.prompt,
       size: params.size,

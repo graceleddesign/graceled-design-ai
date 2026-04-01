@@ -9,15 +9,18 @@ export async function runAiEvalDefinitions<TSubject>(params: {
   attemptId?: string | null;
   subject: TSubject;
   definitions: readonly AiEvalDefinition<TSubject>[];
+  assertActive?: () => Promise<void> | void;
 }): Promise<AiEvalResultRecord[]> {
   const results: AiEvalResultRecord[] = [];
 
   for (const definition of params.definitions) {
+    await params.assertActive?.();
     const outcome = await definition.evaluate({
       runId: params.runId,
       attemptId: params.attemptId ?? null,
       subject: params.subject
     });
+    await params.assertActive?.();
     results.push(
       await persistAiEvalResult({
         runId: params.runId,

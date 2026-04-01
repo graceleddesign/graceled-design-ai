@@ -1,6 +1,6 @@
 import "server-only";
 
-import { completeAiRun, createAiRun } from "@/lib/ai-harness/storage/attempts";
+import { abandonAiRuns, completeAiRun, createAiRun } from "@/lib/ai-harness/storage/attempts";
 import { logBenchmarkRun } from "@/lib/ai-harness/storage/benchmark-runs";
 import { generateImageWithOpenAiHarness, type OpenAiImageReference } from "@/lib/ai-harness/providers";
 import type {
@@ -45,7 +45,10 @@ export async function createGraphicsBackgroundAiRun(params: {
   laneKey?: string | null;
   benchmarkCaseKey?: string | null;
   metadataJson?: AiInputJsonValue | null;
+  assertActive?: () => Promise<void> | void;
+  onRunCreated?: (run: AiRunRecord) => Promise<void> | void;
 }): Promise<GraphicsBackgroundAiRunHandle> {
+  await params.assertActive?.();
   const run = await createAiRun({
     productKey: GRAPHICS_PRODUCT_KEY,
     featureKey: GRAPHICS_BACKGROUND_FEATURE_KEY,
@@ -56,6 +59,7 @@ export async function createGraphicsBackgroundAiRun(params: {
     benchmarkCaseKey: params.benchmarkCaseKey ?? null,
     metadataJson: params.metadataJson ?? null
   });
+  await params.onRunCreated?.(run);
 
   return {
     run
@@ -133,6 +137,7 @@ export async function runGraphicsBackgroundImageGeneration(params: {
   promptVersion?: string;
   references?: OpenAiImageReference[];
   disable429Retry?: boolean;
+  assertActive?: () => Promise<void> | void;
   meta?: {
     debug?: GptImageDebugMeta;
   };
@@ -145,6 +150,7 @@ export async function runGraphicsBackgroundImageGeneration(params: {
     size: resolveGraphicsBackgroundImageSize(params.shape),
     references: params.references,
     disable429Retry: params.disable429Retry,
+    assertActive: params.assertActive,
     meta: params.meta
   });
 
@@ -162,4 +168,26 @@ export async function runGraphicsBackgroundImageGeneration(params: {
       providerRequestId: trace.output.providerRequestId
     }
   };
+}
+
+export async function abandonGraphicsBackgroundAiRuns(params: {
+  runIds: readonly string[];
+  generationId: string;
+  timeoutMs: number;
+}): Promise<{ runIds: string[]; attemptIds: string[] }> {
+  return abandonAiRuns({
+    runIds: params.runIds,
+    errorClass: "TIMEOUT",
+    message: `Claimed generation execution timed out for ${params.generationId} after ${params.timeoutMs}ms.`,
+    attemptOutputJson: {
+      generationId: params.generationId,
+      timeoutMs: params.timeoutMs,
+      abandonedReason: "CLAIM_TIMEOUT"
+    },
+    runMetadataJson: {
+      generationId: params.generationId,
+      timeoutMs: params.timeoutMs,
+      terminalizationReason: "CLAIM_TIMEOUT"
+    }
+  });
 }

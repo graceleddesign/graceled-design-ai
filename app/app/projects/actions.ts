@@ -44,6 +44,7 @@ import { resizeCoverWithFocalPoint, type FocalPoint } from "@/lib/image-cover";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
 import { isOpenAiRateLimitError } from "@/lib/gptImageRateLimit";
 import {
+  abandonGraphicsBackgroundAiRuns,
   createGraphicsBackgroundAiRun,
   finalizeGraphicsBackgroundAiRun,
   runGraphicsBackgroundImageGeneration,
@@ -4231,6 +4232,7 @@ async function persistBackgroundEvaluationIfAvailable(params: {
   stage: string;
   attemptNumber: number;
   directionSpec: PlannedDirectionSpec | null;
+  assertActive?: () => Promise<void> | void;
 }): Promise<void> {
   const aiTrace = params.attempt.aiTrace;
   if (!aiTrace) {
@@ -4238,9 +4240,11 @@ async function persistBackgroundEvaluationIfAvailable(params: {
   }
 
   try {
+    await params.assertActive?.();
     await persistGraphicsBackgroundEvalResults({
       runId: aiTrace.runId,
       attemptId: aiTrace.attemptId,
+      assertActive: params.assertActive,
       subject: {
         evidence: params.evaluation.evidence,
         invalidReasons: params.evaluation.acceptance.invalidReasons,
@@ -6355,6 +6359,68 @@ function isClaimedGenerationExecutionTimeoutError(error: unknown): boolean {
   return error instanceof ClaimedGenerationExecutionTimeoutError;
 }
 
+type ClaimedGenerationExecutionTimeoutLease = {
+  abort: (reason: unknown) => void;
+  throwIfTimedOut: () => void;
+  registerBackgroundRunId: (runId: string) => void;
+  finalizeTimedOutHarnessWork: () => Promise<void>;
+};
+
+function normalizeExecutionLeaseError(reason: unknown, generationId: string): Error {
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  return new Error(`CLAIMED_GENERATION_EXECUTION_TIMEOUT:${generationId}:${String(reason ?? "unknown")}`);
+}
+
+function createClaimedGenerationExecutionTimeoutLease(params: {
+  generationId: string;
+  timeoutMs: number;
+}): ClaimedGenerationExecutionTimeoutLease {
+  const controller = new AbortController();
+  const trackedBackgroundRunIds = new Set<string>();
+  const finalizedRunIds = new Set<string>();
+
+  return {
+    abort(reason: unknown) {
+      if (!controller.signal.aborted) {
+        controller.abort(reason);
+      }
+    },
+    throwIfTimedOut() {
+      if (controller.signal.aborted) {
+        throw normalizeExecutionLeaseError(controller.signal.reason, params.generationId);
+      }
+    },
+    registerBackgroundRunId(runId: string) {
+      if (runId.trim()) {
+        trackedBackgroundRunIds.add(runId);
+      }
+    },
+    async finalizeTimedOutHarnessWork() {
+      if (!controller.signal.aborted) {
+        return;
+      }
+
+      const pendingRunIds = [...trackedBackgroundRunIds].filter((runId) => !finalizedRunIds.has(runId));
+      if (pendingRunIds.length === 0) {
+        return;
+      }
+
+      const finalized = await abandonGraphicsBackgroundAiRuns({
+        runIds: pendingRunIds,
+        generationId: params.generationId,
+        timeoutMs: params.timeoutMs
+      });
+
+      for (const runId of finalized.runIds) {
+        finalizedRunIds.add(runId);
+      }
+    }
+  };
+}
+
 type BackgroundAttemptCandidateDebug = {
   url: string;
   textScrub?: TextScrubDebug;
@@ -8005,10 +8071,14 @@ async function generateCleanMinimalBackgroundPng(params: {
   retryCall?: boolean;
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
+  assertActive?: () => Promise<void> | void;
 }): Promise<{ backgroundPng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
   const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
   const aspect = aspectFromShape(params.shape);
   let promptOnlyRetry = Boolean(params.retryCall);
+  const assertActive = async () => {
+    await params.assertActive?.();
+  };
   const trackCall = (retry: boolean) => {
     if (!params.registerImageCall) {
       return;
@@ -8023,10 +8093,12 @@ async function generateCleanMinimalBackgroundPng(params: {
     }
   };
 
+  await assertActive();
   if (params.referenceDataUrls.length > 0) {
     try {
       trackCall(Boolean(params.retryCall));
       return await runImageGeneration(async () => {
+        await assertActive();
         const result = await runGraphicsBackgroundImageGeneration({
           runHandle: params.aiRunHandle,
           prompt: params.prompt,
@@ -8034,6 +8106,7 @@ async function generateCleanMinimalBackgroundPng(params: {
           shape: params.shape,
           references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl })),
           disable429Retry: params.disable429Retry,
+          assertActive: params.assertActive,
           meta: params.imageDebugMeta
             ? {
                 debug: params.imageDebugMeta
@@ -8054,19 +8127,23 @@ async function generateCleanMinimalBackgroundPng(params: {
       ) {
         throw error;
       }
+      await assertActive();
       promptOnlyRetry = true;
       console.warn(`Reference-guided generation failed for ${params.shape}; retrying prompt-only. ${message}`);
     }
   }
 
+  await assertActive();
   trackCall(promptOnlyRetry);
   return runImageGeneration(async () => {
+    await assertActive();
     const result = await runGraphicsBackgroundImageGeneration({
       runHandle: params.aiRunHandle,
       prompt: params.prompt,
       promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
       shape: params.shape,
       disable429Retry: params.disable429Retry,
+      assertActive: params.assertActive,
       meta: params.imageDebugMeta
         ? {
             debug: params.imageDebugMeta
@@ -8130,6 +8207,7 @@ async function generateValidatedBackgroundPng(params: {
   isRetryGeneration?: boolean;
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
+  assertActive?: () => Promise<void> | void;
 }): Promise<{
   backgroundPng: Buffer;
   prompt: string;
@@ -8144,6 +8222,7 @@ async function generateValidatedBackgroundPng(params: {
 
   try {
     for (let attempt = 0; attempt <= maxTextRetries; attempt += 1) {
+      await params.assertActive?.();
       const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[Math.min(attempt - 1, NO_TEXT_RETRY_BOOSTS.length - 1)];
       const prompt = buildTemplateBackgroundPrompt({
         brief: params.brief,
@@ -8175,13 +8254,16 @@ async function generateValidatedBackgroundPng(params: {
         registerImageCall: params.registerImageCall,
         retryCall: params.isRetryGeneration === true || attempt > 0,
         disablePromptOnlyFallbackForRateLimit: params.disablePromptOnlyFallbackForRateLimit,
-        disable429Retry: params.disable429Retry
+        disable429Retry: params.disable429Retry,
+        assertActive: params.assertActive
       });
+      await params.assertActive?.();
       const backgroundPng = await normalizePngToShape(backgroundSource.backgroundPng, params.shape, params.focalPoint);
       const hasText = await imageHasReadableText(backgroundPng, {
         hardFailTokens: params.hardFailTextTokens
       });
       if (!hasText) {
+        await params.assertActive?.();
         return {
           backgroundPng,
           prompt,
@@ -8196,6 +8278,7 @@ async function generateValidatedBackgroundPng(params: {
       lastAiTrace = backgroundSource.aiTrace;
     }
 
+    await params.assertActive?.();
     return {
       backgroundPng: lastBackgroundPng as Buffer,
       prompt: lastPrompt,
@@ -9389,6 +9472,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR"
         };
       } else {
+      const executionLease = createClaimedGenerationExecutionTimeoutLease({
+        generationId: plannedGeneration.id,
+        timeoutMs: CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS
+      });
+      const assertClaimedGenerationExecutionActive = () => executionLease.throwIfTimedOut();
       try {
       let executionTimeoutId: ReturnType<typeof setTimeout> | null = null;
       try {
@@ -9688,6 +9776,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         originalityBoost?: string;
         candidateSuffix?: string;
       } = {}) => {
+        await assertClaimedGenerationExecutionActive();
         const activeDirectionSpec =
           attemptParams.directionSpecOverride === undefined ? backgroundDirectionSpec : attemptParams.directionSpecOverride;
         if (shouldReuseBackground && reusableAssets?.masterBackgroundPng) {
@@ -9729,8 +9818,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             candidateSuffix: attemptParams.candidateSuffix || null,
             variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null,
             stageHint: shouldRunExplorationToneCheck ? "exploration" : "production"
-          })
+          }),
+          assertActive: assertClaimedGenerationExecutionActive,
+          onRunCreated: (run) => {
+            executionLease.registerBackgroundRunId(run.id);
+          }
         });
+        await assertClaimedGenerationExecutionActive();
         let latestBackgroundAiTrace: GraphicsBackgroundAiAttemptTrace | null = null;
         try {
         const toneTargetForCompliance = shouldRunExplorationToneCheck
@@ -9760,7 +9854,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           imageDebugMeta: imageRateLimitDebugMeta,
           registerImageCall,
           disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
-          disable429Retry: shouldDisable429Retry
+          disable429Retry: shouldDisable429Retry,
+          assertActive: assertClaimedGenerationExecutionActive
         });
         latestBackgroundAiTrace = initialBackground.aiTrace;
 
@@ -9825,7 +9920,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 registerImageCall,
                 isRetryGeneration: true,
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
-                disable429Retry: shouldDisable429Retry
+                disable429Retry: shouldDisable429Retry,
+                assertActive: assertClaimedGenerationExecutionActive
               });
               latestBackgroundAiTrace = validatedBackground.aiTrace;
               paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
@@ -9893,7 +9989,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 registerImageCall,
                 isRetryGeneration: true,
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
-                disable429Retry: shouldDisable429Retry
+                disable429Retry: shouldDisable429Retry,
+                assertActive: assertClaimedGenerationExecutionActive
             });
             latestBackgroundAiTrace = validatedBackground.aiTrace;
 
@@ -9963,7 +10060,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 registerImageCall,
                 isRetryGeneration: true,
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
-                disable429Retry: shouldDisable429Retry
+                disable429Retry: shouldDisable429Retry,
+                assertActive: assertClaimedGenerationExecutionActive
             });
             latestBackgroundAiTrace = validatedBackground.aiTrace;
 
@@ -9996,6 +10094,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const hash = await computeDHashFromBuffer(backgroundPng);
         const closestDistance = findClosestReferenceDistance(hash, references);
         try {
+          await assertClaimedGenerationExecutionActive();
           await finalizeGraphicsBackgroundAiRun({
             runHandle: backgroundAiRunHandle,
             status: "COMPLETED",
@@ -10332,7 +10431,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           optionIndex: plannedGeneration.optionIndex,
           stage: params.stage,
           attemptNumber: params.attemptNumber,
-          directionSpec: winner ? winner.candidate.directionSpecUsed : bestCandidate.candidate.directionSpecUsed
+          directionSpec: winner ? winner.candidate.directionSpecUsed : bestCandidate.candidate.directionSpecUsed,
+          assertActive: assertClaimedGenerationExecutionActive
         });
 
         return {
@@ -10525,7 +10625,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               optionIndex: plannedGeneration.optionIndex,
               stage: "background_recovery",
               attemptNumber: 2,
-              directionSpec: activeDirectionSpec
+              directionSpec: activeDirectionSpec,
+              assertActive: assertClaimedGenerationExecutionActive
             });
             return {
               attempt: recoveryAccepted ? recoveryAttempt : null,
@@ -10555,7 +10656,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             optionIndex: plannedGeneration.optionIndex,
             stage: "primary",
             attemptNumber: 1,
-            directionSpec: activeDirectionSpec
+            directionSpec: activeDirectionSpec,
+            assertActive: assertClaimedGenerationExecutionActive
           });
           return {
             attempt: attemptEvaluation.acceptance.accepted ? attempt : null,
@@ -11686,7 +11788,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       })(),
       new Promise<never>((_, reject) => {
         executionTimeoutId = setTimeout(() => {
-          reject(new ClaimedGenerationExecutionTimeoutError(plannedGeneration.id, CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS));
+          const timeoutError = new ClaimedGenerationExecutionTimeoutError(
+            plannedGeneration.id,
+            CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS
+          );
+          executionLease.abort(timeoutError);
+          reject(timeoutError);
         }, CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS);
       })
       ]);
@@ -11696,6 +11803,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         }
       }
     } catch (error) {
+      const claimTimedOut = isClaimedGenerationExecutionTimeoutError(error);
+      if (claimTimedOut) {
+        executionLease.abort(error);
+      }
       const message = error instanceof Error ? error.message : "Unknown error";
       const failureReason = resolveBackgroundAttemptFailureReason(error, imageCallCapReached);
       failSafeReason = failureReason;
@@ -11704,37 +11815,49 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
       );
       try {
-        const optionStatus = await completeGenerationWithFallbackOutput({
-          projectId: params.project.id,
-          generationId: plannedGeneration.id,
-          output: fallbackOutput,
-          failureReason,
-          providerPreflight: params.providerPreflight,
-          attemptOwner: plannedGeneration.attemptOwner
-        });
-        provisionalResult = {
-          generationId: plannedGeneration.id,
-          optionStatus,
-          failureReason
-        };
-      } catch (fallbackError) {
-        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback persistence error";
-        failSafeMessage = `Fallback persistence failed before terminal settlement: ${fallbackMessage}`;
-        const persisted = await persistMinimalFailedGenerationSettlement({
-          generationId: plannedGeneration.id,
-          output: fallbackOutput,
-          failureReason,
-          providerPreflight: params.providerPreflight,
-          attemptOwner: plannedGeneration.attemptOwner,
-          input: failSafeInput,
-          notes: "generation_failed",
-          warningMessages: ["Fallback persistence failed.", `Generation error: ${message}`, `Fallback error: ${fallbackMessage}`]
-        });
-        provisionalResult = {
-          generationId: plannedGeneration.id,
-          optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
-          failureReason
-        };
+        try {
+          const optionStatus = await completeGenerationWithFallbackOutput({
+            projectId: params.project.id,
+            generationId: plannedGeneration.id,
+            output: fallbackOutput,
+            failureReason,
+            providerPreflight: params.providerPreflight,
+            attemptOwner: plannedGeneration.attemptOwner
+          });
+          provisionalResult = {
+            generationId: plannedGeneration.id,
+            optionStatus,
+            failureReason
+          };
+        } catch (fallbackError) {
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback persistence error";
+          failSafeMessage = `Fallback persistence failed before terminal settlement: ${fallbackMessage}`;
+          const persisted = await persistMinimalFailedGenerationSettlement({
+            generationId: plannedGeneration.id,
+            output: fallbackOutput,
+            failureReason,
+            providerPreflight: params.providerPreflight,
+            attemptOwner: plannedGeneration.attemptOwner,
+            input: failSafeInput,
+            notes: "generation_failed",
+            warningMessages: ["Fallback persistence failed.", `Generation error: ${message}`, `Fallback error: ${fallbackMessage}`]
+          });
+          provisionalResult = {
+            generationId: plannedGeneration.id,
+            optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
+            failureReason
+          };
+        }
+      } finally {
+        if (claimTimedOut) {
+          try {
+            await executionLease.finalizeTimedOutHarnessWork();
+          } catch (timeoutFinalizeError) {
+            const timeoutFinalizeMessage =
+              timeoutFinalizeError instanceof Error ? timeoutFinalizeError.message : "Unknown timed-out harness finalization error";
+            console.warn(`[ai-harness-run] generation=${plannedGeneration.id} status=timeout-finalize error=${timeoutFinalizeMessage}`);
+          }
+        }
       }
     }
       }
