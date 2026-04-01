@@ -52,6 +52,7 @@ import {
   type GraphicsBackgroundAiRunHandle
 } from "@/lib/graphics-domain/generation";
 import { resolveClaimedGenerationExecutionTimeoutMs } from "@/lib/graphics-domain/claim-timeout";
+import { settleUnexpectedClaimedGenerationFailure } from "@/lib/graphics-domain/claimed-generation-failure-settlement";
 import {
   GRAPHICS_BACKGROUND_PROMPT_VERSION,
   buildGraphicsBackgroundRunMetadata
@@ -11818,52 +11819,61 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       failSafeReason = failureReason;
       failSafeMessage = `Generation branch threw before terminal settlement: ${message}`;
       console.error(
-        `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
+        `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Settling as failed after active background work is exhausted. ${message}`
       );
       try {
-        try {
-          const optionStatus = await completeGenerationWithFallbackOutput({
-            projectId: params.project.id,
-            generationId: plannedGeneration.id,
-            output: fallbackOutput,
-            failureReason,
-            providerPreflight: params.providerPreflight,
-            attemptOwner: plannedGeneration.attemptOwner
-          });
-          provisionalResult = {
-            generationId: plannedGeneration.id,
-            optionStatus,
-            failureReason
-          };
-        } catch (fallbackError) {
-          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback persistence error";
-          failSafeMessage = `Fallback persistence failed before terminal settlement: ${fallbackMessage}`;
-          const persisted = await persistMinimalFailedGenerationSettlement({
-            generationId: plannedGeneration.id,
-            output: fallbackOutput,
-            failureReason,
-            providerPreflight: params.providerPreflight,
-            attemptOwner: plannedGeneration.attemptOwner,
-            input: failSafeInput,
-            notes: "generation_failed",
-            warningMessages: ["Fallback persistence failed.", `Generation error: ${message}`, `Fallback error: ${fallbackMessage}`]
-          });
-          provisionalResult = {
-            generationId: plannedGeneration.id,
-            optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
-            failureReason
-          };
-        }
-      } finally {
-        if (claimTimedOut) {
-          try {
-            await executionLease.finalizeTimedOutHarnessWork();
-          } catch (timeoutFinalizeError) {
-            const timeoutFinalizeMessage =
-              timeoutFinalizeError instanceof Error ? timeoutFinalizeError.message : "Unknown timed-out harness finalization error";
-            console.warn(`[ai-harness-run] generation=${plannedGeneration.id} status=timeout-finalize error=${timeoutFinalizeMessage}`);
-          }
-        }
+        const optionStatus = await settleUnexpectedClaimedGenerationFailure({
+          claimTimedOut,
+          finalizeTimedOutBackgroundWork: claimTimedOut
+            ? async () => {
+                await executionLease.finalizeTimedOutHarnessWork();
+              }
+            : undefined,
+          persistTerminalFailure: async () =>
+            persistMinimalFailedGenerationSettlement({
+              generationId: plannedGeneration.id,
+              output: fallbackOutput,
+              failureReason,
+              providerPreflight: params.providerPreflight,
+              attemptOwner: plannedGeneration.attemptOwner,
+              input: failSafeInput,
+              notes: "generation_failed",
+              warningMessages: [
+                claimTimedOut ? "Timed-out background work was exhausted before terminal failure settlement." : null,
+                `Generation error: ${message}`
+              ]
+            }),
+          readPersistedStatus: async () => readPersistedGenerationOptionStatus(plannedGeneration.id)
+        });
+        provisionalResult = {
+          generationId: plannedGeneration.id,
+          optionStatus,
+          failureReason
+        };
+      } catch (failureSettlementError) {
+        const settlementMessage =
+          failureSettlementError instanceof Error ? failureSettlementError.message : "Unknown terminal failure settlement error";
+        failSafeMessage = `Failed-generation settlement failed before terminal settlement: ${settlementMessage}`;
+        const persisted = await persistMinimalFailedGenerationSettlement({
+          generationId: plannedGeneration.id,
+          output: fallbackOutput,
+          failureReason,
+          providerPreflight: params.providerPreflight,
+          attemptOwner: plannedGeneration.attemptOwner,
+          input: failSafeInput,
+          notes: "generation_failed",
+          warningMessages: [
+            claimTimedOut ? "Timed-out background work finalization failed before terminal settlement." : null,
+            "Failed-generation settlement retry failed.",
+            `Generation error: ${message}`,
+            `Settlement error: ${settlementMessage}`
+          ]
+        });
+        provisionalResult = {
+          generationId: plannedGeneration.id,
+          optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
+          failureReason
+        };
       }
     }
       }
