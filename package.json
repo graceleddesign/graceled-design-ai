@@ -26,9 +26,6 @@
     "prisma:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts"
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  },
   "dependencies": {
     "@fontsource/abril-fatface": "^5.2.7",
     "@fontsource/alfa-slab-one": "^5.2.8",

@@ -9,6 +9,7 @@ import { redirect } from "next/navigation";
 import sharp from "sharp";
 import { z } from "zod";
 import { requireSession } from "@/lib/auth";
+import { readAiErrorClass } from "@/lib/ai-harness/core/errors";
 import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import {
   mapLegacyTitleIntegrationToDesignSpec,
@@ -43,6 +44,18 @@ import { resizeCoverWithFocalPoint, type FocalPoint } from "@/lib/image-cover";
 import { computeDHashFromBuffer, hammingDistanceHash } from "@/lib/image-hash";
 import { isOpenAiRateLimitError } from "@/lib/gptImageRateLimit";
 import {
+  createGraphicsBackgroundAiRun,
+  finalizeGraphicsBackgroundAiRun,
+  runGraphicsBackgroundImageGeneration,
+  type GraphicsBackgroundAiAttemptTrace,
+  type GraphicsBackgroundAiRunHandle
+} from "@/lib/graphics-domain/generation";
+import {
+  GRAPHICS_BACKGROUND_PROMPT_VERSION,
+  buildGraphicsBackgroundRunMetadata
+} from "@/lib/graphics-domain/prompts";
+import { persistGraphicsBackgroundEvalResults } from "@/lib/graphics-evals/background-eligibility";
+import {
   type GenerationFailureReason,
   type GenerationLifecycleState,
   type GenerationOptionStatus,
@@ -55,7 +68,6 @@ import {
 } from "@/lib/generation-state";
 import { preflightImageProvider, resolveImageProviderConfig, type ImageProviderPreflightResult } from "@/lib/image-provider";
 import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
-import { generatePngFromPrompt } from "@/lib/openai-image";
 import { openai } from "@/lib/openai";
 import { optionLabel } from "@/lib/option-label";
 import { buildOverlayDisplayContent, normalizeLine } from "@/lib/overlay-lines";
@@ -180,6 +192,7 @@ const generateRoundTwoSchema = z.object({
 });
 const ROUND_OPTION_COUNT = 3;
 const ROUND1_NON_FALLBACK_MAX_ATTEMPTS = 8;
+const CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS = 90_000;
 const FINALIST_ASPECT_RECOVERY_LIMIT = 2;
 type BackgroundAssetSlot = "square_bg" | "wide_bg" | "tall_bg";
 type FinalAssetSlot = "square" | "wide" | "tall";
@@ -201,11 +214,6 @@ const BACKGROUND_ASSET_SLOT_BY_SHAPE: Record<PreviewShape, BackgroundAssetSlot> 
   square: "square_bg",
   wide: "wide_bg",
   tall: "tall_bg"
-};
-const OPENAI_IMAGE_SIZE_BY_SHAPE: Record<PreviewShape, "1024x1024" | "1536x1024" | "1024x1536"> = {
-  square: "1024x1024",
-  wide: "1536x1024",
-  tall: "1024x1536"
 };
 const BRAND_NEUTRAL_HEXES = ["#000000", "#111827", "#334155", "#64748B", "#CBD5E1", "#F8FAFC", "#FFFFFF"] as const;
 const BRAND_PALETTE_SAMPLE_COLUMNS = 40;
@@ -261,6 +269,8 @@ const ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT = 4;
 const ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT = 2;
 const CHEAP_MODE_ROUND1_BACKGROUND_CANDIDATE_COUNT = 1;
 const STANDARD_ROUND1_BACKGROUND_CANDIDATE_COUNT = 2;
+const ROUND1_BACKGROUND_RECOVERY_MAX_ATTEMPTS = 1;
+const ROUND1_BACKGROUND_RECOVERY_CANDIDATE_COUNT = 2;
 const ROUND1_NO_NOTES_LOCKUP_CANDIDATE_COUNT = 1;
 const ROUND1_NO_NOTES_MAX_TEXT_RETRIES = 1;
 const ROUND1_CHEAP_MODE_MAX_IMAGE_CALLS = 12;
@@ -4040,6 +4050,75 @@ function buildBackgroundAttemptFailureReason(invalidReasons: string[]): Backgrou
   return "UNKNOWN";
 }
 
+const BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY = [
+  "background_text_detected",
+  "background_scaffold_like",
+  "background_blank_or_motif_weak",
+  "background_tone_fit_failed",
+  "background_not_canonical"
+] as const;
+
+function normalizeBackgroundRecoveryReasons(reasons: string[]): string[] {
+  const priority = new Map(BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY.map((reason, index) => [reason, index] as const));
+  return [...new Set(reasons.filter((reason) => typeof reason === "string" && reason.trim().length > 0))]
+    .sort((left, right) => {
+      const leftPriority = priority.get(left) ?? Number.MAX_SAFE_INTEGER;
+      const rightPriority = priority.get(right) ?? Number.MAX_SAFE_INTEGER;
+      return leftPriority - rightPriority || left.localeCompare(right);
+    });
+}
+
+function collectRecoverableBackgroundInvalidReasons(invalidReasons: string[]): string[] {
+  return normalizeBackgroundRecoveryReasons(
+    invalidReasons.filter((reason) =>
+      BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY.includes(
+        reason as (typeof BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY)[number]
+      )
+    )
+  );
+}
+
+function createBackgroundRecoveryDebug(params?: Partial<BackgroundRecoveryDebug>): BackgroundRecoveryDebug {
+  return {
+    attempted: params?.attempted === true,
+    attempts: typeof params?.attempts === "number" && Number.isFinite(params.attempts) ? params.attempts : 0,
+    reasons: normalizeBackgroundRecoveryReasons(params?.reasons || []),
+    succeeded: params?.succeeded === true,
+    finalReasons: normalizeBackgroundRecoveryReasons(params?.finalReasons || [])
+  };
+}
+
+function buildBackgroundRecoveryBoost(params: {
+  invalidReasons: string[];
+  toneTarget: "light" | "vivid" | "dark" | "mono" | null;
+}): string | undefined {
+  const recoverableReasons = collectRecoverableBackgroundInvalidReasons(params.invalidReasons);
+  if (recoverableReasons.length <= 0) {
+    return undefined;
+  }
+
+  const instructions = [BACKGROUND_RECOVERY_SAME_DIRECTION_BOOST, BACKGROUND_RECOVERY_CANONICAL_BOOST];
+  if (recoverableReasons.includes("background_text_detected")) {
+    instructions.push(BACKGROUND_ELIGIBILITY_RETRY_BOOST);
+  }
+  if (recoverableReasons.includes("background_scaffold_like")) {
+    instructions.push(BACKGROUND_RECOVERY_SCAFFOLD_BOOST);
+  }
+  if (recoverableReasons.includes("background_blank_or_motif_weak")) {
+    instructions.push(BACKGROUND_RECOVERY_MOTIF_BOOST);
+  }
+  if (recoverableReasons.includes("background_tone_fit_failed")) {
+    instructions.push(
+      params.toneTarget ? `${BACKGROUND_RECOVERY_TONE_BOOST_PREFIX} Target tone: ${params.toneTarget}.` : BACKGROUND_RECOVERY_TONE_BOOST_PREFIX
+    );
+  }
+  if (recoverableReasons.includes("background_not_canonical")) {
+    instructions.push(BACKGROUND_RECOVERY_CANONICAL_BOOST);
+  }
+
+  return instructions.join(" ");
+}
+
 async function evaluateBackgroundAttempt(params: {
   attempt: {
     backgroundPng: Buffer;
@@ -4140,6 +4219,53 @@ function buildProductionBackgroundValidationEvidence(params: {
     toneFit: selectedChecks.toneFit ?? params.toneCheck?.passed ?? null,
     referenceFit: selectedChecks.referenceFit
   };
+}
+
+async function persistBackgroundEvaluationIfAvailable(params: {
+  attempt: {
+    aiTrace?: GraphicsBackgroundAiAttemptTrace | null;
+  };
+  evaluation: BackgroundAttemptEvaluation;
+  generationId: string;
+  optionIndex: number;
+  stage: string;
+  attemptNumber: number;
+  directionSpec: PlannedDirectionSpec | null;
+}): Promise<void> {
+  const aiTrace = params.attempt.aiTrace;
+  if (!aiTrace) {
+    return;
+  }
+
+  try {
+    await persistGraphicsBackgroundEvalResults({
+      runId: aiTrace.runId,
+      attemptId: aiTrace.attemptId,
+      subject: {
+        evidence: params.evaluation.evidence,
+        invalidReasons: params.evaluation.acceptance.invalidReasons,
+        textArtifactDetected: params.evaluation.textArtifactDetected,
+        checks: params.evaluation.checks,
+        stats: {
+          titleSafeScore: params.evaluation.stats.titleSafe?.score || null,
+          midtoneRangeScore: params.evaluation.stats.midtoneRange?.score || null,
+          meaningfulStructureScore: params.evaluation.stats.hardFail?.meaningfulStructureScore || null
+        },
+        metadata: {
+          generationId: params.generationId,
+          optionIndex: params.optionIndex,
+          stage: params.stage,
+          attemptNumber: params.attemptNumber,
+          styleFamily: resolveDirectionStyleFields(params.directionSpec).styleFamily,
+          providerKey: aiTrace.providerKey,
+          modelKey: aiTrace.modelKey
+        }
+      }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown background eval persistence error";
+    console.warn(`[ai-harness-evals] generation=${params.generationId} stage=${params.stage} attempt=${params.attemptNumber} error=${message}`);
+  }
 }
 
 function buildProductionLockupValidationEvidence(params: {
@@ -4308,6 +4434,35 @@ function withGenerationExecutionStateOutput(
   };
 }
 
+function withClaimedGenerationActiveOutput(
+  output: GenerationOutputPayload,
+  attemptOwner: Pick<GenerationAttemptOwner, "token" | "attemptNumber">
+): GenerationOutputPayload {
+  return withGenerationExecutionStateOutput(
+    {
+      ...output,
+      meta: {
+        ...output.meta,
+        ...(mergeGenerationDebugMeta(output.meta.debug, {
+          generationLifecycleState: "GENERATION_IN_PROGRESS"
+        })
+          ? {
+              debug: mergeGenerationDebugMeta(output.meta.debug, {
+                generationLifecycleState: "GENERATION_IN_PROGRESS"
+              })
+            }
+          : {})
+      }
+    },
+    {
+      version: 1,
+      phase: "RUNNING",
+      activeAttemptToken: attemptOwner.token,
+      activeAttemptNumber: attemptOwner.attemptNumber
+    }
+  );
+}
+
 function resolveNextGenerationAttemptNumber(output: unknown): number {
   const execution = readPersistedGenerationExecutionState(output);
   const previousAttemptNumber =
@@ -4317,7 +4472,34 @@ function resolveNextGenerationAttemptNumber(output: unknown): number {
   return previousAttemptNumber + 1;
 }
 
+function mapAiErrorClassToProviderFailureReason(errorClass: ReturnType<typeof readAiErrorClass>): ProviderFailureReason | null {
+  if (errorClass === "MODEL_UNAVAILABLE") {
+    return "PROVIDER_MODEL_UNAVAILABLE";
+  }
+  if (errorClass === "QUOTA_EXCEEDED") {
+    return "PROVIDER_QUOTA_OR_RATE_LIMIT";
+  }
+  if (errorClass === "MISCONFIGURED_PROVIDER") {
+    return "PROVIDER_AUTH_OR_CONFIG_ERROR";
+  }
+  if (
+    errorClass === "TRANSIENT_PROVIDER_FAILURE" ||
+    errorClass === "TIMEOUT" ||
+    errorClass === "INVALID_RESPONSE" ||
+    errorClass === "UNKNOWN_PROVIDER_ERROR"
+  ) {
+    return "PROVIDER_TRANSIENT_ERROR";
+  }
+
+  return null;
+}
+
 function readProviderFailureReasonFromError(error: unknown): ProviderFailureReason | null {
+  const aiFailureReason = mapAiErrorClassToProviderFailureReason(readAiErrorClass(error));
+  if (aiFailureReason) {
+    return aiFailureReason;
+  }
+
   if (!error || typeof error !== "object" || !("failureReason" in error)) {
     return null;
   }
@@ -4333,6 +4515,10 @@ function resolveGenerationLifecycleStateForFailure(reason: BackgroundAttemptFail
 function resolveBackgroundAttemptFailureReason(error: unknown, imageCallCapReached = false): BackgroundAttemptFailureReason {
   if (imageCallCapReached) {
     return "BUDGET";
+  }
+
+  if (isClaimedGenerationExecutionTimeoutError(error)) {
+    return "PROVIDER_TRANSIENT_ERROR";
   }
 
   return readProviderFailureReasonFromError(error) || (isOpenAiRateLimitError(error) ? "PROVIDER_QUOTA_OR_RATE_LIMIT" : "UNKNOWN");
@@ -5964,7 +6150,7 @@ type BuildGenerationOutputParams = {
 
 type BackgroundRerankCandidateDebug = {
   url: string;
-  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
+  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry" | "background_recovery";
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
@@ -6028,7 +6214,7 @@ type BackgroundRerankCandidateDebug = {
 type BackgroundRerankWinnerDebug = {
   index: number;
   url: string;
-  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
+  stage: "primary" | "fallback_family" | "fallback_set" | "text_retry" | "background_recovery";
   attempt: number;
   styleFamily: StyleFamilyKey | null;
   explorationSetKey: string | null;
@@ -6079,6 +6265,14 @@ type TextScrubDebug = {
   scrubbedUrl: string | null;
 };
 
+type BackgroundRecoveryDebug = {
+  attempted: boolean;
+  attempts: number;
+  reasons: string[];
+  succeeded: boolean;
+  finalReasons: string[];
+};
+
 type ImageCallDebugSummary = {
   total: number;
   byStage: Record<ImageCallStage, number>;
@@ -6117,6 +6311,17 @@ class Round1ImageCallCapReachedError extends Error {
 
 function isRound1ImageCallCapReachedError(error: unknown): boolean {
   return error instanceof Round1ImageCallCapReachedError;
+}
+
+class ClaimedGenerationExecutionTimeoutError extends Error {
+  constructor(generationId: string, timeoutMs: number) {
+    super(`CLAIMED_GENERATION_EXECUTION_TIMEOUT:${generationId}:${timeoutMs}`);
+    this.name = "ClaimedGenerationExecutionTimeoutError";
+  }
+}
+
+function isClaimedGenerationExecutionTimeoutError(error: unknown): boolean {
+  return error instanceof ClaimedGenerationExecutionTimeoutError;
 }
 
 type BackgroundAttemptCandidateDebug = {
@@ -6212,6 +6417,11 @@ type GenerationOutputPayload = {
       lockupSource?: DebugAssetSource;
       backgroundFailureReason?: BackgroundAttemptFailureReason | null;
       backgroundAttempts?: BackgroundAttemptDebug[];
+      backgroundRecoveryAttempted?: boolean;
+      backgroundRecoveryAttempts?: number;
+      backgroundRecoveryReasons?: string[];
+      backgroundRecoverySucceeded?: boolean;
+      backgroundRecoveryFinalReasons?: string[];
       textScrub?: TextScrubDebug;
       warnings?: string[];
       imageCalls?: ImageCallDebugSummary;
@@ -7754,6 +7964,8 @@ async function generateCleanMinimalBackgroundPng(params: {
   prompt: string;
   shape: PreviewShape;
   referenceDataUrls: string[];
+  aiRunHandle: GraphicsBackgroundAiRunHandle;
+  promptVersion?: string;
   runImageGeneration?: ConcurrencyLimiter;
   imageDebugMeta?: {
     rateLimitWaitMs?: number;
@@ -7762,8 +7974,7 @@ async function generateCleanMinimalBackgroundPng(params: {
   retryCall?: boolean;
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
-}): Promise<Buffer> {
-  const size = OPENAI_IMAGE_SIZE_BY_SHAPE[params.shape];
+}): Promise<{ backgroundPng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
   const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
   const aspect = aspectFromShape(params.shape);
   let promptOnlyRetry = Boolean(params.retryCall);
@@ -7784,10 +7995,12 @@ async function generateCleanMinimalBackgroundPng(params: {
   if (params.referenceDataUrls.length > 0) {
     try {
       trackCall(Boolean(params.retryCall));
-      return await runImageGeneration(() =>
-        generatePngFromPrompt({
+      return await runImageGeneration(async () => {
+        const result = await runGraphicsBackgroundImageGeneration({
+          runHandle: params.aiRunHandle,
           prompt: params.prompt,
-          size,
+          promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
+          shape: params.shape,
           references: params.referenceDataUrls.map((dataUrl) => ({ dataUrl })),
           disable429Retry: params.disable429Retry,
           meta: params.imageDebugMeta
@@ -7795,8 +8008,13 @@ async function generateCleanMinimalBackgroundPng(params: {
                 debug: params.imageDebugMeta
               }
             : undefined
-        })
-      );
+        });
+
+        return {
+          backgroundPng: result.imagePng,
+          aiTrace: result.aiTrace
+        };
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reference-guided generation error";
       if (
@@ -7811,18 +8029,25 @@ async function generateCleanMinimalBackgroundPng(params: {
   }
 
   trackCall(promptOnlyRetry);
-  return runImageGeneration(() =>
-    generatePngFromPrompt({
+  return runImageGeneration(async () => {
+    const result = await runGraphicsBackgroundImageGeneration({
+      runHandle: params.aiRunHandle,
       prompt: params.prompt,
-      size,
+      promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
+      shape: params.shape,
       disable429Retry: params.disable429Retry,
       meta: params.imageDebugMeta
         ? {
             debug: params.imageDebugMeta
           }
         : undefined
-    })
-  );
+    });
+
+    return {
+      backgroundPng: result.imagePng,
+      aiTrace: result.aiTrace
+    };
+  });
 }
 
 const NO_TEXT_RETRY_BOOSTS = [
@@ -7831,6 +8056,16 @@ const NO_TEXT_RETRY_BOOSTS = [
   "Remove ALL letterforms; replace with texture."
 ] as const;
 const BACKGROUND_ELIGIBILITY_RETRY_BOOST = "Remove ALL letterforms; replace with texture.";
+const BACKGROUND_RECOVERY_SAME_DIRECTION_BOOST =
+  "BACKGROUND RECOVERY: stay in the same direction, same style family, same motif scope, and same overall concept. Improve only the background execution.";
+const BACKGROUND_RECOVERY_CANONICAL_BOOST =
+  "BACKGROUND RECOVERY: return a fully original, canonical background only. No placeholder cues, no provisional scaffolds, no fallback-like layout artifacts.";
+const BACKGROUND_RECOVERY_SCAFFOLD_BOOST =
+  "BACKGROUND RECOVERY: remove frames, borders, split poster panels, ruled layout cues, detached stage blocks, and obvious wireframe structure. Use organic or material-led structure only.";
+const BACKGROUND_RECOVERY_MOTIF_BOOST =
+  "BACKGROUND RECOVERY: keep the same motif intent, but make one symbolic focal motif clearly present and visually meaningful. Avoid empty haze, low-detail filler, and blank texture fields.";
+const BACKGROUND_RECOVERY_TONE_BOOST_PREFIX =
+  "BACKGROUND RECOVERY: keep the same direction, but correct tonal distribution to satisfy the required tone target.";
 const TEXT_ARTIFACT_RETRY_OVERRIDE =
   "TEXT REMOVAL RETRY OVERRIDE: remove all typography artifacts; regenerate as pure background only; no letters/words at all.";
 
@@ -7853,6 +8088,8 @@ async function generateValidatedBackgroundPng(params: {
   paletteComplianceBoost?: string;
   toneComplianceBoost?: string;
   textArtifactRetryBoost?: string;
+  aiRunHandle: GraphicsBackgroundAiRunHandle;
+  promptVersion?: string;
   runImageGeneration?: ConcurrencyLimiter;
   maxTextRetries?: number;
   imageDebugMeta?: {
@@ -7862,66 +8099,100 @@ async function generateValidatedBackgroundPng(params: {
   isRetryGeneration?: boolean;
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
-}): Promise<{ backgroundPng: Buffer; prompt: string; textRetryCount: number; textCheckPassed: boolean }> {
+}): Promise<{
+  backgroundPng: Buffer;
+  prompt: string;
+  textRetryCount: number;
+  textCheckPassed: boolean;
+  aiTrace: GraphicsBackgroundAiAttemptTrace;
+}> {
   const maxTextRetries = Math.max(0, Math.min(params.maxTextRetries ?? NO_TEXT_RETRY_BOOSTS.length, NO_TEXT_RETRY_BOOSTS.length));
   let lastPrompt = "";
   let lastBackgroundPng: Buffer | null = null;
+  let lastAiTrace: GraphicsBackgroundAiAttemptTrace | null = null;
 
-  for (let attempt = 0; attempt <= maxTextRetries; attempt += 1) {
-    const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[Math.min(attempt - 1, NO_TEXT_RETRY_BOOSTS.length - 1)];
-    const prompt = buildTemplateBackgroundPrompt({
-      brief: params.brief,
-      styleFamily: params.styleFamily,
-      shape: params.shape,
-      generationId: params.generationId,
-      directionSpec: params.directionSpec,
-      designSpec: params.designSpec,
-      brandMode: params.brandMode,
-      explorationMode: params.explorationMode,
-      seriesPreferenceGuidance: params.seriesPreferenceGuidance,
-      bibleCreativeBrief: params.bibleCreativeBrief,
-      originalityBoost: params.originalityBoost,
-      brandPaletteHardConstraint: params.brandPaletteHardConstraint,
-      paletteComplianceBoost: params.paletteComplianceBoost,
-      toneComplianceBoost: params.toneComplianceBoost,
-      textArtifactRetryBoost: params.textArtifactRetryBoost,
-      noTextBoost
-    });
+  try {
+    for (let attempt = 0; attempt <= maxTextRetries; attempt += 1) {
+      const noTextBoost = attempt === 0 ? undefined : NO_TEXT_RETRY_BOOSTS[Math.min(attempt - 1, NO_TEXT_RETRY_BOOSTS.length - 1)];
+      const prompt = buildTemplateBackgroundPrompt({
+        brief: params.brief,
+        styleFamily: params.styleFamily,
+        shape: params.shape,
+        generationId: params.generationId,
+        directionSpec: params.directionSpec,
+        designSpec: params.designSpec,
+        brandMode: params.brandMode,
+        explorationMode: params.explorationMode,
+        seriesPreferenceGuidance: params.seriesPreferenceGuidance,
+        bibleCreativeBrief: params.bibleCreativeBrief,
+        originalityBoost: params.originalityBoost,
+        brandPaletteHardConstraint: params.brandPaletteHardConstraint,
+        paletteComplianceBoost: params.paletteComplianceBoost,
+        toneComplianceBoost: params.toneComplianceBoost,
+        textArtifactRetryBoost: params.textArtifactRetryBoost,
+        noTextBoost
+      });
 
-    const backgroundSource = await generateCleanMinimalBackgroundPng({
-      prompt,
-      shape: params.shape,
-      referenceDataUrls: params.referenceDataUrls,
-      runImageGeneration: params.runImageGeneration,
-      imageDebugMeta: params.imageDebugMeta,
-      registerImageCall: params.registerImageCall,
-      retryCall: params.isRetryGeneration === true || attempt > 0,
-      disablePromptOnlyFallbackForRateLimit: params.disablePromptOnlyFallbackForRateLimit,
-      disable429Retry: params.disable429Retry
-    });
-    const backgroundPng = await normalizePngToShape(backgroundSource, params.shape, params.focalPoint);
-    const hasText = await imageHasReadableText(backgroundPng, {
-      hardFailTokens: params.hardFailTextTokens
-    });
-    if (!hasText) {
-      return {
-        backgroundPng,
+      const backgroundSource = await generateCleanMinimalBackgroundPng({
         prompt,
-        textRetryCount: attempt,
-        textCheckPassed: true
-      };
+        shape: params.shape,
+        referenceDataUrls: params.referenceDataUrls,
+        aiRunHandle: params.aiRunHandle,
+        promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
+        runImageGeneration: params.runImageGeneration,
+        imageDebugMeta: params.imageDebugMeta,
+        registerImageCall: params.registerImageCall,
+        retryCall: params.isRetryGeneration === true || attempt > 0,
+        disablePromptOnlyFallbackForRateLimit: params.disablePromptOnlyFallbackForRateLimit,
+        disable429Retry: params.disable429Retry
+      });
+      const backgroundPng = await normalizePngToShape(backgroundSource.backgroundPng, params.shape, params.focalPoint);
+      const hasText = await imageHasReadableText(backgroundPng, {
+        hardFailTokens: params.hardFailTextTokens
+      });
+      if (!hasText) {
+        return {
+          backgroundPng,
+          prompt,
+          textRetryCount: attempt,
+          textCheckPassed: true,
+          aiTrace: backgroundSource.aiTrace
+        };
+      }
+
+      lastPrompt = prompt;
+      lastBackgroundPng = backgroundPng;
+      lastAiTrace = backgroundSource.aiTrace;
     }
 
-    lastPrompt = prompt;
-    lastBackgroundPng = backgroundPng;
-  }
+    return {
+      backgroundPng: lastBackgroundPng as Buffer,
+      prompt: lastPrompt,
+      textRetryCount: maxTextRetries,
+      textCheckPassed: false,
+      aiTrace: lastAiTrace as GraphicsBackgroundAiAttemptTrace
+    };
+  } catch (error) {
+    try {
+      await finalizeGraphicsBackgroundAiRun({
+        runHandle: params.aiRunHandle,
+        status: "FAILED",
+        error,
+        metadataJson: {
+          promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
+          generationId: params.generationId,
+          lastAttemptId: lastAiTrace?.attemptId || null,
+          lastProviderKey: lastAiTrace?.providerKey || null,
+          lastModelKey: lastAiTrace?.modelKey || null
+        }
+      });
+    } catch (finalizeError) {
+      const finalizeMessage = finalizeError instanceof Error ? finalizeError.message : "Unknown ai harness failure finalization error";
+      console.warn(`[ai-harness-run] generation=${params.generationId} status=failed error=${finalizeMessage}`);
+    }
 
-  return {
-    backgroundPng: lastBackgroundPng as Buffer,
-    prompt: lastPrompt,
-    textRetryCount: maxTextRetries,
-    textCheckPassed: false
-  };
+    throw error;
+  }
 }
 
 function findClosestReferenceDistance(hash: string, references: ReferenceLibraryItem[]): number {
@@ -8317,6 +8588,13 @@ async function readPersistedGenerationOptionStatus(generationId: string): Promis
   return row ? resolvePersistedGenerationOptionStatusFromRow(row) : "FAILED_GENERATION";
 }
 
+function readClaimableGenerationOutput(
+  output: Prisma.JsonValue | null,
+  fallbackOutput: GenerationOutputPayload
+): GenerationOutputPayload {
+  return output && typeof output === "object" && !Array.isArray(output) ? (output as GenerationOutputPayload) : fallbackOutput;
+}
+
 async function claimPlannedGenerationAttempts(params: {
   plannedGenerations: PlannedGeneration[];
   mode: "initial" | "retry";
@@ -8324,95 +8602,94 @@ async function claimPlannedGenerationAttempts(params: {
   if (params.plannedGenerations.length === 0) {
     return [];
   }
+  void params.mode;
 
-  const persistedRows = await prisma.generation.findMany({
-    where: {
-      id: {
-        in: params.plannedGenerations.map((generation) => generation.id)
-      }
-    },
-    select: {
-      id: true,
-      status: true,
-      output: true,
-      updatedAt: true
-    }
-  });
-  const rowById = new Map(persistedRows.map((row) => [row.id, row] as const));
-  const claimed: ClaimedPlannedGeneration[] = [];
-
-  for (const plannedGeneration of params.plannedGenerations) {
-    const persistedRow = rowById.get(plannedGeneration.id);
-    if (!persistedRow) {
-      continue;
-    }
-
-    const attemptOwnerBase = {
-      token: randomUUID(),
-      attemptNumber: resolveNextGenerationAttemptNumber(persistedRow.output)
-    };
-    const updateResult =
-      params.mode === "initial"
-        ? await prisma.generation.updateMany({
-            where: {
-              id: persistedRow.id,
-              updatedAt: persistedRow.updatedAt
-            },
-            data: {
-              status: "RUNNING"
-            }
-          })
-        : await prisma.generation.updateMany({
-            where: {
-              id: persistedRow.id,
-              updatedAt: persistedRow.updatedAt
-            },
-            data: {
-              output: withGenerationExecutionStateOutput(
-                persistedRow.output && typeof persistedRow.output === "object" && !Array.isArray(persistedRow.output)
-                  ? (persistedRow.output as GenerationOutputPayload)
-                  : plannedGeneration.fallbackOutput,
-                {
-                  version: 1,
-                  phase: "RUNNING",
-                  activeAttemptToken: attemptOwnerBase.token,
-                  activeAttemptNumber: attemptOwnerBase.attemptNumber
-                }
-              ) as Prisma.InputJsonValue
-            }
-          });
-
-    if (updateResult.count !== 1) {
-      continue;
-    }
-
-    const claimedRow = await prisma.generation.findUnique({
+  return prisma.$transaction(async (tx) => {
+    const persistedRows = await tx.generation.findMany({
       where: {
-        id: persistedRow.id
+        id: {
+          in: params.plannedGenerations.map((generation) => generation.id)
+        }
       },
       select: {
+        id: true,
+        status: true,
+        output: true,
         updatedAt: true
       }
     });
+    const rowById = new Map(persistedRows.map((row) => [row.id, row] as const));
+    const claimed: ClaimedPlannedGeneration[] = [];
 
-    if (!claimedRow) {
-      continue;
+    for (const plannedGeneration of params.plannedGenerations) {
+      const persistedRow = rowById.get(plannedGeneration.id);
+      if (!persistedRow) {
+        throw new Error(`Generation ${plannedGeneration.id} could not be loaded for claim.`);
+      }
+
+      const attemptOwnerBase = {
+        token: randomUUID(),
+        attemptNumber: resolveNextGenerationAttemptNumber(persistedRow.output)
+      };
+      const claimedOutput = withClaimedGenerationActiveOutput(
+        readClaimableGenerationOutput(persistedRow.output, plannedGeneration.fallbackOutput),
+        attemptOwnerBase
+      );
+      const updateResult = await tx.generation.updateMany({
+        where: {
+          id: persistedRow.id,
+          updatedAt: persistedRow.updatedAt
+        },
+        data: {
+          status: "RUNNING",
+          output: claimedOutput as Prisma.InputJsonValue
+        }
+      });
+
+      if (updateResult.count !== 1) {
+        throw new Error(`Generation ${plannedGeneration.id} could not be claimed for active execution.`);
+      }
+
+      const claimedRow = await tx.generation.findUnique({
+        where: {
+          id: persistedRow.id
+        },
+        select: {
+          updatedAt: true
+        }
+      });
+
+      if (!claimedRow) {
+        throw new Error(`Generation ${plannedGeneration.id} disappeared after claim.`);
+      }
+
+      claimed.push({
+        ...plannedGeneration,
+        attemptOwner: {
+          ...attemptOwnerBase,
+          ownerUpdatedAt: claimedRow.updatedAt
+        }
+      });
     }
 
-    claimed.push({
-      ...plannedGeneration,
-      attemptOwner: {
-        ...attemptOwnerBase,
-        ownerUpdatedAt: claimedRow.updatedAt
-      }
-    });
-  }
+    return claimed;
+  });
+}
 
-  if (claimed.length !== params.plannedGenerations.length) {
-    throw new Error("Failed to claim one or more generation attempts for settlement.");
-  }
+function isTerminalGenerationDbStatus(status: string | null | undefined): status is "COMPLETED" | "FAILED" {
+  return status === "COMPLETED" || status === "FAILED";
+}
 
-  return claimed;
+function isGenerationAttemptOwnedBy(
+  output: unknown,
+  attemptOwner: Pick<GenerationAttemptOwner, "token" | "attemptNumber">
+): boolean {
+  const execution = readPersistedGenerationExecutionState(output);
+  return (
+    execution?.phase === "RUNNING" &&
+    execution.activeAttemptToken === attemptOwner.token &&
+    execution.activeAttemptNumber === attemptOwner.attemptNumber
+  );
 }
 
 async function persistGenerationSettlement(params: {
@@ -8433,18 +8710,34 @@ async function persistGenerationSettlement(params: {
     : params.output;
 
   return prisma.$transaction(async (tx) => {
+    const currentRow = await tx.generation.findUnique({
+      where: {
+        id: params.generationId
+      },
+      select: {
+        status: true,
+        output: true,
+        updatedAt: true
+      }
+    });
+
+    if (!currentRow) {
+      return false;
+    }
+
+    if (params.attemptOwner) {
+      if (!isGenerationAttemptOwnedBy(currentRow.output, params.attemptOwner)) {
+        return false;
+      }
+    } else if (currentRow.status === "COMPLETED") {
+      return false;
+    }
+
     const updateResult = await tx.generation.updateMany({
-      where: params.attemptOwner
-        ? {
-            id: params.generationId,
-            updatedAt: params.attemptOwner.ownerUpdatedAt
-          }
-        : {
-            id: params.generationId,
-            status: {
-              not: "COMPLETED"
-            }
-          },
+      where: {
+        id: params.generationId,
+        updatedAt: currentRow.updatedAt
+      },
       data: {
         status: params.status,
         output: persistedOutput as Prisma.InputJsonValue,
@@ -8466,6 +8759,147 @@ async function persistGenerationSettlement(params: {
 
     return true;
   });
+}
+
+async function persistMinimalFailedGenerationSettlement(params: {
+  generationId: string;
+  output: GenerationOutputPayload;
+  failureReason: BackgroundAttemptFailureReason;
+  providerPreflight?: ImageProviderPreflightResult | null;
+  attemptOwner?: GenerationAttemptOwner | null;
+  input?: Prisma.InputJsonValue;
+  notes: string;
+  warningMessages?: Array<string | null | undefined>;
+}): Promise<boolean> {
+  const existingDebug = params.output.meta.debug;
+  const warnings = (params.warningMessages || []).reduce<string[] | undefined>(
+    (current, warningMessage) => appendUniqueDebugWarning(current, warningMessage || null),
+    existingDebug?.warnings
+  );
+  const failedOutput: GenerationOutputPayload = {
+    ...params.output,
+    status: "FAILED_GENERATION",
+    notes: params.notes,
+    meta: {
+      ...params.output.meta,
+      debug: mergeGenerationDebugMeta(existingDebug, {
+        backgroundSource: existingDebug?.backgroundSource || "fallback",
+        lockupSource: existingDebug?.lockupSource || "fallback",
+        generationLifecycleState: resolveGenerationLifecycleStateForFailure(params.failureReason),
+        backgroundFailureReason: params.failureReason,
+        backgroundRecoveryAttempted: existingDebug?.backgroundRecoveryAttempted === true,
+        backgroundRecoveryAttempts:
+          typeof existingDebug?.backgroundRecoveryAttempts === "number" && Number.isFinite(existingDebug.backgroundRecoveryAttempts)
+            ? existingDebug.backgroundRecoveryAttempts
+            : 0,
+        backgroundRecoveryReasons: existingDebug?.backgroundRecoveryReasons || [],
+        backgroundRecoverySucceeded: existingDebug?.backgroundRecoverySucceeded === true,
+        backgroundRecoveryFinalReasons: existingDebug?.backgroundRecoveryFinalReasons || [],
+        imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
+        aspectAssets: existingDebug?.aspectAssets || {
+          widescreen: "missing",
+          square: "missing",
+          vertical: "missing"
+        },
+        warnings
+      })
+    }
+  };
+  const failedValidation = resolveProductionValidOption({
+    output: failedOutput,
+    dbStatus: "FAILED"
+  });
+  const persistedFailedOutput: GenerationOutputPayload = {
+    ...failedOutput,
+    meta: {
+      ...failedOutput.meta,
+      productionValidation: toPersistedProductionValidationSnapshot(failedValidation)
+    }
+  };
+
+  return persistGenerationSettlement({
+    generationId: params.generationId,
+    status: "FAILED",
+    output: persistedFailedOutput,
+    input: params.input,
+    attemptOwner: params.attemptOwner,
+    applyAssetChanges: async (tx) => {
+      await tx.asset.deleteMany({
+        where: {
+          generationId: params.generationId,
+          slot: {
+            in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+          }
+        }
+      });
+    }
+  });
+}
+
+async function ensureClaimedGenerationTerminalResult(params: {
+  generationId: string;
+  fallbackOutput: GenerationOutputPayload;
+  providerPreflight?: ImageProviderPreflightResult | null;
+  attemptOwner: GenerationAttemptOwner;
+  failureReason: BackgroundAttemptFailureReason;
+  input?: Prisma.InputJsonValue;
+  provisionalResult?: PlannedGenerationRunResult | null;
+  failSafeMessage: string;
+}): Promise<PlannedGenerationRunResult> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const persistedRows = await loadPersistedGenerationTruthRows([params.generationId]);
+    const row = persistedRows.get(params.generationId);
+    if (!row) {
+      break;
+    }
+
+    const optionStatus = resolvePersistedGenerationOptionStatusFromRow(row);
+    if (isTerminalGenerationDbStatus(row.status) && optionStatus !== "IN_PROGRESS") {
+      return {
+        generationId: params.generationId,
+        optionStatus,
+        failureReason: optionStatus === "COMPLETED" ? null : params.failureReason
+      };
+    }
+
+    if (!isGenerationAttemptOwnedBy(row.output, params.attemptOwner)) {
+      return {
+        generationId: params.generationId,
+        optionStatus,
+        failureReason: optionStatus === "COMPLETED" ? null : params.failureReason
+      };
+    }
+
+    const persisted = await persistMinimalFailedGenerationSettlement({
+      generationId: params.generationId,
+      output: readClaimableGenerationOutput(row.output, params.fallbackOutput),
+      failureReason: params.failureReason,
+      providerPreflight: params.providerPreflight,
+      attemptOwner: params.attemptOwner,
+      input: params.input,
+      notes: "terminal_settlement_fail_safe",
+      warningMessages: [params.failSafeMessage]
+    });
+
+    if (persisted) {
+      const settledStatus = await readPersistedGenerationOptionStatus(params.generationId);
+      return {
+        generationId: params.generationId,
+        optionStatus: settledStatus,
+        failureReason: settledStatus === "COMPLETED" ? null : params.failureReason
+      };
+    }
+  }
+
+  if (params.provisionalResult) {
+    return params.provisionalResult;
+  }
+
+  return {
+    generationId: params.generationId,
+    optionStatus: await readPersistedGenerationOptionStatus(params.generationId),
+    failureReason: params.failureReason
+  };
 }
 
 async function completeGenerationWithFallbackOutput(params: {
@@ -8520,6 +8954,15 @@ async function completeGenerationWithFallbackOutput(params: {
     backgroundSource: "fallback",
     lockupSource: "fallback",
     generationLifecycleState: resolveGenerationLifecycleStateForFailure(params.failureReason || null),
+    backgroundRecoveryAttempted: outputWithStatus.meta.debug?.backgroundRecoveryAttempted === true,
+    backgroundRecoveryAttempts:
+      typeof outputWithStatus.meta.debug?.backgroundRecoveryAttempts === "number" &&
+      Number.isFinite(outputWithStatus.meta.debug.backgroundRecoveryAttempts)
+        ? outputWithStatus.meta.debug.backgroundRecoveryAttempts
+        : 0,
+    backgroundRecoveryReasons: outputWithStatus.meta.debug?.backgroundRecoveryReasons || [],
+    backgroundRecoverySucceeded: outputWithStatus.meta.debug?.backgroundRecoverySucceeded === true,
+    backgroundRecoveryFinalReasons: outputWithStatus.meta.debug?.backgroundRecoveryFinalReasons || [],
     aspectAssets: {
       widescreen: "placeholder",
       square: "placeholder",
@@ -8825,78 +9268,84 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
   motifBankContext?: MotifBankContext;
 }): Promise<PlannedGenerationRunResult[]> {
   const openAiEnabled = isOpenAiPreviewGenerationEnabled() && Boolean(process.env.OPENAI_API_KEY?.trim());
-  const imageGenerationLimit = createConcurrencyLimiter(ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY);
-  const optionGenerationLimit = createConcurrencyLimiter(
-    Math.min(ROUND1_OPTION_PARALLEL_CONCURRENCY, Math.max(1, params.plannedGenerations.length))
-  );
-  const [referenceIndex, curatedReferences] = await Promise.all([loadIndex(), getCuratedReferences()]);
-  const referenceIndexById = new Map(referenceIndex.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
-  const curatedReferenceById = new Map(curatedReferences.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
-  const reusableAssetsByGenerationId = new Map<string, ReusableGenerationAssets | null>();
-  const initialGenerationInput = params.plannedGenerations[0]?.input;
-  const seriesPreferenceNotes = readSeriesPreferencesDesignNotesFromInput(initialGenerationInput);
-  const motifBankContext =
-    params.motifBankContext ||
-    getMotifBankContext({
-      title: params.project.series_title,
-      subtitle: params.project.series_subtitle,
-      scripturePassages: params.project.scripture_passages,
-      description: params.project.series_description,
-      designNotes: params.project.designNotes || seriesPreferenceNotes || null
-    });
-  const bibleCreativeBrief =
-    params.bibleCreativeBrief ||
-    (await extractBibleCreativeBrief({
-      title: params.project.series_title,
-      subtitle: params.project.series_subtitle,
-      scripturePassages: params.project.scripture_passages,
-      description: params.project.series_description,
-      designNotes: params.project.designNotes || seriesPreferenceNotes || null,
-      motifBankContext
-    }));
-  const orgAllowedBrandPalette =
-    params.project.brandMode === "brand" ? parseAllowedPaletteFromOrgBrandKit(params.project.brandKit) : [];
-  const brandPaletteHardConstraintPrompt =
-    params.project.brandMode === "brand" ? buildBrandPaletteHardConstraintPrompt(orgAllowedBrandPalette) : "";
-  const brandPaletteComplianceHexes =
-    params.project.brandMode === "brand" && orgAllowedBrandPalette.length > 0
-      ? [...new Set([...orgAllowedBrandPalette, ...BRAND_NEUTRAL_HEXES])]
-      : [];
-  const organizationTypographyDirection =
-    params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
-      ? params.project.brandKit.typographyDirection
-      : null;
-  const round1SelectedVariationTemplateUsage = new Map<string, number>();
-  let round1SelectedDefaultBiasCount = 0;
-  const layoutDiversityPenaltyForTemplate = (round: number, templateKey: string | null): number => {
-    if (round !== 1 || !templateKey) {
-      return 0;
-    }
-    const repeatCount = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
-    let penalty = repeatCount * ROUND1_LAYOUT_TEMPLATE_REPEAT_PENALTY;
-    if (isRound1DefaultBiasTemplateKey(templateKey) && round1SelectedDefaultBiasCount > 0) {
-      penalty += round1SelectedDefaultBiasCount * ROUND1_LAYOUT_DEFAULT_BIAS_REPEAT_PENALTY;
-    }
-    return penalty;
-  };
-  const noteRound1SelectedTemplate = (round: number, templateKey: string | null) => {
-    if (round !== 1 || !templateKey) {
-      return;
-    }
-    const current = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
-    round1SelectedVariationTemplateUsage.set(templateKey, current + 1);
-    if (isRound1DefaultBiasTemplateKey(templateKey)) {
-      round1SelectedDefaultBiasCount += 1;
-    }
-  };
-  let round1ImageCallsConsumed = 0;
+  try {
+    const imageGenerationLimit = createConcurrencyLimiter(ROUND1_IMAGE_GENERATION_MAX_CONCURRENCY);
+    const optionGenerationLimit = createConcurrencyLimiter(
+      Math.min(ROUND1_OPTION_PARALLEL_CONCURRENCY, Math.max(1, params.plannedGenerations.length))
+    );
+    const [referenceIndex, curatedReferences] = await Promise.all([loadIndex(), getCuratedReferences()]);
+    const referenceIndexById = new Map(referenceIndex.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
+    const curatedReferenceById = new Map(curatedReferences.map((reference) => [normalizeReferenceId(reference.id), reference] as const));
+    const reusableAssetsByGenerationId = new Map<string, ReusableGenerationAssets | null>();
+    const initialGenerationInput = params.plannedGenerations[0]?.input;
+    const seriesPreferenceNotes = readSeriesPreferencesDesignNotesFromInput(initialGenerationInput);
+    const motifBankContext =
+      params.motifBankContext ||
+      getMotifBankContext({
+        title: params.project.series_title,
+        subtitle: params.project.series_subtitle,
+        scripturePassages: params.project.scripture_passages,
+        description: params.project.series_description,
+        designNotes: params.project.designNotes || seriesPreferenceNotes || null
+      });
+    const bibleCreativeBrief =
+      params.bibleCreativeBrief ||
+      (await extractBibleCreativeBrief({
+        title: params.project.series_title,
+        subtitle: params.project.series_subtitle,
+        scripturePassages: params.project.scripture_passages,
+        description: params.project.series_description,
+        designNotes: params.project.designNotes || seriesPreferenceNotes || null,
+        motifBankContext
+      }));
+    const orgAllowedBrandPalette =
+      params.project.brandMode === "brand" ? parseAllowedPaletteFromOrgBrandKit(params.project.brandKit) : [];
+    const brandPaletteHardConstraintPrompt =
+      params.project.brandMode === "brand" ? buildBrandPaletteHardConstraintPrompt(orgAllowedBrandPalette) : "";
+    const brandPaletteComplianceHexes =
+      params.project.brandMode === "brand" && orgAllowedBrandPalette.length > 0
+        ? [...new Set([...orgAllowedBrandPalette, ...BRAND_NEUTRAL_HEXES])]
+        : [];
+    const organizationTypographyDirection =
+      params.project.brandMode === "brand" && params.project.brandKit?.source === "organization"
+        ? params.project.brandKit.typographyDirection
+        : null;
+    const round1SelectedVariationTemplateUsage = new Map<string, number>();
+    let round1SelectedDefaultBiasCount = 0;
+    const layoutDiversityPenaltyForTemplate = (round: number, templateKey: string | null): number => {
+      if (round !== 1 || !templateKey) {
+        return 0;
+      }
+      const repeatCount = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
+      let penalty = repeatCount * ROUND1_LAYOUT_TEMPLATE_REPEAT_PENALTY;
+      if (isRound1DefaultBiasTemplateKey(templateKey) && round1SelectedDefaultBiasCount > 0) {
+        penalty += round1SelectedDefaultBiasCount * ROUND1_LAYOUT_DEFAULT_BIAS_REPEAT_PENALTY;
+      }
+      return penalty;
+    };
+    const noteRound1SelectedTemplate = (round: number, templateKey: string | null) => {
+      if (round !== 1 || !templateKey) {
+        return;
+      }
+      const current = round1SelectedVariationTemplateUsage.get(templateKey) || 0;
+      round1SelectedVariationTemplateUsage.set(templateKey, current + 1);
+      if (isRound1DefaultBiasTemplateKey(templateKey)) {
+        round1SelectedDefaultBiasCount += 1;
+      }
+    };
+    let round1ImageCallsConsumed = 0;
 
-  const optionResults: PlannedGenerationRunResult[] = await Promise.all(
+    const optionResults: PlannedGenerationRunResult[] = await Promise.all(
     params.plannedGenerations.map((plannedGeneration) => optionGenerationLimit(async (): Promise<PlannedGenerationRunResult> => {
       let fallbackOutput = plannedGeneration.fallbackOutput;
       let imageCallCapReached = false;
+      let provisionalResult: PlannedGenerationRunResult | null = null;
+      let failSafeReason: BackgroundAttemptFailureReason = "UNKNOWN";
+      let failSafeMessage = "Generation branch ended without terminal settlement.";
+      let failSafeInput: Prisma.InputJsonValue | undefined;
 
       if (!openAiEnabled) {
+        failSafeReason = "PROVIDER_AUTH_OR_CONFIG_ERROR";
         const optionStatus = await completeGenerationWithFallbackOutput({
           projectId: params.project.id,
           generationId: plannedGeneration.id,
@@ -8905,14 +9354,17 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           providerPreflight: params.providerPreflight,
           attemptOwner: plannedGeneration.attemptOwner
         });
-        return {
+        provisionalResult = {
           generationId: plannedGeneration.id,
           optionStatus,
           failureReason: "PROVIDER_AUTH_OR_CONFIG_ERROR"
         };
-      }
-
+      } else {
       try {
+      let executionTimeoutId: ReturnType<typeof setTimeout> | null = null;
+      try {
+      await Promise.race([
+      (async (): Promise<void> => {
       const palette = params.project.brandKit ? parsePaletteJson(params.project.brandKit.paletteJson) : [];
       const feedbackControls = readFeedbackGenerationControls(plannedGeneration.input);
       const seriesPreferenceGuidance = buildSeriesPreferenceGuidance(params.project);
@@ -9232,9 +9684,25 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundTextCheck: null as BackgroundTextCheckSummary | null,
             textCheckPassed: !hasText,
             textScrubDebug: null as TextScrubDebug | null,
-            variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
+            variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null,
+            aiTrace: null as GraphicsBackgroundAiAttemptTrace | null
           };
         }
+        const backgroundAiRunHandle = await createGraphicsBackgroundAiRun({
+          projectId: params.project.id,
+          generationId: plannedGeneration.id,
+          round: plannedGeneration.round,
+          laneKey: optionLane(plannedGeneration.optionIndex),
+          metadataJson: buildGraphicsBackgroundRunMetadata({
+            presetKey: plannedGeneration.presetKey,
+            optionIndex: plannedGeneration.optionIndex,
+            referenceCount: referenceDataUrls.length,
+            candidateSuffix: attemptParams.candidateSuffix || null,
+            variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null,
+            stageHint: shouldRunExplorationToneCheck ? "exploration" : "production"
+          })
+        });
+        try {
         const toneTargetForCompliance = shouldRunExplorationToneCheck
           ? resolveToneTargetFromDirectionSpec(activeDirectionSpec)
           : null;
@@ -9250,6 +9718,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           explorationMode: shouldRunExplorationToneCheck,
           seriesPreferenceGuidance,
           bibleCreativeBrief,
+          aiRunHandle: backgroundAiRunHandle,
+          promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
           referenceDataUrls,
           hardFailTextTokens,
           focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
@@ -9310,6 +9780,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
+                aiRunHandle: backgroundAiRunHandle,
+                promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
                 referenceDataUrls,
                 hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
@@ -9374,6 +9846,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
+                aiRunHandle: backgroundAiRunHandle,
+                promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
                 referenceDataUrls,
                 hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
@@ -9440,6 +9914,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 explorationMode: shouldRunExplorationToneCheck,
                 seriesPreferenceGuidance,
                 bibleCreativeBrief,
+                aiRunHandle: backgroundAiRunHandle,
+                promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
                 referenceDataUrls,
                 hardFailTextTokens,
                 focalPoint: resolveRecipeFocalPoint(lockupRecipeForRender, OPTION_MASTER_BACKGROUND_SHAPE),
@@ -9485,6 +9961,30 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const backgroundPng = validatedBackground.backgroundPng;
         const hash = await computeDHashFromBuffer(backgroundPng);
         const closestDistance = findClosestReferenceDistance(hash, references);
+        try {
+          await finalizeGraphicsBackgroundAiRun({
+            runHandle: backgroundAiRunHandle,
+            status: "COMPLETED",
+            providerConfigVersion: validatedBackground.aiTrace.providerConfigVersion,
+            metadataJson: {
+              promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
+              generationSeedPrefix,
+              selectedAttemptId: validatedBackground.aiTrace.attemptId,
+              selectedProviderKey: validatedBackground.aiTrace.providerKey,
+              selectedModelKey: validatedBackground.aiTrace.modelKey,
+              selectedProviderModel: validatedBackground.aiTrace.providerModel,
+              textRetryCount: validatedBackground.textRetryCount,
+              paletteRetryCount,
+              toneRetryCount,
+              textArtifactRetryCount,
+              textCheckPassed: validatedBackground.textCheckPassed,
+              variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
+            }
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown ai harness run finalization error";
+          console.warn(`[ai-harness-run] generation=${plannedGeneration.id} status=completed error=${message}`);
+        }
 
         return {
           prompt: validatedBackground.prompt,
@@ -9499,12 +9999,31 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           backgroundTextCheck,
           textCheckPassed: validatedBackground.textCheckPassed,
           textScrubDebug: null as TextScrubDebug | null,
-          variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
+          variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null,
+          aiTrace: validatedBackground.aiTrace
         };
+        } catch (error) {
+          try {
+            await finalizeGraphicsBackgroundAiRun({
+              runHandle: backgroundAiRunHandle,
+              status: "FAILED",
+              error,
+              metadataJson: {
+                promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
+                generationSeedPrefix: `${runSeed}|${plannedGeneration.optionIndex}${attemptParams.candidateSuffix || ""}`,
+                variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
+              }
+            });
+          } catch (finalizeError) {
+            const message = finalizeError instanceof Error ? finalizeError.message : "Unknown ai harness run failure finalization error";
+            console.warn(`[ai-harness-run] generation=${plannedGeneration.id} status=failed error=${message}`);
+          }
+          throw error;
+        }
       };
 
       const runBackgroundRerankAttempt = async (params: {
-        stage: "primary" | "fallback_family" | "fallback_set" | "text_retry";
+        stage: "primary" | "fallback_family" | "fallback_set" | "text_retry" | "background_recovery";
         attemptNumber: number;
         directionSpecOverride?: PlannedDirectionSpec | null;
         originalityBoost?: string;
@@ -9518,6 +10037,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             attempt,
             winnerIndex: 0,
             bestScore: Number.POSITIVE_INFINITY,
+            bestInvalidReasons: [] as string[],
             laneFailed: false,
             hardFailReadableText: false,
             eligiblePoolEmpty: false,
@@ -9563,9 +10083,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           referenceAnchorDebug?.visualAnchorSrc ||
           anchorVisualAnchorSrc ||
           null;
+        const candidateCountForAttempt =
+          params.stage === "background_recovery"
+            ? Math.max(1, Math.min(backgroundCandidateCount, ROUND1_BACKGROUND_RECOVERY_CANDIDATE_COUNT))
+            : backgroundCandidateCount;
         const candidateTemplateKeys = buildBackgroundCandidateTemplateKeys({
           seed: `${runSeed}|${plannedGeneration.optionIndex}|${candidateTag}|attempt-${params.attemptNumber}`,
-          count: backgroundCandidateCount,
+          count: candidateCountForAttempt,
           directionSpec: activeDirectionSpec
         });
         const candidates = [] as Array<{
@@ -9631,7 +10155,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             evaluation
           };
         };
-        for (let candidateIndex = 0; candidateIndex < backgroundCandidateCount; candidateIndex += 1) {
+        for (let candidateIndex = 0; candidateIndex < candidateCountForAttempt; candidateIndex += 1) {
           const candidateVariationTemplateKey =
             candidateTemplateKeys[candidateIndex] || activeDirectionSpec?.variationTemplateKey || null;
           const candidateDirectionSpec = withVariationTemplateKey(activeDirectionSpec, candidateVariationTemplateKey);
@@ -9769,11 +10293,23 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           winnerIndex: winner ? winner.index : null,
           failureReason
         };
+        await persistBackgroundEvaluationIfAvailable({
+          attempt: winner?.candidate.attempt || bestCandidate.candidate.attempt,
+          evaluation: winner?.candidate.evaluation || bestCandidate.candidate.evaluation,
+          generationId: plannedGeneration.id,
+          optionIndex: plannedGeneration.optionIndex,
+          stage: params.stage,
+          attemptNumber: params.attemptNumber,
+          directionSpec: winner ? winner.candidate.directionSpecUsed : bestCandidate.candidate.directionSpecUsed
+        });
 
         return {
           attempt: winner?.candidate.attempt || bestCandidate.candidate.attempt,
           winnerIndex: winner ? winner.index : null,
           bestScore,
+          bestInvalidReasons: winner
+            ? winner.candidate.evaluation.acceptance.invalidReasons
+            : bestCandidate.candidate.evaluation.acceptance.invalidReasons,
           laneFailed,
           hardFailReadableText,
           eligiblePoolEmpty,
@@ -9830,8 +10366,46 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       };
 
       const selectBackgroundWinner = async (originalityBoost?: string) => {
+        const buildSingleAttemptDebug = (params: {
+          attemptIndex: number;
+          directionSpec: PlannedDirectionSpec | null;
+          evaluation: BackgroundAttemptEvaluation;
+          visualAnchorSrc: string | null;
+        }): BackgroundAttemptDebug => ({
+          attemptIndex: params.attemptIndex,
+          styleFamily: resolveDirectionStyleFields(params.directionSpec).styleFamily,
+          anchorUsed: {
+            visualAnchorSrc: params.visualAnchorSrc
+          },
+          candidates: [
+            {
+              url: "",
+              checks: {
+                textOk: params.evaluation.evidence.textFree === true,
+                scaffoldOk: params.evaluation.evidence.scaffoldFree === true,
+                motifOk: params.evaluation.evidence.motifPresent === true,
+                toneOk: params.evaluation.evidence.toneFit,
+                referenceOk: params.evaluation.evidence.referenceFit
+              },
+              scores: {
+                total: 0,
+                layoutDiversityPenalty: 0,
+                frameScaffoldPenalty: 0,
+                meaningfulStructure: Math.max(0, params.evaluation.stats.hardFail?.meaningfulStructureScore || 0),
+                titleSafe: params.evaluation.stats.titleSafe?.score || 0,
+                midtoneRange: params.evaluation.stats.midtoneRange?.score || 0
+              }
+            }
+          ],
+          winnerIndex: params.evaluation.acceptance.accepted ? 0 : null,
+          failureReason: params.evaluation.acceptance.accepted
+            ? null
+            : buildBackgroundAttemptFailureReason(params.evaluation.acceptance.invalidReasons)
+        });
+
         if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
           const activeDirectionSpec = backgroundDirectionSpec;
+          const toneTarget = resolveToneTargetFromDirectionSpec(activeDirectionSpec);
           const attempt = await renderMasterAttempt({ originalityBoost });
           if (shouldReuseBackground) {
             const reusableValidation =
@@ -9862,6 +10436,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               backgroundAttempts: [] as BackgroundAttemptDebug[],
               backgroundValidation: reusableValidation,
               textScrub: attempt.textScrubDebug || null,
+              backgroundRecovery: createBackgroundRecoveryDebug({
+                finalReasons: acceptance.accepted ? [] : acceptance.invalidReasons
+              }),
               fallbackFailureReason: acceptance.accepted
                 ? (null as BackgroundAttemptFailureReason | null)
                 : buildBackgroundAttemptFailureReason(acceptance.invalidReasons)
@@ -9876,37 +10453,78 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             source: "generated",
             sourceGenerationId: null
           });
-          const attemptDebug: BackgroundAttemptDebug = {
+          const attemptDebug = buildSingleAttemptDebug({
             attemptIndex: 1,
-            styleFamily: resolveDirectionStyleFields(activeDirectionSpec).styleFamily,
-            anchorUsed: {
+            directionSpec: activeDirectionSpec,
+            evaluation: attemptEvaluation,
+            visualAnchorSrc: null
+          });
+          const recoverableReasons = collectRecoverableBackgroundInvalidReasons(attemptEvaluation.acceptance.invalidReasons);
+          if (!attemptEvaluation.acceptance.accepted && recoverableReasons.length > 0) {
+            const recoveryBoost = buildBackgroundRecoveryBoost({
+              invalidReasons: recoverableReasons,
+              toneTarget
+            });
+            const recoveryOriginalityBoost = [originalityBoost, recoveryBoost].filter(Boolean).join(" ").trim() || undefined;
+            const recoveryAttempt = await renderMasterAttempt({
+              directionSpecOverride: activeDirectionSpec,
+              originalityBoost: recoveryOriginalityBoost,
+              candidateSuffix: "|background-recovery"
+            });
+            const recoveryEvaluation = await evaluateBackgroundAttempt({
+              attempt: recoveryAttempt,
+              titleSafeBox: titleSafeBoxForDirection(activeDirectionSpec),
+              toneTarget,
+              referenceCluster: activeDirectionSpec?.referenceCluster || null,
+              source: "generated",
+              sourceGenerationId: null
+            });
+            const recoveryAttemptDebug = buildSingleAttemptDebug({
+              attemptIndex: 2,
+              directionSpec: activeDirectionSpec,
+              evaluation: recoveryEvaluation,
               visualAnchorSrc: null
-            },
-            candidates: [
-              {
-                url: "",
-                checks: {
-                  textOk: attemptEvaluation.evidence.textFree === true,
-                  scaffoldOk: attemptEvaluation.evidence.scaffoldFree === true,
-                  motifOk: attemptEvaluation.evidence.motifPresent === true,
-                  toneOk: attemptEvaluation.evidence.toneFit,
-                  referenceOk: attemptEvaluation.evidence.referenceFit
-                },
-                scores: {
-                  total: 0,
-                  layoutDiversityPenalty: 0,
-                  frameScaffoldPenalty: 0,
-                  meaningfulStructure: Math.max(0, attemptEvaluation.stats.hardFail?.meaningfulStructureScore || 0),
-                  titleSafe: attemptEvaluation.stats.titleSafe?.score || 0,
-                  midtoneRange: attemptEvaluation.stats.midtoneRange?.score || 0
-                }
-              }
-            ],
-            winnerIndex: attemptEvaluation.acceptance.accepted ? 0 : null,
-            failureReason: attemptEvaluation.acceptance.accepted
-              ? null
-              : buildBackgroundAttemptFailureReason(attemptEvaluation.acceptance.invalidReasons)
-          };
+            });
+            const recoveryAccepted = recoveryEvaluation.acceptance.accepted;
+            await persistBackgroundEvaluationIfAvailable({
+              attempt: recoveryAttempt,
+              evaluation: recoveryEvaluation,
+              generationId: plannedGeneration.id,
+              optionIndex: plannedGeneration.optionIndex,
+              stage: "background_recovery",
+              attemptNumber: 2,
+              directionSpec: activeDirectionSpec
+            });
+            return {
+              attempt: recoveryAccepted ? recoveryAttempt : null,
+              winnerIndex: recoveryAccepted ? 0 : null,
+              laneFailed: !recoveryAccepted,
+              eligiblePoolEmpty: !recoveryAccepted,
+              winnerDirectionSpec: activeDirectionSpec,
+              backgroundAttempts: [attemptDebug, recoveryAttemptDebug],
+              backgroundValidation: recoveryEvaluation.evidence,
+              textScrub: recoveryAttempt.textScrubDebug || attempt.textScrubDebug || null,
+              backgroundRecovery: createBackgroundRecoveryDebug({
+                attempted: true,
+                attempts: 1,
+                reasons: recoverableReasons,
+                succeeded: recoveryAccepted,
+                finalReasons: recoveryAccepted ? [] : recoveryEvaluation.acceptance.invalidReasons
+              }),
+              fallbackFailureReason: recoveryAccepted
+                ? (null as BackgroundAttemptFailureReason | null)
+                : buildBackgroundAttemptFailureReason(recoveryEvaluation.acceptance.invalidReasons)
+            };
+          }
+          await persistBackgroundEvaluationIfAvailable({
+            attempt,
+            evaluation: attemptEvaluation,
+            generationId: plannedGeneration.id,
+            optionIndex: plannedGeneration.optionIndex,
+            stage: "primary",
+            attemptNumber: 1,
+            directionSpec: activeDirectionSpec
+          });
           return {
             attempt: attemptEvaluation.acceptance.accepted ? attempt : null,
             winnerIndex: attemptEvaluation.acceptance.accepted ? 0 : null,
@@ -9916,6 +10534,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundAttempts: [attemptDebug],
             backgroundValidation: attemptEvaluation.evidence,
             textScrub: attempt.textScrubDebug || null,
+            backgroundRecovery: createBackgroundRecoveryDebug({
+              finalReasons: attemptEvaluation.acceptance.accepted ? [] : attemptEvaluation.acceptance.invalidReasons
+            }),
             fallbackFailureReason: attemptEvaluation.acceptance.accepted
               ? (null as BackgroundAttemptFailureReason | null)
               : buildBackgroundAttemptFailureReason(attemptEvaluation.acceptance.invalidReasons)
@@ -9931,6 +10552,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         const backgroundAttempts: BackgroundAttemptDebug[] = [];
         let globalWinnerIndex = 0;
         let winner: BackgroundRerankWinnerDebug | null = null;
+        let backgroundRecovery = createBackgroundRecoveryDebug();
 
         const buildApiErrorAttemptDebug = (params: {
           attemptIndex: number;
@@ -10018,6 +10640,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundAttempts,
             backgroundValidation: null as ProductionBackgroundValidationEvidence | null,
             textScrub: null as TextScrubDebug | null,
+            backgroundRecovery,
             fallbackFailureReason: backgroundAttempts[backgroundAttempts.length - 1]?.failureReason || "UNKNOWN"
           };
         }
@@ -10060,6 +10683,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               backgroundAttempts,
               backgroundValidation: latestSelection?.backgroundValidation || null,
               textScrub: latestSelection?.textScrub || null,
+              backgroundRecovery: createBackgroundRecoveryDebug({
+                finalReasons: latestSelection?.bestInvalidReasons || []
+              }),
               fallbackFailureReason: backgroundAttempts[backgroundAttempts.length - 1]?.failureReason || "UNKNOWN"
             };
           }
@@ -10069,7 +10695,98 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
         }
 
+        if (
+          !bestEligibleSelection &&
+          backgroundRecovery.attempts < ROUND1_BACKGROUND_RECOVERY_MAX_ATTEMPTS
+        ) {
+          const recoveryReasons = collectRecoverableBackgroundInvalidReasons(latestSelection.bestInvalidReasons);
+          if (recoveryReasons.length > 0) {
+            fallback.attempts += 1;
+            const recoveryBoost = buildBackgroundRecoveryBoost({
+              invalidReasons: recoveryReasons,
+              toneTarget: resolveToneTargetFromDirectionSpec(activeDirectionSpec)
+            });
+            const recoveryOriginalityBoost = [originalityBoost, recoveryBoost].filter(Boolean).join(" ").trim() || undefined;
+            try {
+              latestSelection = await runBackgroundRerankAttempt({
+                stage: "background_recovery",
+                attemptNumber: fallback.attempts,
+                directionSpecOverride: activeDirectionSpec,
+                originalityBoost: recoveryOriginalityBoost
+              });
+              appendAttempt(latestSelection);
+              if (latestSelection.winner) {
+                bestEligibleSelection = latestSelection;
+              }
+              activeDirectionSpec = latestSelection.winnerDirectionSpec || activeDirectionSpec;
+              backgroundRecovery = createBackgroundRecoveryDebug({
+                attempted: true,
+                attempts: 1,
+                reasons: recoveryReasons,
+                succeeded: Boolean(latestSelection.winner),
+                finalReasons: latestSelection.winner ? [] : latestSelection.bestInvalidReasons
+              });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "Unknown background recovery error";
+              const failureReason = resolveBackgroundAttemptFailureReason(error);
+              console.warn(
+                `[background-rerank-attempt] generation=${plannedGeneration.id} option=${plannedGeneration.optionIndex} stage=background_recovery attempt=${fallback.attempts} error=${message}`
+              );
+              backgroundAttempts.push(
+                buildApiErrorAttemptDebug({
+                  attemptIndex: fallback.attempts,
+                  directionSpec: activeDirectionSpec,
+                  failureReason
+                })
+              );
+              backgroundRecovery = createBackgroundRecoveryDebug({
+                attempted: true,
+                attempts: 1,
+                reasons: recoveryReasons,
+                succeeded: false,
+                finalReasons: [`background_generation_failed:${failureReason}`]
+              });
+              persistBackgroundRerankMeta({
+                laneFailed: true
+              });
+              return {
+                attempt: null as Awaited<ReturnType<typeof renderMasterAttempt>> | null,
+                winnerIndex: null as number | null,
+                laneFailed: true,
+                eligiblePoolEmpty: true,
+                winnerDirectionSpec: activeDirectionSpec,
+                backgroundAttempts,
+                backgroundValidation: latestSelection?.backgroundValidation || null,
+                textScrub: latestSelection?.textScrub || null,
+                backgroundRecovery,
+                fallbackFailureReason: failureReason
+              };
+            }
+          }
+        }
+
         const finalSelection = bestEligibleSelection || latestSelection;
+        if (!backgroundRecovery.attempted) {
+          backgroundRecovery = createBackgroundRecoveryDebug({
+            finalReasons: bestEligibleSelection ? [] : finalSelection.bestInvalidReasons
+          });
+        } else if (bestEligibleSelection) {
+          backgroundRecovery = createBackgroundRecoveryDebug({
+            attempted: true,
+            attempts: backgroundRecovery.attempts,
+            reasons: backgroundRecovery.reasons,
+            succeeded: true,
+            finalReasons: []
+          });
+        } else if (backgroundRecovery.finalReasons.length === 0) {
+          backgroundRecovery = createBackgroundRecoveryDebug({
+            attempted: backgroundRecovery.attempted,
+            attempts: backgroundRecovery.attempts,
+            reasons: backgroundRecovery.reasons,
+            succeeded: false,
+            finalReasons: finalSelection.bestInvalidReasons
+          });
+        }
         const finalFailureReason: BackgroundAttemptFailureReason | null =
           finalSelection.failureReason ||
           (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed ? "ALL_TEXT" : null);
@@ -10089,6 +10806,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             backgroundAttempts,
             backgroundValidation: finalSelection.backgroundValidation,
             textScrub: finalSelection.textScrub || null,
+            backgroundRecovery,
             fallbackFailureReason: finalFailureReason || "UNKNOWN"
           };
         }
@@ -10110,6 +10828,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           backgroundAttempts,
           backgroundValidation: finalSelection.backgroundValidation,
           textScrub: finalSelection.textScrub || finalSelection.attempt.textScrubDebug || null,
+          backgroundRecovery,
           fallbackFailureReason: null as BackgroundAttemptFailureReason | null
         };
       };
@@ -10119,6 +10838,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         backgroundAttempts: BackgroundAttemptDebug[];
         backgroundValidation?: ProductionBackgroundValidationEvidence | null;
         textScrub?: TextScrubDebug | null;
+        backgroundRecovery?: BackgroundRecoveryDebug | null;
       }): Promise<{ optionStatus: GenerationOptionStatus; failureReason: BackgroundAttemptFailureReason }> => {
         const resolvedFailureReason: BackgroundAttemptFailureReason = imageCallCapReached
           ? "BUDGET"
@@ -10134,6 +10854,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           generationLifecycleState: resolveGenerationLifecycleStateForFailure(resolvedFailureReason),
           backgroundFailureReason: resolvedFailureReason,
           backgroundAttempts: fallbackParams.backgroundAttempts,
+          backgroundRecoveryAttempted: fallbackParams.backgroundRecovery?.attempted === true,
+          backgroundRecoveryAttempts: fallbackParams.backgroundRecovery?.attempts || 0,
+          backgroundRecoveryReasons: fallbackParams.backgroundRecovery?.reasons || [],
+          backgroundRecoverySucceeded: fallbackParams.backgroundRecovery?.succeeded === true,
+          backgroundRecoveryFinalReasons: fallbackParams.backgroundRecovery?.finalReasons || [],
           imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
           ...(fallbackParams.textScrub
             ? {
@@ -10175,12 +10900,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
 
       const initialMasterSelection = await selectBackgroundWinner();
       backgroundAttemptDiagnostics = initialMasterSelection.backgroundAttempts;
+      let selectedBackgroundRecovery = initialMasterSelection.backgroundRecovery;
       if (initialMasterSelection.fallbackFailureReason || !initialMasterSelection.attempt) {
         const fallbackResult = await completeWithBackgroundFallback({
           failureReason: initialMasterSelection.fallbackFailureReason || "UNKNOWN",
           backgroundAttempts: initialMasterSelection.backgroundAttempts,
           backgroundValidation: initialMasterSelection.backgroundValidation || null,
-          textScrub: initialMasterSelection.textScrub || null
+          textScrub: initialMasterSelection.textScrub || null,
+          backgroundRecovery: initialMasterSelection.backgroundRecovery
         });
         return {
           generationId: plannedGeneration.id,
@@ -10197,12 +10924,14 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           "Originality guard: alter composition strongly from references. Change focal geometry, spacing rhythm, and tonal distribution while preserving the same overall mood."
         );
         backgroundAttemptDiagnostics = originalityMasterSelection.backgroundAttempts;
+        selectedBackgroundRecovery = originalityMasterSelection.backgroundRecovery;
         if (originalityMasterSelection.fallbackFailureReason || !originalityMasterSelection.attempt) {
           const fallbackResult = await completeWithBackgroundFallback({
             failureReason: originalityMasterSelection.fallbackFailureReason || "UNKNOWN",
             backgroundAttempts: originalityMasterSelection.backgroundAttempts,
             backgroundValidation: originalityMasterSelection.backgroundValidation || null,
-            textScrub: originalityMasterSelection.textScrub || selectedBackgroundTextScrub
+            textScrub: originalityMasterSelection.textScrub || selectedBackgroundTextScrub,
+            backgroundRecovery: originalityMasterSelection.backgroundRecovery
           });
           return {
             generationId: plannedGeneration.id,
@@ -10648,6 +11377,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           lockupSource: lockupSourceForSuccess,
           generationLifecycleState: "GENERATION_COMPLETED",
           backgroundFailureReason: null,
+          backgroundRecoveryAttempted: selectedBackgroundRecovery.attempted,
+          backgroundRecoveryAttempts: selectedBackgroundRecovery.attempts,
+          backgroundRecoveryReasons: selectedBackgroundRecovery.reasons,
+          backgroundRecoverySucceeded: selectedBackgroundRecovery.succeeded,
+          backgroundRecoveryFinalReasons: selectedBackgroundRecovery.finalReasons,
           imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
           ...(selectedBackgroundTextScrub
             ? {
@@ -10820,6 +11554,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         },
         resolvedLockupPalette
       );
+      failSafeInput = persistedInputWithLockupPalette;
       const completionValidation = resolveProductionValidOption({
         output: completedOutput,
         dbStatus: "COMPLETED",
@@ -10883,41 +11618,56 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             });
           }
         });
-        return {
+        failSafeReason = failureReason;
+        provisionalResult = {
           generationId: plannedGeneration.id,
           optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
           failureReason
         };
-      }
-
-      const persisted = await persistGenerationSettlement({
-        generationId: plannedGeneration.id,
-        status: "COMPLETED",
-        output: completedOutputWithValidation,
-        input: persistedInputWithLockupPalette,
-        attemptOwner: plannedGeneration.attemptOwner,
-        applyAssetChanges: async (tx) => {
-          await tx.asset.deleteMany({
-            where: {
-              generationId: plannedGeneration.id,
-              slot: {
-                in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+      } else {
+        const persisted = await persistGenerationSettlement({
+          generationId: plannedGeneration.id,
+          status: "COMPLETED",
+          output: completedOutputWithValidation,
+          input: persistedInputWithLockupPalette,
+          attemptOwner: plannedGeneration.attemptOwner,
+          applyAssetChanges: async (tx) => {
+            await tx.asset.deleteMany({
+              where: {
+                generationId: plannedGeneration.id,
+                slot: {
+                  in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
+                }
               }
-            }
-          });
-          await tx.asset.createMany({
-            data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
-          });
+            });
+            await tx.asset.createMany({
+              data: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
+            });
+          }
+        });
+        provisionalResult = {
+          generationId: plannedGeneration.id,
+          optionStatus: persisted ? "COMPLETED" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
+          failureReason: null
+        };
+      }
+      })(),
+      new Promise<never>((_, reject) => {
+        executionTimeoutId = setTimeout(() => {
+          reject(new ClaimedGenerationExecutionTimeoutError(plannedGeneration.id, CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS));
+        }, CLAIMED_GENERATION_EXECUTION_TIMEOUT_MS);
+      })
+      ]);
+      } finally {
+        if (executionTimeoutId) {
+          clearTimeout(executionTimeoutId);
         }
-      });
-      return {
-        generationId: plannedGeneration.id,
-        optionStatus: persisted ? "COMPLETED" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
-        failureReason: null
-      };
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       const failureReason = resolveBackgroundAttemptFailureReason(error, imageCallCapReached);
+      failSafeReason = failureReason;
+      failSafeMessage = `Generation branch threw before terminal settlement: ${message}`;
       console.error(
         `OpenAI preview generation failed for generation ${plannedGeneration.id} (${plannedGeneration.presetKey}). Falling back to layout-only output. ${message}`
       );
@@ -10930,76 +11680,64 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           providerPreflight: params.providerPreflight,
           attemptOwner: plannedGeneration.attemptOwner
         });
-        return {
+        provisionalResult = {
           generationId: plannedGeneration.id,
           optionStatus,
           failureReason
         };
       } catch (fallbackError) {
         const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback persistence error";
-        const warnings = appendUniqueDebugWarning(
-          appendUniqueDebugWarning(fallbackOutput.meta.debug?.warnings, "Fallback persistence failed."),
-          `Generation error: ${message}`
-        );
-        const failedOutput: GenerationOutputPayload = {
-          ...fallbackOutput,
-          status: "FAILED_GENERATION",
-          notes: "generation_failed",
-          meta: {
-            ...fallbackOutput.meta,
-            debug: mergeGenerationDebugMeta(fallbackOutput.meta.debug, {
-              backgroundSource: "fallback",
-              lockupSource: "fallback",
-              generationLifecycleState: resolveGenerationLifecycleStateForFailure(failureReason),
-              backgroundFailureReason: failureReason,
-              imageProvider: buildImageProviderDebugMeta(params.providerPreflight),
-              aspectAssets: {
-                widescreen: "missing",
-                square: "missing",
-                vertical: "missing"
-              },
-              warnings: appendUniqueDebugWarning(warnings, `Fallback error: ${fallbackMessage}`)
-            })
-          }
-        };
-        const failedValidation = resolveProductionValidOption({
-          output: failedOutput,
-          dbStatus: "FAILED"
-        });
-        const persistedFailedOutput: GenerationOutputPayload = {
-          ...failedOutput,
-          meta: {
-            ...failedOutput.meta,
-            productionValidation: toPersistedProductionValidationSnapshot(failedValidation)
-          }
-        };
-        const persisted = await persistGenerationSettlement({
+        failSafeMessage = `Fallback persistence failed before terminal settlement: ${fallbackMessage}`;
+        const persisted = await persistMinimalFailedGenerationSettlement({
           generationId: plannedGeneration.id,
-          status: "FAILED",
-          output: persistedFailedOutput,
+          output: fallbackOutput,
+          failureReason,
+          providerPreflight: params.providerPreflight,
           attemptOwner: plannedGeneration.attemptOwner,
-          applyAssetChanges: async (tx) => {
-            await tx.asset.deleteMany({
-              where: {
-                generationId: plannedGeneration.id,
-                slot: {
-                  in: [...PREVIEW_ASSET_SLOTS_TO_CLEAR]
-                }
-              }
-            });
-          }
+          input: failSafeInput,
+          notes: "generation_failed",
+          warningMessages: ["Fallback persistence failed.", `Generation error: ${message}`, `Fallback error: ${fallbackMessage}`]
         });
-        return {
+        provisionalResult = {
           generationId: plannedGeneration.id,
           optionStatus: persisted ? "FAILED_GENERATION" : await readPersistedGenerationOptionStatus(plannedGeneration.id),
           failureReason
         };
       }
     }
-  }))
-  );
+      }
+      return ensureClaimedGenerationTerminalResult({
+        generationId: plannedGeneration.id,
+        fallbackOutput,
+        providerPreflight: params.providerPreflight,
+        attemptOwner: plannedGeneration.attemptOwner,
+        failureReason: failSafeReason,
+        input: failSafeInput,
+        provisionalResult,
+        failSafeMessage
+      });
+    }))
+    );
 
-  return optionResults;
+    return optionResults;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown shared generation setup error";
+    const failureReason = resolveBackgroundAttemptFailureReason(error);
+    console.error(`[generation-batch] claimed rows exited before per-row settlement. ${message}`);
+    return Promise.all(
+      params.plannedGenerations.map((plannedGeneration) =>
+        ensureClaimedGenerationTerminalResult({
+          generationId: plannedGeneration.id,
+          fallbackOutput: plannedGeneration.fallbackOutput,
+          providerPreflight: params.providerPreflight,
+          attemptOwner: plannedGeneration.attemptOwner,
+          failureReason,
+          provisionalResult: null,
+          failSafeMessage: `Shared generation branch failed before terminal settlement: ${message}`
+        })
+      )
+    );
+  }
 }
 
 export async function createProjectAction(

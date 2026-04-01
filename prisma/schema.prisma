@@ -33,6 +33,12 @@ enum AssetKind {
   OTHER
 }
 
+enum AiRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
 model User {
   id            String       @id @default(cuid())
   email         String       @unique
@@ -203,4 +209,87 @@ model Asset {
 
   project       Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   generation    Generation? @relation(fields: [generationId], references: [id], onDelete: SetNull)
+}
+
+model AiRun {
+  id               String         @id @default(cuid())
+  productKey       String
+  featureKey       String
+  projectId        String?
+  generationId     String?
+  round            Int?
+  laneKey          String?
+  benchmarkCaseKey String?
+  status           AiRunStatus    @default(RUNNING)
+  startedAt        DateTime       @default(now())
+  completedAt      DateTime?
+  metadataJson     Json?
+  attempts         AiAttempt[]
+  evalResults      AiEvalResult[]
+  benchmarkRuns    BenchmarkRun[]
+
+  @@index([projectId, generationId, round])
+}
+
+model AiAttempt {
+  id                 String         @id @default(cuid())
+  runId              String
+  providerKey        String
+  modelKey           String
+  operationKey       String
+  promptVersion      String
+  requestHash        String
+  providerRequestId  String?
+  startedAt          DateTime       @default(now())
+  completedAt        DateTime?
+  latencyMs          Int?
+  success            Boolean        @default(false)
+  errorClass         String?
+  providerStatusCode Int?
+  outputJson         Json?
+  run                AiRun          @relation(fields: [runId], references: [id], onDelete: Cascade)
+  evalResults        AiEvalResult[]
+
+  @@index([runId, operationKey])
+  @@index([providerKey, modelKey])
+}
+
+model AiEvalResult {
+  id          String      @id @default(cuid())
+  runId       String
+  attemptId   String?
+  evalKey     String
+  passed      Boolean
+  score       Float?
+  reasonKey   String?
+  detailsJson Json?
+  createdAt   DateTime    @default(now())
+  run         AiRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  attempt     AiAttempt?  @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+
+  @@index([runId, evalKey])
+}
+
+model BenchmarkCase {
+  id            String         @id @default(cuid())
+  caseKey       String         @unique
+  name          String
+  inputJson     Json
+  enabled       Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  benchmarkRuns BenchmarkRun[]
+}
+
+model BenchmarkRun {
+  id                    String        @id @default(cuid())
+  caseKey               String
+  runId                 String        @unique
+  codeVersion           String?
+  providerConfigVersion String?
+  summaryJson           Json?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  benchmarkCase         BenchmarkCase @relation(fields: [caseKey], references: [caseKey], onDelete: Cascade)
+  run                   AiRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
 }
