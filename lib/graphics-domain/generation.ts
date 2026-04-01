@@ -71,6 +71,10 @@ export async function finalizeGraphicsBackgroundAiRun(params: {
   providerConfigVersion?: string | null;
   error?: unknown;
 }): Promise<AiRunRecord> {
+  if (params.runHandle.run.status !== "RUNNING") {
+    return params.runHandle.run;
+  }
+
   const errorClass = params.error ? readAiErrorClass(params.error) : null;
   const metadataJson =
     params.metadataJson && typeof params.metadataJson === "object" && !Array.isArray(params.metadataJson)
@@ -88,6 +92,7 @@ export async function finalizeGraphicsBackgroundAiRun(params: {
     status: params.status,
     metadataJson
   });
+  params.runHandle.run = completedRun;
 
   if (completedRun.benchmarkCaseKey) {
     await logBenchmarkRun({
