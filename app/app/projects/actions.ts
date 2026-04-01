@@ -4524,6 +4524,37 @@ function resolveBackgroundAttemptFailureReason(error: unknown, imageCallCapReach
   return readProviderFailureReasonFromError(error) || (isOpenAiRateLimitError(error) ? "PROVIDER_QUOTA_OR_RATE_LIMIT" : "UNKNOWN");
 }
 
+function buildBackgroundAiTraceMetadata(
+  prefix: "selected" | "last",
+  aiTrace: GraphicsBackgroundAiAttemptTrace | null | undefined
+): Record<string, string | null> {
+  if (!aiTrace) {
+    return {};
+  }
+
+  if (prefix === "selected") {
+    return {
+      selectedAttemptId: aiTrace.attemptId,
+      selectedProviderKey: aiTrace.providerKey,
+      selectedModelKey: aiTrace.modelKey,
+      selectedProviderModel: aiTrace.providerModel,
+      selectedProviderConfigVersion: aiTrace.providerConfigVersion,
+      selectedOperationKey: aiTrace.operationKey,
+      selectedProviderRequestId: aiTrace.providerRequestId
+    };
+  }
+
+  return {
+    lastAttemptId: aiTrace.attemptId,
+    lastProviderKey: aiTrace.providerKey,
+    lastModelKey: aiTrace.modelKey,
+    lastProviderModel: aiTrace.providerModel,
+    lastProviderConfigVersion: aiTrace.providerConfigVersion,
+    lastOperationKey: aiTrace.operationKey,
+    lastProviderRequestId: aiTrace.providerRequestId
+  };
+}
+
 function buildImageProviderDebugMeta(preflight?: ImageProviderPreflightResult | null): NonNullable<GenerationOutputPayload["meta"]["debug"]>["imageProvider"] {
   const config = resolveImageProviderConfig();
 
@@ -8181,9 +8212,7 @@ async function generateValidatedBackgroundPng(params: {
         metadataJson: {
           promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
           generationId: params.generationId,
-          lastAttemptId: lastAiTrace?.attemptId || null,
-          lastProviderKey: lastAiTrace?.providerKey || null,
-          lastModelKey: lastAiTrace?.modelKey || null
+          ...buildBackgroundAiTraceMetadata("last", lastAiTrace)
         }
       });
     } catch (finalizeError) {
@@ -9702,6 +9731,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             stageHint: shouldRunExplorationToneCheck ? "exploration" : "production"
           })
         });
+        let latestBackgroundAiTrace: GraphicsBackgroundAiAttemptTrace | null = null;
         try {
         const toneTargetForCompliance = shouldRunExplorationToneCheck
           ? resolveToneTargetFromDirectionSpec(activeDirectionSpec)
@@ -9732,6 +9762,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
           disable429Retry: shouldDisable429Retry
         });
+        latestBackgroundAiTrace = initialBackground.aiTrace;
 
         let validatedBackground = initialBackground;
         let paletteRetryCount = 0;
@@ -9796,6 +9827,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
                 disable429Retry: shouldDisable429Retry
               });
+              latestBackgroundAiTrace = validatedBackground.aiTrace;
               paletteComplianceScore = await scorePaletteCompliance(validatedBackground.backgroundPng, brandPaletteComplianceHexes);
             }
           } catch (error) {
@@ -9863,6 +9895,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
                 disable429Retry: shouldDisable429Retry
             });
+            latestBackgroundAiTrace = validatedBackground.aiTrace;
 
             if (brandPaletteComplianceHexes.length > 0) {
               try {
@@ -9932,6 +9965,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
                 disable429Retry: shouldDisable429Retry
             });
+            latestBackgroundAiTrace = validatedBackground.aiTrace;
 
             if (brandPaletteComplianceHexes.length > 0) {
               try {
@@ -9969,10 +10003,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             metadataJson: {
               promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
               generationSeedPrefix,
-              selectedAttemptId: validatedBackground.aiTrace.attemptId,
-              selectedProviderKey: validatedBackground.aiTrace.providerKey,
-              selectedModelKey: validatedBackground.aiTrace.modelKey,
-              selectedProviderModel: validatedBackground.aiTrace.providerModel,
+              ...buildBackgroundAiTraceMetadata("selected", validatedBackground.aiTrace),
               textRetryCount: validatedBackground.textRetryCount,
               paletteRetryCount,
               toneRetryCount,
@@ -10011,7 +10042,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               metadataJson: {
                 promptVersion: GRAPHICS_BACKGROUND_PROMPT_VERSION,
                 generationSeedPrefix: `${runSeed}|${plannedGeneration.optionIndex}${attemptParams.candidateSuffix || ""}`,
-                variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null
+                variationTemplateKey: activeDirectionSpec?.variationTemplateKey || null,
+                ...buildBackgroundAiTraceMetadata("last", latestBackgroundAiTrace)
               }
             });
           } catch (finalizeError) {

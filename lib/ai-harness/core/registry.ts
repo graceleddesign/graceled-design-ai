@@ -141,7 +141,9 @@ export function resolveOperationRoute(params: {
       {
         providerKey: operation.providerKey,
         modelKey,
-        operationKey: operation.key
+        operationKey: operation.key,
+        providerModel: model.providerModel,
+        providerConfigVersion: `${provider.key}:${model.key}:${model.providerModel}`
       },
       `AI provider ${provider.key} is disabled`
     );
@@ -152,7 +154,9 @@ export function resolveOperationRoute(params: {
       {
         providerKey: operation.providerKey,
         modelKey,
-        operationKey: operation.key
+        operationKey: operation.key,
+        providerModel: model.providerModel,
+        providerConfigVersion: `${provider.key}:${model.key}:${model.providerModel}`
       },
       `AI model ${modelKey} is unavailable for ${operation.key}`
     );
@@ -163,7 +167,9 @@ export function resolveOperationRoute(params: {
       {
         providerKey: operation.providerKey,
         modelKey,
-        operationKey: operation.key
+        operationKey: operation.key,
+        providerModel: model.providerModel,
+        providerConfigVersion: `${provider.key}:${model.key}:${model.providerModel}`
       },
       `AI model ${modelKey} does not support ${operation.key}`
     );

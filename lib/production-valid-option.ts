@@ -1,5 +1,7 @@
 import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
 import {
+  isGenerationDbInProgress,
+  isTerminalGenerationDbStatus,
   type GenerationFailureReason,
   type GenerationOptionStatus,
   isPersistedGenerationExecutionActive
@@ -1140,8 +1142,9 @@ export function resolveProductionValidOption(params: {
   const backgroundAssetPaths = readBackgroundAssetPaths(params.assets);
   const lockupAssetPath = readLockupAssetPath(params.assets);
   const fallbackLike = readFallbackLikeStatus(params.output);
-  const executionActive = isPersistedGenerationExecutionActive(params.output);
-  const dbInProgress = params.dbStatus === "RUNNING" || params.dbStatus === "QUEUED" || executionActive;
+  const terminalDbStatus = isTerminalGenerationDbStatus(params.dbStatus);
+  const executionActive = !terminalDbStatus && isPersistedGenerationExecutionActive(params.output);
+  const dbInProgress = isGenerationDbInProgress(params.dbStatus) || executionActive;
   const dbFailedLike = params.dbStatus === "FAILED" || dbInProgress || !params.output;
   const valid =
     !dbInProgress &&

@@ -67,6 +67,10 @@ export function isGenerationDbInProgress(dbStatus: string | null | undefined): b
   return dbStatus === "RUNNING" || dbStatus === "QUEUED";
 }
 
+export function isTerminalGenerationDbStatus(status: string | null | undefined): status is "COMPLETED" | "FAILED" {
+  return status === "COMPLETED" || status === "FAILED";
+}
+
 export function isPersistedGenerationExecutionPhase(value: unknown): value is PersistedGenerationExecutionPhase {
   return value === "RUNNING" || value === "SETTLED";
 }

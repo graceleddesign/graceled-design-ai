@@ -161,6 +161,7 @@ export type AiAttemptFailureInput = {
   id: string;
   errorClass: Exclude<AiErrorClass, "VALIDATION_FAILED">;
   providerStatusCode?: number | null;
+  providerRequestId?: string | null;
   outputJson?: AiInputJsonValue | null;
   completedAt?: Date;
 };

@@ -78,7 +78,9 @@ export async function generateTextWithOpenAiHarness(params: {
       {
         providerKey: route.provider.key,
         modelKey: route.model.key,
-        operationKey: route.operation.key
+        operationKey: route.operation.key,
+        providerModel: route.model.providerModel,
+        providerConfigVersion: route.providerConfigVersion
       },
       "OPENAI_API_KEY is not configured"
     );
@@ -103,7 +105,9 @@ export async function generateTextWithOpenAiHarness(params: {
           {
             providerKey: route.provider.key,
             modelKey: route.model.key,
-            operationKey: route.operation.key
+            operationKey: route.operation.key,
+            providerModel: route.model.providerModel,
+            providerConfigVersion: route.providerConfigVersion
           },
           "OpenAI text response did not include text output"
         );

@@ -97,7 +97,9 @@ export async function generateImageWithOpenAiHarness(params: {
       {
         providerKey: route.provider.key,
         modelKey: route.model.key,
-        operationKey: route.operation.key
+        operationKey: route.operation.key,
+        providerModel: route.model.providerModel,
+        providerConfigVersion: route.providerConfigVersion
       },
       "OPENAI_API_KEY is not configured"
     );
@@ -157,7 +159,9 @@ export async function generateImageWithOpenAiHarness(params: {
           {
             providerKey: route.provider.key,
             modelKey: route.model.key,
-            operationKey: route.operation.key
+            operationKey: route.operation.key,
+            providerModel: route.model.providerModel,
+            providerConfigVersion: route.providerConfigVersion
           },
           "OpenAI image response did not include generated image output",
           error

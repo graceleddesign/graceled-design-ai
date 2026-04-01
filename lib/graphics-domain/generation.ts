@@ -5,12 +5,11 @@ import { logBenchmarkRun } from "@/lib/ai-harness/storage/benchmark-runs";
 import { generateImageWithOpenAiHarness, type OpenAiImageReference } from "@/lib/ai-harness/providers";
 import type {
   AiBenchmarkCaseDefinition,
-  AiErrorClass,
   AiInputJsonValue,
   AiRunRecord,
   AiRunStatus
 } from "@/lib/ai-harness/core/types";
-import { readAiErrorClass } from "@/lib/ai-harness/core/errors";
+import { readAiErrorClass, readAiProviderErrorMetadata } from "@/lib/ai-harness/core/errors";
 import { resolveGraphicsBackgroundImageSize, type GraphicsPreviewShape } from "@/lib/graphics-domain/assets";
 import {
   GRAPHICS_BACKGROUND_FEATURE_KEY,
@@ -76,17 +75,37 @@ export async function finalizeGraphicsBackgroundAiRun(params: {
   }
 
   const errorClass = params.error ? readAiErrorClass(params.error) : null;
-  const metadataJson =
-    params.metadataJson && typeof params.metadataJson === "object" && !Array.isArray(params.metadataJson)
-      ? {
-          ...params.metadataJson,
+  const providerErrorMetadata = params.error ? readAiProviderErrorMetadata(params.error) : null;
+  const errorMetadataJson =
+    errorClass || providerErrorMetadata
+      ? ({
           ...(errorClass
             ? {
                 errorClass
               }
+            : {}),
+          ...(providerErrorMetadata
+            ? {
+                errorProviderKey: providerErrorMetadata.providerKey,
+                errorModelKey: providerErrorMetadata.modelKey,
+                errorProviderModel: providerErrorMetadata.providerModel,
+                errorProviderConfigVersion: providerErrorMetadata.providerConfigVersion,
+                errorOperationKey: providerErrorMetadata.operationKey,
+                errorStatusCode: providerErrorMetadata.statusCode,
+                errorProviderErrorCode: providerErrorMetadata.providerErrorCode,
+                errorProviderRequestId: providerErrorMetadata.providerRequestId,
+                errorRawErrorType: providerErrorMetadata.rawErrorType
+              }
             : {})
+        } satisfies Record<string, string | number | null>)
+      : null;
+  const metadataJson =
+    params.metadataJson && typeof params.metadataJson === "object" && !Array.isArray(params.metadataJson)
+      ? {
+          ...params.metadataJson,
+          ...(errorMetadataJson ?? {})
         }
-      : params.metadataJson ?? (errorClass ? ({ errorClass } satisfies { errorClass: AiErrorClass }) : null);
+      : params.metadataJson ?? errorMetadataJson ?? null;
   const completedRun = await completeAiRun({
     id: params.runHandle.run.id,
     status: params.status,

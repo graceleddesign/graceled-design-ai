@@ -171,6 +171,11 @@ export async function completeAiAttemptFailure(input: AiAttemptFailureInput): Pr
         id: input.id
       },
       data: {
+        ...(typeof input.providerRequestId === "undefined"
+          ? {}
+          : {
+              providerRequestId: input.providerRequestId ?? null
+            }),
         completedAt,
         latencyMs: resolveLatencyMs(existing.startedAt, completedAt),
         success: false,

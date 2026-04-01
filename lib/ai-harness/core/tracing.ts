@@ -84,14 +84,24 @@ export async function traceAiProviderCall<TOutput>(params: {
     const normalizedError = normalizeProviderError(error, {
       providerKey: params.route.provider.key,
       modelKey: params.route.model.key,
-      operationKey: params.route.operation.key
+      operationKey: params.route.operation.key,
+      providerModel: params.route.model.providerModel,
+      providerConfigVersion: params.route.providerConfigVersion
     });
     await completeAiAttemptFailure({
       id: attempt.id,
       errorClass: normalizedError.errorClass,
       providerStatusCode: normalizedError.statusCode,
+      providerRequestId: normalizedError.providerRequestId,
       outputJson: {
+        errorClass: normalizedError.errorClass,
         message: normalizedError.message,
+        providerKey: normalizedError.providerKey,
+        modelKey: normalizedError.modelKey,
+        providerModel: normalizedError.providerModel,
+        providerConfigVersion: normalizedError.providerConfigVersion,
+        operationKey: normalizedError.operationKey,
+        statusCode: normalizedError.statusCode,
         providerErrorCode: normalizedError.providerErrorCode,
         providerRequestId: normalizedError.providerRequestId,
         rawErrorType: normalizedError.rawErrorType
