@@ -83,7 +83,7 @@ import {
 } from "@/lib/generation-state";
 import { preflightImageProvider, resolveImageProviderConfig, type ImageProviderPreflightResult } from "@/lib/image-provider";
 import { resolveRecipeFocalPoint } from "@/lib/lockups/renderer";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 import { optionLabel } from "@/lib/option-label";
 import { buildOverlayDisplayContent, normalizeLine } from "@/lib/overlay-lines";
 import { buildSymbolDirectives, SYMBOL_ONLY_TEXT_BAN_DIRECTIVE } from "@/lib/motif-symbol-directives";
@@ -6099,7 +6099,7 @@ async function imageHasReadableText(
   }
 
   try {
-    const response = await openai.responses.create({
+    const response = await getOpenAI().responses.create({
       model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
       temperature: 0,
       input: [
@@ -7768,7 +7768,7 @@ async function createStyleBrief(params: {
     .join("\n");
 
   try {
-    const response = await openai.responses.create({
+    const response = await getOpenAI().responses.create({
       model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
       input: prompt
     });

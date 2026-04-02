@@ -10,7 +10,7 @@ import {
   resolveImageProviderConfig
 } from "@/lib/image-provider";
 import { resizeCoverWithFocalPoint } from "@/lib/image-cover";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 
 type ImageQuality = "low" | "medium" | "high" | "auto";
 type ImageSize = "1024x1024" | "1536x1024" | "1024x1536";
@@ -119,7 +119,7 @@ async function generatePngWithOpenAi(params: {
   try {
     const response = await runWithGptImage429Retry(() =>
       runWithGptImageBudget(() =>
-        openai.responses.create({
+        getOpenAI().responses.create({
           model: providerConfig.model,
           input: params.prompt,
           tool_choice: { type: "image_generation" },

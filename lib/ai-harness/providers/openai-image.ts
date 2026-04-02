@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash } from "crypto";
 import { runWithGptImage429Retry, runWithGptImageBudget, type GptImageDebugMeta } from "@/lib/gptImageRateLimit";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 import {
   createInvalidResponseError,
   createProviderConfigurationError
@@ -136,7 +136,7 @@ export async function generateImageWithOpenAiHarness(params: {
       const runImageRequest = () =>
         runWithGptImageBudget(
           () =>
-            openai.responses.create({
+            getOpenAI().responses.create({
               model: route.model.providerModel,
               input,
               tool_choice: { type: "image_generation" },

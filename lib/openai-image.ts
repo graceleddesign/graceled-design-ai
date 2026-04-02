@@ -6,7 +6,7 @@ import {
   normalizeImageProviderError,
   resolveImageProviderConfig
 } from "@/lib/image-provider";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 
 export type OpenAiImageSize = "1024x1024" | "1536x1024" | "1024x1536";
 export type OpenAiImageQuality = "low" | "medium" | "high";
@@ -61,7 +61,7 @@ export async function generatePngFromPrompt(params: {
     const runImageCall = () =>
       runWithGptImageBudget(
         () =>
-          openai.responses.create({
+          getOpenAI().responses.create({
             model: providerConfig.model,
             input,
             tool_choice: { type: "image_generation" },

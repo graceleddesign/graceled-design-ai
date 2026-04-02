@@ -2,7 +2,7 @@ import "server-only";
 
 import { getMotifBankContext, type MotifBankContext } from "@/lib/bible-motif-bank";
 import { GENERIC_CHRISTIAN_MOTIFS, isGenericMotif } from "@/lib/motif-guardrails";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 
 export type BibleCreativeBrief = {
   // High-level art-direction summary used in background prompt context.
@@ -656,7 +656,7 @@ export async function extractBibleCreativeBrief(params: ExtractBibleCreativeBrie
   ].join("\n");
 
   try {
-    const response = await openai.responses.create({
+    const response = await getOpenAI().responses.create({
       model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
       temperature: 0,
       input: [
@@ -705,7 +705,7 @@ export async function extractBibleCreativeBrief(params: ExtractBibleCreativeBrie
       "Ensure doNotUse includes antiMotifs and generic motif bans."
     ].join("\n");
 
-    const retryResponse = await openai.responses.create({
+    const retryResponse = await getOpenAI().responses.create({
       model: process.env.OPENAI_MAIN_MODEL?.trim() || "gpt-4.1-mini",
       temperature: 0,
       input: [

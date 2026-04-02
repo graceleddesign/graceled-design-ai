@@ -1,6 +1,6 @@
 import "server-only";
 
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 import { type ProviderFailureReason } from "@/lib/generation-state";
 
 export type ImageProviderName = "openai";
@@ -288,7 +288,7 @@ export async function preflightImageProvider(params?: {
     }
 
     try {
-      const response = await openai.responses.create({
+      const response = await getOpenAI().responses.create({
         model: config.model,
         input: PREFLIGHT_PROMPT,
         tool_choice: { type: "image_generation" },

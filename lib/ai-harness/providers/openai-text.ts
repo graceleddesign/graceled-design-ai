@@ -1,6 +1,6 @@
 import "server-only";
 
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 import {
   createInvalidResponseError,
   createProviderConfigurationError
@@ -94,7 +94,7 @@ export async function generateTextWithOpenAiHarness(params: {
       input: params.input
     },
     call: async () => {
-      const response = await openai.responses.create({
+      const response = await getOpenAI().responses.create({
         model: route.model.providerModel,
         input: params.input as never
       });

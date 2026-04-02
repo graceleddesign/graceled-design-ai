@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { openai } from "@/lib/openai";
+import { getOpenAI } from "@/lib/openai";
 import {
   DESIGN_SPEC_SCHEMA,
   type DesignSpec
@@ -304,7 +304,7 @@ export async function generateDesignSpec(params: GenerateDesignSpecParams): Prom
 
   const runAttempt = async (retryReason?: string): Promise<DesignSpec | null> => {
     const retryLine = retryReason ? `\nRetry correction notes: ${retryReason}` : "";
-    const response = await openai.responses.create({
+    const response = await getOpenAI().responses.create({
       model,
       temperature: 0.4,
       input: [
