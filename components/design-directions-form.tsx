@@ -1,7 +1,7 @@
 "use client";
 
 import { useActionState } from "react";
-import { generateRoundOneAction, type GenerationActionState } from "@/app/app/projects/actions";
+import { generateRoundOneAction, type GenerationActionState } from "@/app/app/projects/generation-actions";
 
 type DesignDirectionsFormProps = {
   projectId: string;

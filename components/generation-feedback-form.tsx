@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useActionState, useState } from "react";
-import { generateRoundTwoAction, type RoundFeedbackActionState } from "@/app/app/projects/actions";
+import { generateRoundTwoAction, type RoundFeedbackActionState } from "@/app/app/projects/generation-actions";
 import { STYLE_DIRECTION_OPTIONS } from "@/lib/style-direction";
 
 type GenerationFeedbackFormProps = {
