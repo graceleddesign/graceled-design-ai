@@ -53,6 +53,7 @@ import {
 } from "@/lib/graphics-domain/generation";
 import { resolveClaimedGenerationExecutionTimeoutMs } from "@/lib/graphics-domain/claim-timeout";
 import { settleUnexpectedClaimedGenerationFailure } from "@/lib/graphics-domain/claimed-generation-failure-settlement";
+import { resolveRound1LiveWorkBudget } from "@/lib/graphics-domain/round1-live-work-budget";
 import {
   GRAPHICS_BACKGROUND_PROMPT_VERSION,
   buildGraphicsBackgroundRunMetadata
@@ -267,14 +268,8 @@ const MONO_TONE_OVERRIDE_RETRY_BOOST =
 const DARK_TONE_OVERRIDE_RETRY_BOOST =
   "DARK OVERRIDE RETRY: dark but readable; avoid pure black; include visible midtones and highlights; clear forms and structure; maintain strong contrast for title-safe area.";
 const OPTION_MASTER_BACKGROUND_SHAPE: PreviewShape = "wide";
-const ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT = 4;
-const ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT = 2;
-const CHEAP_MODE_ROUND1_BACKGROUND_CANDIDATE_COUNT = 1;
-const STANDARD_ROUND1_BACKGROUND_CANDIDATE_COUNT = 2;
 const ROUND1_BACKGROUND_RECOVERY_MAX_ATTEMPTS = 1;
 const ROUND1_BACKGROUND_RECOVERY_CANDIDATE_COUNT = 2;
-const ROUND1_NO_NOTES_LOCKUP_CANDIDATE_COUNT = 1;
-const ROUND1_NO_NOTES_MAX_TEXT_RETRIES = 1;
 const ROUND1_CHEAP_MODE_MAX_IMAGE_CALLS = 12;
 const ROUND1_IMAGE_CALL_CAP_WARNING = "Image call cap reached; returning best available.";
 const DEV_CHEAP_MODE = process.env.DEV_CHEAP_MODE?.trim().toLowerCase() === "true";
@@ -9504,18 +9499,16 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const inputRefinementLineage = readRefinementLineageFromInput(plannedGeneration.input);
       const shouldUseCheapRound1Mode = DEV_CHEAP_MODE && plannedGeneration.round === 1;
       const shouldUseRound1NoNotesThrottle = plannedGeneration.round === 1 && !hasDesignNotes;
+      const round1LiveWorkBudget = resolveRound1LiveWorkBudget({
+        round: plannedGeneration.round,
+        hasDesignNotes,
+        devCheapMode: DEV_CHEAP_MODE,
+        explorationMaxTextRetriesPerBackground: NO_TEXT_RETRY_BOOSTS.length
+      });
       const shouldDisableToneComplianceRetry = shouldUseRound1NoNotesThrottle;
-      const backgroundCandidateCount = shouldUseRound1NoNotesThrottle
-        ? DEV_CHEAP_MODE
-          ? CHEAP_MODE_ROUND1_BACKGROUND_CANDIDATE_COUNT
-          : STANDARD_ROUND1_BACKGROUND_CANDIDATE_COUNT
-        : ROUND1_EXPLORATION_BACKGROUND_CANDIDATE_COUNT;
-      const lockupCandidateCount = shouldUseRound1NoNotesThrottle
-        ? ROUND1_NO_NOTES_LOCKUP_CANDIDATE_COUNT
-        : ROUND1_EXPLORATION_LOCKUP_CANDIDATE_COUNT;
-      const maxTextRetriesPerBackground = shouldUseRound1NoNotesThrottle
-        ? ROUND1_NO_NOTES_MAX_TEXT_RETRIES
-        : NO_TEXT_RETRY_BOOSTS.length;
+      const backgroundCandidateCount = round1LiveWorkBudget.backgroundCandidateCount;
+      const lockupCandidateCount = round1LiveWorkBudget.lockupCandidateCount;
+      const maxTextRetriesPerBackground = round1LiveWorkBudget.maxTextRetriesPerBackground;
       const shouldDisablePromptFallbackOnRateLimit = shouldUseRound1NoNotesThrottle;
       const shouldDisable429Retry = shouldUseRound1NoNotesThrottle;
       const shouldEnforceRound1ImageCallCap = shouldUseCheapRound1Mode;
