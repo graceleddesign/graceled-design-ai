@@ -53,6 +53,11 @@ import {
 } from "@/lib/graphics-domain/generation";
 import { resolveClaimedGenerationExecutionTimeoutMs } from "@/lib/graphics-domain/claim-timeout";
 import { settleUnexpectedClaimedGenerationFailure } from "@/lib/graphics-domain/claimed-generation-failure-settlement";
+import {
+  acquireRoundOneLaunchSingleFlight,
+  attachRoundOneLaunchGenerationIds,
+  finalizeRoundOneLaunchSingleFlight
+} from "@/lib/graphics-domain/round1-launch-single-flight";
 import { resolveRound1LiveWorkBudget } from "@/lib/graphics-domain/round1-live-work-budget";
 import {
   GRAPHICS_BACKGROUND_PROMPT_VERSION,
@@ -12085,289 +12090,343 @@ export async function generateRoundOneAction(
   }
 
   const brandKit = project.brandKit;
-
-  const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
-  const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
-  const runSeed = randomUUID();
-  const seriesMarkRequested = shouldRequestSeriesMarkFromNotes([project.designNotes]);
-  const motifBankContext = getMotifBankContext({
-    title: project.series_title,
-    subtitle: project.series_subtitle,
-    scripturePassages: project.scripture_passages,
-    description: project.series_description,
-    designNotes: project.designNotes
+  const roundOneLaunchTarget = `/app/projects/${projectId}/generations`;
+  const roundOneLaunchState = await acquireRoundOneLaunchSingleFlight({
+    prisma,
+    projectId: project.id
   });
-  const hasDesignNotes = hasDesignDirection(project.designNotes, null);
-  const explorationMode = !hasDesignNotes;
-  const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys, recentReferenceIds, curatedRefs] =
-    await Promise.all([
-    loadRecentProjectMotifs(project.id),
-    loadRecentStyleFamilies({
-      organizationId: session.organizationId,
-      projectId: project.id,
-      limit: 20
-    }),
-    explorationMode
-      ? loadRecentLockupRecipeIds({
+  if (roundOneLaunchState.kind === "duplicate") {
+    redirect(roundOneLaunchTarget);
+  }
+  const roundOneLaunchLease = roundOneLaunchState.lease;
+  let roundOneLaunchGenerationIds: string[] = [];
+  let roundOneLaunchReleased = false;
+  const releaseRoundOneLaunch = async (terminalStatus: "COMPLETED" | "FAILED", note?: string | null): Promise<void> => {
+    if (roundOneLaunchReleased) {
+      return;
+    }
+
+    const finalized = await finalizeRoundOneLaunchSingleFlight({
+      prisma,
+      lease: roundOneLaunchLease,
+      terminalStatus,
+      generationIds: roundOneLaunchGenerationIds,
+      note
+    });
+    roundOneLaunchReleased = true;
+    if (!finalized) {
+      console.warn(`[round1-single-flight] lease release missed project=${project.id} status=${terminalStatus}`);
+    }
+  };
+  const summarizeRoundOneLaunchError = (error: unknown): string => {
+    const message = error instanceof Error ? error.message : "unknown_round_one_launch_error";
+    const normalized = message.replace(/\s+/g, " ").trim();
+    return `generate_round_one_action_threw:${normalized.slice(0, 160)}`;
+  };
+
+  try {
+    const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
+    const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
+    const runSeed = randomUUID();
+    const seriesMarkRequested = shouldRequestSeriesMarkFromNotes([project.designNotes]);
+    const motifBankContext = getMotifBankContext({
+      title: project.series_title,
+      subtitle: project.series_subtitle,
+      scripturePassages: project.scripture_passages,
+      description: project.series_description,
+      designNotes: project.designNotes
+    });
+    const hasDesignNotes = hasDesignDirection(project.designNotes, null);
+    const explorationMode = !hasDesignNotes;
+    const [recentMotifs, recentStyleFamilies, recentRecipeIds, recentExplorationSetKeys, recentReferenceIds, curatedRefs] =
+      await Promise.all([
+        loadRecentProjectMotifs(project.id),
+        loadRecentStyleFamilies({
           organizationId: session.organizationId,
           projectId: project.id,
           limit: 20
-        })
-      : Promise.resolve([]),
-    explorationMode
-      ? loadRecentExplorationSetKeys({
-          projectId: project.id,
-          limit: 8
-        })
-      : Promise.resolve([]),
-    explorationMode
-      ? loadRecentReferenceIds({
-          organizationId: session.organizationId,
-          projectId: project.id,
-          projectLimit: 12,
-          globalLimit: 30
-        })
-      : Promise.resolve({
-          projectRecent: [],
-          globalRecent: []
         }),
-    explorationMode ? getCuratedReferences() : Promise.resolve([])
-  ]);
-  const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
-  const bibleCreativeBrief = await extractBibleCreativeBrief({
-    title: project.series_title,
-    subtitle: project.series_subtitle,
-    scripturePassages: project.scripture_passages,
-    description: project.series_description,
-    designNotes: project.designNotes,
-    motifBankContext
-  });
-  const directionPlan = planDirectionSet({
-    runSeed,
-    projectId: project.id,
-    round: 1,
-    explorationSetSeed: `${project.id}|round-1|${runSeed}`,
-    enabledPresetKeys: enabledPresets.map((preset) => preset.key),
-    optionCount: ROUND_OPTION_COUNT,
-    seriesMarkRequested,
-    wantsSeriesMarkLane: seriesMarkRequested,
-    motifs: bibleCreativeBrief.motifs,
-    allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
-    markIdeas: bibleCreativeBrief.markIdeas,
-    recentMotifs,
-    recentStyleFamilies,
-    recentStyleBuckets,
-    recentExplorationSetKeys,
-    recentRecipeIds,
-    explorationMode,
-    brandMode: project.brandMode,
-    seriesTitle: project.series_title,
-    seriesSubtitle: project.series_subtitle,
-    seriesDescription: project.series_description,
-    designNotes: project.designNotes,
-    topicNames: motifBankContext.topicNames,
-    motifScope: motifBankContext.scriptureScope,
-    primaryThemes: motifBankContext.primaryThemeCandidates,
-    secondaryThemes: motifBankContext.secondaryThemeCandidates,
-    sceneMotifs: motifBankContext.sceneMotifCandidates,
-    sceneMotifRequested: motifBankContext.sceneMotifRequested,
-    curatedRefs,
-    recentReferenceIdsProject: recentReferenceIds.projectRecent,
-    recentReferenceIdsGlobal: recentReferenceIds.globalRecent
-  });
-  const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
-  const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
-  const plannedStyleFamilies = directionPlan.map((spec) => spec.templateStyleFamily) as [StyleFamily, StyleFamily, StyleFamily];
-
-  if (selectedPresetKeys.length < ROUND_OPTION_COUNT || lockupPresetIds.length < ROUND_OPTION_COUNT) {
-    return { error: "At least three presets are required to generate options." };
-  }
-
-  const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT, directionPlan);
-  const lockupLayoutsForOptions = resolvePlannedLockupLayouts({
-    seed: `${runSeed}:round-1`,
-    directionPlan,
-    styleFamilies: plannedStyleFamilies,
-    lockupPresetIds,
-    referencesByOption: refsForOptions,
-    forceDistinctRecipes: explorationMode,
-    recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
-    brandMode: project.brandMode,
-    typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null,
-    round: 1,
-    hasDesignNotes
-  });
-  const inputsByOption = selectedPresetKeys.map((_, index) =>
-    buildGenerationInput(
-      project,
-      brandKit,
-      selectedPresetKeys,
-      undefined,
-      lockupPresetIds[index],
+        explorationMode
+          ? loadRecentLockupRecipeIds({
+              organizationId: session.organizationId,
+              projectId: project.id,
+              limit: 20
+            })
+          : Promise.resolve([]),
+        explorationMode
+          ? loadRecentExplorationSetKeys({
+              projectId: project.id,
+              limit: 8
+            })
+          : Promise.resolve([]),
+        explorationMode
+          ? loadRecentReferenceIds({
+              organizationId: session.organizationId,
+              projectId: project.id,
+              projectLimit: 12,
+              globalLimit: 30
+            })
+          : Promise.resolve({
+              projectRecent: [],
+              globalRecent: []
+            }),
+        explorationMode ? getCuratedReferences() : Promise.resolve([])
+      ]);
+    const recentStyleBuckets = deriveRecentStyleBuckets(recentStyleFamilies);
+    const bibleCreativeBrief = await extractBibleCreativeBrief({
+      title: project.series_title,
+      subtitle: project.series_subtitle,
+      scripturePassages: project.scripture_passages,
+      description: project.series_description,
+      designNotes: project.designNotes,
+      motifBankContext
+    });
+    const directionPlan = planDirectionSet({
       runSeed,
-      plannedStyleFamilies,
-      runSeed,
-      directionPlan,
-      lockupLayoutsForOptions[index]
-    )
-  );
-  for (const input of inputsByOption) {
-    const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
-    if (!validatedDesignBrief.ok) {
-      return {
-        error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
-      };
-    }
-  }
-
-  const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
-    const generationId = randomUUID();
-    const references = refsForOptions[index] || [];
-    const input = inputsByOption[index];
-
-    return {
-      id: generationId,
-      presetId: presetIdByKey.get(presetKey) || null,
-      presetKey,
+      projectId: project.id,
       round: 1,
-      optionIndex: index,
-      references,
-      input: input as Prisma.InputJsonValue,
-      fallbackOutput: buildFallbackGenerationOutput({
-        projectId: project.id,
-        presetKey,
+      explorationSetSeed: `${project.id}|round-1|${runSeed}`,
+      enabledPresetKeys: enabledPresets.map((preset) => preset.key),
+      optionCount: ROUND_OPTION_COUNT,
+      seriesMarkRequested,
+      wantsSeriesMarkLane: seriesMarkRequested,
+      motifs: bibleCreativeBrief.motifs,
+      allowedGenericMotifs: bibleCreativeBrief.allowedGenericMotifs,
+      markIdeas: bibleCreativeBrief.markIdeas,
+      recentMotifs,
+      recentStyleFamilies,
+      recentStyleBuckets,
+      recentExplorationSetKeys,
+      recentRecipeIds,
+      explorationMode,
+      brandMode: project.brandMode,
+      seriesTitle: project.series_title,
+      seriesSubtitle: project.series_subtitle,
+      seriesDescription: project.series_description,
+      designNotes: project.designNotes,
+      topicNames: motifBankContext.topicNames,
+      motifScope: motifBankContext.scriptureScope,
+      primaryThemes: motifBankContext.primaryThemeCandidates,
+      secondaryThemes: motifBankContext.secondaryThemeCandidates,
+      sceneMotifs: motifBankContext.sceneMotifCandidates,
+      sceneMotifRequested: motifBankContext.sceneMotifRequested,
+      curatedRefs,
+      recentReferenceIdsProject: recentReferenceIds.projectRecent,
+      recentReferenceIdsGlobal: recentReferenceIds.globalRecent
+    });
+    const selectedPresetKeys = directionPlan.map((spec) => spec.presetKey);
+    const lockupPresetIds = directionPlan.map((spec) => spec.lockupPresetId);
+    const plannedStyleFamilies = directionPlan.map((spec) => spec.templateStyleFamily) as [StyleFamily, StyleFamily, StyleFamily];
+
+    if (selectedPresetKeys.length < ROUND_OPTION_COUNT || lockupPresetIds.length < ROUND_OPTION_COUNT) {
+      await releaseRoundOneLaunch("FAILED", "insufficient_presets");
+      return { error: "At least three presets are required to generate options." };
+    }
+
+    const refsForOptions = await pickReferenceSetsForRound(project.id, 1, ROUND_OPTION_COUNT, directionPlan);
+    const lockupLayoutsForOptions = resolvePlannedLockupLayouts({
+      seed: `${runSeed}:round-1`,
+      directionPlan,
+      styleFamilies: plannedStyleFamilies,
+      lockupPresetIds,
+      referencesByOption: refsForOptions,
+      forceDistinctRecipes: explorationMode,
+      recentRecipeIds: explorationMode ? recentRecipeIds : undefined,
+      brandMode: project.brandMode,
+      typographyDirection: brandKit?.source === "organization" ? brandKit.typographyDirection : null,
+      round: 1,
+      hasDesignNotes
+    });
+    const inputsByOption = selectedPresetKeys.map((_, index) =>
+      buildGenerationInput(
         project,
-        input,
+        brandKit,
+        selectedPresetKeys,
+        undefined,
+        lockupPresetIds[index],
+        runSeed,
+        plannedStyleFamilies,
+        runSeed,
+        directionPlan,
+        lockupLayoutsForOptions[index]
+      )
+    );
+    for (const input of inputsByOption) {
+      const validatedDesignBrief = validateDesignBrief((input as { designBrief?: unknown }).designBrief);
+      if (!validatedDesignBrief.ok) {
+        await releaseRoundOneLaunch("FAILED", "invalid_design_brief");
+        return {
+          error: `Design brief is invalid: ${validatedDesignBrief.issues.slice(0, 2).join(" | ")}`
+        };
+      }
+    }
+
+    const plannedGenerations: PlannedGeneration[] = selectedPresetKeys.map((presetKey, index) => {
+      const generationId = randomUUID();
+      const references = refsForOptions[index] || [];
+      const input = inputsByOption[index];
+
+      return {
+        id: generationId,
+        presetId: presetIdByKey.get(presetKey) || null,
+        presetKey,
         round: 1,
         optionIndex: index,
-        referenceItems: references,
-        motifBankContext
-      })
-    };
-  });
-
-  await prisma.$transaction(
-    plannedGenerations.map(({ id: generationId, presetId: generationPresetId, input: generationInput }) =>
-      prisma.generation.create({
-        data: {
-          id: generationId,
+        references,
+        input: input as Prisma.InputJsonValue,
+        fallbackOutput: buildFallbackGenerationOutput({
           projectId: project.id,
-          presetId: generationPresetId,
+          presetKey,
+          project,
+          input,
           round: 1,
-          status: "QUEUED",
-          input: generationInput
-        }
-      })
-    )
-  );
-
-  const providerPreflight = await preflightImageProvider();
-  if (!providerPreflight.ok) {
-    await abortRoundForProviderFailure({
-      projectId: project.id,
-      plannedGenerations,
-      providerPreflight
+          optionIndex: index,
+          referenceItems: references,
+          motifBankContext
+        })
+      };
     });
-    redirect(`/app/projects/${projectId}/generations`);
-  }
-  const firstAttemptGenerations = await claimPlannedGenerationAttempts({
-    plannedGenerations,
-    mode: "initial"
-  });
 
-  const shouldEnforceRound1NonFallbackRequirement = !hasDesignNotes;
-  const optionResultByGenerationId = new Map<string, PlannedGenerationRunResult>();
-  let totalRoundAttemptCount = 0;
-  let hardStopFailureReason: BackgroundAttemptFailureReason | null = null;
-  let retryCursor = 0;
-  const upsertResults = (results: PlannedGenerationRunResult[]) => {
-    totalRoundAttemptCount += results.length;
-    for (const result of results) {
-      optionResultByGenerationId.set(result.generationId, result);
-    }
-  };
-  const countCompleted = (): number =>
-    plannedGenerations.filter((generation) => optionResultByGenerationId.get(generation.id)?.optionStatus === "COMPLETED").length;
-
-  const firstAttemptResults = await createOpenAiPreviewAssetsForPlannedGenerations({
-    organizationId: session.organizationId,
-    project,
-    plannedGenerations: firstAttemptGenerations,
-    providerPreflight,
-    bibleCreativeBrief,
-    motifBankContext
-  });
-  upsertResults(firstAttemptResults);
-  hardStopFailureReason = pickRoundOperationalFailureReason(firstAttemptResults.map((result) => result.failureReason));
-  if (!hardStopFailureReason && firstAttemptResults.some((result) => result.failureReason === "BUDGET")) {
-    hardStopFailureReason = "BUDGET";
-  }
-
-  if (shouldEnforceRound1NonFallbackRequirement) {
-    while (
-      !hardStopFailureReason &&
-      countCompleted() < ROUND_OPTION_COUNT &&
-      totalRoundAttemptCount < ROUND1_NON_FALLBACK_MAX_ATTEMPTS
-    ) {
-      const remainingAttempts = ROUND1_NON_FALLBACK_MAX_ATTEMPTS - totalRoundAttemptCount;
-      if (remainingAttempts <= 0) {
-        break;
-      }
-      const incompleteGenerations = plannedGenerations.filter(
-        (generation) => optionResultByGenerationId.get(generation.id)?.optionStatus !== "COMPLETED"
-      );
-      if (incompleteGenerations.length === 0) {
-        break;
-      }
-
-      const batchSize = Math.min(remainingAttempts, incompleteGenerations.length);
-      const retryBatch = Array.from({ length: batchSize }, (_, offset) => {
-        const index = (retryCursor + offset) % incompleteGenerations.length;
-        return incompleteGenerations[index];
-      });
-      retryCursor = incompleteGenerations.length > 0 ? (retryCursor + batchSize) % incompleteGenerations.length : 0;
-      const claimedRetryBatch = await claimPlannedGenerationAttempts({
-        plannedGenerations: retryBatch,
-        mode: "retry"
-      });
-      const retryResults = await createOpenAiPreviewAssetsForPlannedGenerations({
-        organizationId: session.organizationId,
-        project,
-        plannedGenerations: claimedRetryBatch,
-        providerPreflight,
-        bibleCreativeBrief,
-        motifBankContext
-      });
-      upsertResults(retryResults);
-      hardStopFailureReason = pickRoundOperationalFailureReason(retryResults.map((result) => result.failureReason));
-      if (hardStopFailureReason) {
-        break;
-      }
-      if (retryResults.some((result) => result.failureReason === "BUDGET")) {
-        hardStopFailureReason = "BUDGET";
-        break;
-      }
-    }
-  }
-
-  const finalResults = plannedGenerations.map((generation) => {
-    const known = optionResultByGenerationId.get(generation.id);
-    return (
-      known || {
-        generationId: generation.id,
-        optionStatus: "FAILED_GENERATION" as GenerationOptionStatus,
-        failureReason: "UNKNOWN" as BackgroundAttemptFailureReason
-      }
+    roundOneLaunchGenerationIds = plannedGenerations.map((generation) => generation.id);
+    await prisma.$transaction(
+      plannedGenerations.map(({ id: generationId, presetId: generationPresetId, input: generationInput }) =>
+        prisma.generation.create({
+          data: {
+            id: generationId,
+            projectId: project.id,
+            presetId: generationPresetId,
+            round: 1,
+            status: "QUEUED",
+            input: generationInput
+          }
+        })
+      )
     );
-  });
-  await persistFinalRoundOutcome({
-    generationIds: plannedGenerations.map((generation) => generation.id),
-    results: finalResults,
-    roundAttemptCount: totalRoundAttemptCount,
-    roundRequiredCompletedCount: ROUND_OPTION_COUNT
-  });
 
-  redirect(`/app/projects/${projectId}/generations`);
+    const attachedLaunchGenerationIds = await attachRoundOneLaunchGenerationIds({
+      prisma,
+      lease: roundOneLaunchLease,
+      generationIds: roundOneLaunchGenerationIds
+    });
+    if (!attachedLaunchGenerationIds) {
+      console.warn(`[round1-single-flight] generation ids attach missed project=${project.id}`);
+    }
+
+    const providerPreflight = await preflightImageProvider();
+    if (!providerPreflight.ok) {
+      await abortRoundForProviderFailure({
+        projectId: project.id,
+        plannedGenerations,
+        providerPreflight
+      });
+      await releaseRoundOneLaunch("COMPLETED", "provider_preflight_aborted");
+      redirect(roundOneLaunchTarget);
+    }
+    const firstAttemptGenerations = await claimPlannedGenerationAttempts({
+      plannedGenerations,
+      mode: "initial"
+    });
+
+    const shouldEnforceRound1NonFallbackRequirement = !hasDesignNotes;
+    const optionResultByGenerationId = new Map<string, PlannedGenerationRunResult>();
+    let totalRoundAttemptCount = 0;
+    let hardStopFailureReason: BackgroundAttemptFailureReason | null = null;
+    let retryCursor = 0;
+    const upsertResults = (results: PlannedGenerationRunResult[]) => {
+      totalRoundAttemptCount += results.length;
+      for (const result of results) {
+        optionResultByGenerationId.set(result.generationId, result);
+      }
+    };
+    const countCompleted = (): number =>
+      plannedGenerations.filter((generation) => optionResultByGenerationId.get(generation.id)?.optionStatus === "COMPLETED").length;
+
+    const firstAttemptResults = await createOpenAiPreviewAssetsForPlannedGenerations({
+      organizationId: session.organizationId,
+      project,
+      plannedGenerations: firstAttemptGenerations,
+      providerPreflight,
+      bibleCreativeBrief,
+      motifBankContext
+    });
+    upsertResults(firstAttemptResults);
+    hardStopFailureReason = pickRoundOperationalFailureReason(firstAttemptResults.map((result) => result.failureReason));
+    if (!hardStopFailureReason && firstAttemptResults.some((result) => result.failureReason === "BUDGET")) {
+      hardStopFailureReason = "BUDGET";
+    }
+
+    if (shouldEnforceRound1NonFallbackRequirement) {
+      while (
+        !hardStopFailureReason &&
+        countCompleted() < ROUND_OPTION_COUNT &&
+        totalRoundAttemptCount < ROUND1_NON_FALLBACK_MAX_ATTEMPTS
+      ) {
+        const remainingAttempts = ROUND1_NON_FALLBACK_MAX_ATTEMPTS - totalRoundAttemptCount;
+        if (remainingAttempts <= 0) {
+          break;
+        }
+        const incompleteGenerations = plannedGenerations.filter(
+          (generation) => optionResultByGenerationId.get(generation.id)?.optionStatus !== "COMPLETED"
+        );
+        if (incompleteGenerations.length === 0) {
+          break;
+        }
+
+        const batchSize = Math.min(remainingAttempts, incompleteGenerations.length);
+        const retryBatch = Array.from({ length: batchSize }, (_, offset) => {
+          const index = (retryCursor + offset) % incompleteGenerations.length;
+          return incompleteGenerations[index];
+        });
+        retryCursor = incompleteGenerations.length > 0 ? (retryCursor + batchSize) % incompleteGenerations.length : 0;
+        const claimedRetryBatch = await claimPlannedGenerationAttempts({
+          plannedGenerations: retryBatch,
+          mode: "retry"
+        });
+        const retryResults = await createOpenAiPreviewAssetsForPlannedGenerations({
+          organizationId: session.organizationId,
+          project,
+          plannedGenerations: claimedRetryBatch,
+          providerPreflight,
+          bibleCreativeBrief,
+          motifBankContext
+        });
+        upsertResults(retryResults);
+        hardStopFailureReason = pickRoundOperationalFailureReason(retryResults.map((result) => result.failureReason));
+        if (hardStopFailureReason) {
+          break;
+        }
+        if (retryResults.some((result) => result.failureReason === "BUDGET")) {
+          hardStopFailureReason = "BUDGET";
+          break;
+        }
+      }
+    }
+
+    const finalResults = plannedGenerations.map((generation) => {
+      const known = optionResultByGenerationId.get(generation.id);
+      return (
+        known || {
+          generationId: generation.id,
+          optionStatus: "FAILED_GENERATION" as GenerationOptionStatus,
+          failureReason: "UNKNOWN" as BackgroundAttemptFailureReason
+        }
+      );
+    });
+    await persistFinalRoundOutcome({
+      generationIds: plannedGenerations.map((generation) => generation.id),
+      results: finalResults,
+      roundAttemptCount: totalRoundAttemptCount,
+      roundRequiredCompletedCount: ROUND_OPTION_COUNT
+    });
+
+    await releaseRoundOneLaunch("COMPLETED", "round_settled");
+    redirect(roundOneLaunchTarget);
+  } catch (error) {
+    if (!roundOneLaunchReleased) {
+      await releaseRoundOneLaunch("FAILED", summarizeRoundOneLaunchError(error));
+    }
+    throw error;
+  }
 }
 
 export async function generateRoundTwoAction(
