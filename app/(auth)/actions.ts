@@ -6,10 +6,6 @@ import { createSession, hashPassword, verifyPassword } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { slugify } from "@/lib/utils";
 
-export type AuthActionState = {
-  error?: string;
-};
-
 const loginSchema = z.object({
   email: z.string().email().trim().toLowerCase(),
   password: z.string().min(8)
@@ -21,6 +17,11 @@ const signupSchema = z.object({
   password: z.string().min(8),
   organizationName: z.string().trim().min(2).max(120)
 });
+
+function redirectToAuthError(path: "/login" | "/signup", error: string): never {
+  const params = new URLSearchParams({ error });
+  redirect(`${path}?${params.toString()}`);
+}
 
 async function nextOrganizationSlug(name: string) {
   const base = slugify(name) || "organization";
@@ -35,14 +36,14 @@ async function nextOrganizationSlug(name: string) {
   return slug;
 }
 
-export async function loginAction(_: AuthActionState, formData: FormData): Promise<AuthActionState> {
+export async function loginAction(formData: FormData): Promise<void> {
   const parsed = loginSchema.safeParse({
     email: formData.get("email"),
     password: formData.get("password")
   });
 
   if (!parsed.success) {
-    return { error: "Enter a valid email and password." };
+    redirectToAuthError("/login", "Enter a valid email and password.");
   }
 
   const user = await prisma.user.findUnique({
@@ -56,12 +57,12 @@ export async function loginAction(_: AuthActionState, formData: FormData): Promi
   });
 
   if (!user) {
-    return { error: "Invalid credentials." };
+    redirectToAuthError("/login", "Invalid credentials.");
   }
 
   const passwordOk = await verifyPassword(parsed.data.password, user.passwordHash);
   if (!passwordOk) {
-    return { error: "Invalid credentials." };
+    redirectToAuthError("/login", "Invalid credentials.");
   }
 
   let membership = user.memberships[0];
@@ -93,7 +94,7 @@ export async function loginAction(_: AuthActionState, formData: FormData): Promi
   redirect("/app/projects");
 }
 
-export async function signupAction(_: AuthActionState, formData: FormData): Promise<AuthActionState> {
+export async function signupAction(formData: FormData): Promise<void> {
   const parsed = signupSchema.safeParse({
     name: formData.get("name"),
     email: formData.get("email"),
@@ -102,13 +103,13 @@ export async function signupAction(_: AuthActionState, formData: FormData): Prom
   });
 
   if (!parsed.success) {
-    return { error: "Please complete all fields with valid values." };
+    redirectToAuthError("/signup", "Please complete all fields with valid values.");
   }
 
   const existingUser = await prisma.user.findUnique({ where: { email: parsed.data.email } });
 
   if (existingUser) {
-    return { error: "An account with this email already exists." };
+    redirectToAuthError("/signup", "An account with this email already exists.");
   }
 
   const passwordHash = await hashPassword(parsed.data.password);

@@ -1,16 +1,10 @@
-"use client";
-
 import Link from "next/link";
-import { useActionState } from "react";
-import { loginAction, type AuthActionState } from "@/app/(auth)/actions";
+import { loginAction } from "@/app/(auth)/actions";
+import { AuthSubmitButton } from "@/components/auth-submit-button";
 
-const initialState: AuthActionState = {};
-
-export function LoginForm() {
-  const [state, action, pending] = useActionState(loginAction, initialState);
-
+export function LoginForm({ error }: { error?: string }) {
   return (
-    <form action={action} className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+    <form action={loginAction} className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
       <h1 className="text-xl font-semibold">Log in</h1>
       <p className="text-sm text-slate-600">Use your GraceLed account to continue.</p>
 
@@ -43,15 +37,9 @@ export function LoginForm() {
         />
       </div>
 
-      {state.error ? <p className="text-sm text-red-700">{state.error}</p> : null}
+      {error ? <p className="text-sm text-red-700">{error}</p> : null}
 
-      <button
-        type="submit"
-        disabled={pending}
-        className="w-full rounded-md bg-pine px-4 py-2 font-medium text-white disabled:opacity-60"
-      >
-        {pending ? "Logging in..." : "Log in"}
-      </button>
+      <AuthSubmitButton idleLabel="Log in" pendingLabel="Logging in..." />
 
       <p className="text-sm text-slate-600">
         Need an account? <Link href="/signup">Create one</Link>

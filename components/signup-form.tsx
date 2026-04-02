@@ -1,16 +1,10 @@
-"use client";
-
 import Link from "next/link";
-import { useActionState } from "react";
-import { signupAction, type AuthActionState } from "@/app/(auth)/actions";
+import { signupAction } from "@/app/(auth)/actions";
+import { AuthSubmitButton } from "@/components/auth-submit-button";
 
-const initialState: AuthActionState = {};
-
-export function SignupForm() {
-  const [state, action, pending] = useActionState(signupAction, initialState);
-
+export function SignupForm({ error }: { error?: string }) {
   return (
-    <form action={action} className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+    <form action={signupAction} className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
       <h1 className="text-xl font-semibold">Create your account</h1>
       <p className="text-sm text-slate-600">Set up your first organization workspace.</p>
 
@@ -69,15 +63,9 @@ export function SignupForm() {
         />
       </div>
 
-      {state.error ? <p className="text-sm text-red-700">{state.error}</p> : null}
+      {error ? <p className="text-sm text-red-700">{error}</p> : null}
 
-      <button
-        type="submit"
-        disabled={pending}
-        className="w-full rounded-md bg-pine px-4 py-2 font-medium text-white disabled:opacity-60"
-      >
-        {pending ? "Creating account..." : "Create account"}
-      </button>
+      <AuthSubmitButton idleLabel="Create account" pendingLabel="Creating account..." />
 
       <p className="text-sm text-slate-600">
         Already have an account? <Link href="/login">Log in</Link>
