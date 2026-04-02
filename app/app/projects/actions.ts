@@ -58,6 +58,12 @@ import {
   attachRoundOneLaunchGenerationIds,
   finalizeRoundOneLaunchSingleFlight
 } from "@/lib/graphics-domain/round1-launch-single-flight";
+import {
+  assertGenerationAttemptStillActive,
+  finalizeRoundOneAuthoritativeSettlement,
+  withSettledGenerationExecutionOutput,
+  type RoundOneGenerationTerminalization
+} from "@/lib/graphics-domain/round1-authoritative-settlement";
 import { resolveRound1LiveWorkBudget } from "@/lib/graphics-domain/round1-live-work-budget";
 import {
   GRAPHICS_BACKGROUND_PROMPT_VERSION,
@@ -6362,6 +6368,8 @@ function isClaimedGenerationExecutionTimeoutError(error: unknown): boolean {
   return error instanceof ClaimedGenerationExecutionTimeoutError;
 }
 
+const CLAIMED_GENERATION_EXECUTION_AUTHORITY_RECHECK_MS = 250;
+
 type ClaimedGenerationExecutionTimeoutLease = {
   abort: (reason: unknown) => void;
   throwIfTimedOut: () => void;
@@ -6421,6 +6429,32 @@ function createClaimedGenerationExecutionTimeoutLease(params: {
         finalizedRunIds.add(runId);
       }
     }
+  };
+}
+
+function createClaimedGenerationExecutionActiveAssertion(params: {
+  generationId: string;
+  attemptOwner: GenerationAttemptOwner;
+  executionLease: ClaimedGenerationExecutionTimeoutLease;
+  minRecheckMs?: number;
+}): () => Promise<void> {
+  let lastAuthorityCheckAt = 0;
+  const minRecheckMs = params.minRecheckMs ?? CLAIMED_GENERATION_EXECUTION_AUTHORITY_RECHECK_MS;
+
+  return async () => {
+    params.executionLease.throwIfTimedOut();
+
+    const now = Date.now();
+    if (now - lastAuthorityCheckAt < minRecheckMs) {
+      return;
+    }
+
+    await assertGenerationAttemptStillActive({
+      prisma,
+      generationId: params.generationId,
+      attemptOwner: params.attemptOwner
+    });
+    lastAuthorityCheckAt = now;
   };
 }
 
@@ -9173,6 +9207,189 @@ type PlannedGenerationRunResult = {
   failureReason: BackgroundAttemptFailureReason | null;
 };
 
+function readTerminalGenerationOutputStatus(output: Prisma.JsonValue | null): Exclude<GenerationOptionStatus, "IN_PROGRESS"> | null {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+
+  const status = (output as { status?: unknown }).status;
+  if (status === "COMPLETED" || status === "FAILED_GENERATION" || status === "FALLBACK") {
+    return status;
+  }
+
+  return null;
+}
+
+async function reconcileRoundOneAuthoritativeSettlement(params: {
+  projectId: string;
+  lease: Parameters<typeof finalizeRoundOneAuthoritativeSettlement>[0]["lease"];
+  plannedGenerations: PlannedGeneration[];
+  results: PlannedGenerationRunResult[];
+  roundAttemptCount: number;
+  roundRequiredCompletedCount: number;
+  providerPreflight: ImageProviderPreflightResult;
+}): Promise<{
+  reconciledGenerationIds: string[];
+  abandonedRunIds: string[];
+  abandonedAttemptIds: string[];
+  finalized: boolean;
+  roundOutcome: PersistedRoundOutcomeSummary;
+}> {
+  const resultByGenerationId = new Map(params.results.map((result) => [result.generationId, result] as const));
+  const persistedRows = await prisma.generation.findMany({
+    where: {
+      id: {
+        in: params.plannedGenerations.map((generation) => generation.id)
+      }
+    },
+    select: {
+      id: true,
+      status: true,
+      output: true
+    }
+  });
+  const persistedRowById = new Map(persistedRows.map((row) => [row.id, row] as const));
+  const generationTerminalizations: RoundOneGenerationTerminalization[] = [];
+
+  for (const plannedGeneration of params.plannedGenerations) {
+    const persistedRow = persistedRowById.get(plannedGeneration.id);
+    if (!persistedRow) {
+      continue;
+    }
+
+    const directOutputStatus = readTerminalGenerationOutputStatus(persistedRow.output);
+    const roundResult = resultByGenerationId.get(plannedGeneration.id);
+    const desiredOptionStatus =
+      roundResult?.optionStatus === "IN_PROGRESS"
+        ? directOutputStatus || "FAILED_GENERATION"
+        : roundResult?.optionStatus || directOutputStatus || "FAILED_GENERATION";
+
+    if (desiredOptionStatus === "COMPLETED") {
+      const completionOutput =
+        directOutputStatus === "COMPLETED"
+          ? withSettledGenerationExecutionOutput(persistedRow.output)
+          : null;
+      if (!completionOutput) {
+        continue;
+      }
+
+      generationTerminalizations.push({
+        generationId: plannedGeneration.id,
+        status: "COMPLETED",
+        output: completionOutput
+      });
+      continue;
+    }
+
+    if (desiredOptionStatus === "FALLBACK") {
+      const optionStatus = await completeGenerationWithFallbackOutput({
+        projectId: params.projectId,
+        generationId: plannedGeneration.id,
+        output: plannedGeneration.fallbackOutput,
+        failureReason: roundResult?.failureReason || "UNKNOWN",
+        providerPreflight: params.providerPreflight
+      });
+      const fallbackRow = await prisma.generation.findUnique({
+        where: {
+          id: plannedGeneration.id
+        },
+        select: {
+          output: true
+        }
+      });
+      if (optionStatus === "FALLBACK" && fallbackRow?.output) {
+        generationTerminalizations.push({
+          generationId: plannedGeneration.id,
+          status: "FAILED",
+          output: withSettledGenerationExecutionOutput(fallbackRow.output),
+          clearAssetSlots: PREVIEW_ASSET_SLOTS_TO_CLEAR
+        });
+      }
+      continue;
+    }
+
+    const failedOutput =
+      directOutputStatus === "FAILED_GENERATION" || directOutputStatus === "FALLBACK"
+        ? withSettledGenerationExecutionOutput(persistedRow.output)
+        : null;
+    if (failedOutput) {
+      generationTerminalizations.push({
+        generationId: plannedGeneration.id,
+        status: "FAILED",
+        output: failedOutput,
+        clearAssetSlots: PREVIEW_ASSET_SLOTS_TO_CLEAR
+      });
+      continue;
+    }
+
+    await persistMinimalFailedGenerationSettlement({
+      generationId: plannedGeneration.id,
+      output: plannedGeneration.fallbackOutput,
+      failureReason: roundResult?.failureReason || "UNKNOWN",
+      providerPreflight: params.providerPreflight,
+      input: plannedGeneration.input,
+      notes: "round_authoritative_settlement",
+      warningMessages: [
+        "Round-level settlement finalized an exhausted generation after terminal row convergence failed."
+      ]
+    });
+    const minimalFailureRow = await prisma.generation.findUnique({
+      where: {
+        id: plannedGeneration.id
+      },
+      select: {
+        output: true
+      }
+    });
+    if (minimalFailureRow?.output) {
+      generationTerminalizations.push({
+        generationId: plannedGeneration.id,
+        status: "FAILED",
+        output: withSettledGenerationExecutionOutput(minimalFailureRow.output),
+        clearAssetSlots: PREVIEW_ASSET_SLOTS_TO_CLEAR
+      });
+    }
+  }
+
+  const initialRoundOutcome = await persistFinalRoundOutcome({
+    generationIds: params.plannedGenerations.map((generation) => generation.id),
+    results: params.results,
+    roundAttemptCount: params.roundAttemptCount,
+    roundRequiredCompletedCount: params.roundRequiredCompletedCount
+  });
+  const launchTerminalStatus = initialRoundOutcome.roundStatus === "COMPLETED" ? "COMPLETED" : "FAILED";
+  const settlement = await finalizeRoundOneAuthoritativeSettlement({
+    prisma,
+    lease: params.lease,
+    generationTerminalizations,
+    launchTerminalStatus,
+    note: "round_authoritative_settlement",
+    staleWorkMessage: "Round 1 authoritative settlement terminalized lingering background work after the launch was exhausted.",
+    staleWorkAttemptOutputJson: {
+      projectId: params.projectId,
+      abandonedReason: "ROUND_TERMINALIZED"
+    },
+    staleWorkRunMetadataJson: {
+      projectId: params.projectId,
+      terminalizationReason: "ROUND_TERMINALIZED"
+    }
+  });
+  const roundOutcome = await persistFinalRoundOutcome({
+    generationIds: params.plannedGenerations.map((generation) => generation.id),
+    results: params.results,
+    roundAttemptCount: params.roundAttemptCount,
+    roundRequiredCompletedCount: params.roundRequiredCompletedCount
+  });
+
+  return {
+    reconciledGenerationIds: settlement.reconciledGenerationIds,
+    abandonedRunIds: settlement.abandonedRunIds,
+    abandonedAttemptIds: settlement.abandonedAttemptIds,
+    finalized: settlement.finalized,
+    roundOutcome
+  };
+}
+
 function withRoundDebugStatusOutput(
   output: unknown,
   params: {
@@ -9292,12 +9509,20 @@ function pickRoundOperationalFailureReason(
   return null;
 }
 
+type PersistedRoundOutcomeSummary = {
+  completedCount: number;
+  roundHasFallback: boolean;
+  roundStatus: GenerationRoundStatus;
+  roundFailureReason: GenerationRoundFailureReason | null;
+  roundOperationalFailureReason: ProviderFailureReason | null;
+};
+
 async function persistFinalRoundOutcome(params: {
   generationIds: string[];
   results: PlannedGenerationRunResult[];
   roundAttemptCount: number;
   roundRequiredCompletedCount: number;
-}): Promise<void> {
+}): Promise<PersistedRoundOutcomeSummary> {
   const persistedRows = await loadPersistedGenerationTruthRows(params.generationIds);
   const persistedStatuses = params.generationIds.map((generationId) => {
     const persistedRow = persistedRows.get(generationId);
@@ -9334,6 +9559,14 @@ async function persistFinalRoundOutcome(params: {
     roundFailureReason,
     roundOperationalFailureReason
   });
+
+  return {
+    completedCount,
+    roundHasFallback,
+    roundStatus,
+    roundFailureReason,
+    roundOperationalFailureReason
+  };
 }
 
 async function abortRoundForProviderFailure(params: {
@@ -9486,7 +9719,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         generationId: plannedGeneration.id,
         timeoutMs: claimedGenerationExecutionTimeoutMs
       });
-      const assertClaimedGenerationExecutionActive = () => executionLease.throwIfTimedOut();
+      const assertClaimedGenerationExecutionActive = createClaimedGenerationExecutionActiveAssertion({
+        generationId: plannedGeneration.id,
+        attemptOwner: plannedGeneration.attemptOwner,
+        executionLease
+      });
       try {
       let executionTimeoutId: ReturnType<typeof setTimeout> | null = null;
       try {
@@ -12319,7 +12556,7 @@ export async function generateRoundOneAction(
         plannedGenerations,
         providerPreflight
       });
-      await releaseRoundOneLaunch("COMPLETED", "provider_preflight_aborted");
+      await releaseRoundOneLaunch("FAILED", "provider_preflight_aborted");
       redirect(roundOneLaunchTarget);
     }
     const firstAttemptGenerations = await claimPlannedGenerationAttempts({
@@ -12412,14 +12649,23 @@ export async function generateRoundOneAction(
         }
       );
     });
-    await persistFinalRoundOutcome({
-      generationIds: plannedGenerations.map((generation) => generation.id),
+    const authoritativeSettlement = await reconcileRoundOneAuthoritativeSettlement({
+      projectId: project.id,
+      lease: roundOneLaunchLease,
+      plannedGenerations,
       results: finalResults,
       roundAttemptCount: totalRoundAttemptCount,
-      roundRequiredCompletedCount: ROUND_OPTION_COUNT
+      roundRequiredCompletedCount: ROUND_OPTION_COUNT,
+      providerPreflight
     });
 
-    await releaseRoundOneLaunch("COMPLETED", "round_settled");
+    roundOneLaunchReleased = authoritativeSettlement.finalized;
+    if (!roundOneLaunchReleased) {
+      await releaseRoundOneLaunch(
+        authoritativeSettlement.roundOutcome.roundStatus === "COMPLETED" ? "COMPLETED" : "FAILED",
+        "round_authoritative_settlement_retry"
+      );
+    }
     redirect(roundOneLaunchTarget);
   } catch (error) {
     if (!roundOneLaunchReleased) {

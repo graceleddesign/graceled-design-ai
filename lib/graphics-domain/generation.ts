@@ -60,6 +60,24 @@ export async function createGraphicsBackgroundAiRun(params: {
     metadataJson: params.metadataJson ?? null
   });
   await params.onRunCreated?.(run);
+  try {
+    await params.assertActive?.();
+  } catch (error) {
+    await abandonAiRuns({
+      runIds: [run.id],
+      errorClass: "TIMEOUT",
+      message: `Background AI run created after generation ${params.generationId} was no longer active.`,
+      attemptOutputJson: {
+        generationId: params.generationId,
+        abandonedReason: "CLAIM_INACTIVE_AFTER_RUN_CREATE"
+      },
+      runMetadataJson: {
+        generationId: params.generationId,
+        terminalizationReason: "CLAIM_INACTIVE_AFTER_RUN_CREATE"
+      }
+    });
+    throw error;
+  }
 
   return {
     run
