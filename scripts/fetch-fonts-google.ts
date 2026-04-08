@@ -211,7 +211,7 @@ async function runAdd(args: ParsedArgs): Promise<void> {
     subsets: args.subsets
   });
 
-  let googleAssets = [...GOOGLE_FONT_ASSETS];
+  let googleAssets: FontAsset[] = [...GOOGLE_FONT_ASSETS];
   const allAssets = mergeFontAssets(LOCAL_FONT_ASSETS, googleAssets);
 
   googleAssets = upsertFontFamilyVariants({
@@ -233,7 +233,7 @@ async function runAdd(args: ParsedArgs): Promise<void> {
 }
 
 async function runSync(args: ParsedArgs): Promise<void> {
-  let googleAssets = [...GOOGLE_FONT_ASSETS];
+  let googleAssets: FontAsset[] = [...GOOGLE_FONT_ASSETS];
   let allAssets = mergeFontAssets(LOCAL_FONT_ASSETS, googleAssets);
   let manifestChanged = false;
   const attemptedFamilies = new Set<string>();

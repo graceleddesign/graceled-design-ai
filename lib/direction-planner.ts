@@ -12,6 +12,7 @@ import {
 import {
   isStyleBucketKey,
   isStyleFamilyKey,
+  isStyleToneKey,
   STYLE_FAMILY_BANK,
   STYLE_FAMILY_KEYS,
   type StyleBucketKey,

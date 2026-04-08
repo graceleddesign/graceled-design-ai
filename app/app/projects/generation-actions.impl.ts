@@ -139,6 +139,7 @@ import {
   resolveProductionValidOption,
   resolveProductionValidOptionStatus,
   type BackgroundAcceptanceResult,
+  type DebugAssetSource,
   type GenerationAssetRecord,
   type LockupAcceptanceResult,
   type ProductionBackgroundValidationEvidence,
@@ -3363,7 +3364,7 @@ function normalizeRefinementFeedbackDeltas(value: unknown): RefinementFeedbackDe
     return [];
   }
   return value
-    .map((item) => {
+    .map((item): RefinementFeedbackDelta | null => {
       if (!item || typeof item !== "object" || Array.isArray(item)) {
         return null;
       }
@@ -3405,7 +3406,7 @@ function normalizeRefinementFeedbackDeltas(value: unknown): RefinementFeedbackDe
         variantMutations: normalizeRefinementVariantMutations(typed.variantMutations)
       } satisfies RefinementFeedbackDelta;
     })
-    .filter((item): item is RefinementFeedbackDelta => Boolean(item));
+    .filter((item): item is RefinementFeedbackDelta => item !== null);
 }
 
 function normalizeRefinementLockedStyleInvariants(value: unknown): RefinementLockedStyleInvariants | null {
@@ -3945,7 +3946,9 @@ const BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY = [
 ] as const;
 
 function normalizeBackgroundRecoveryReasons(reasons: string[]): string[] {
-  const priority = new Map(BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY.map((reason, index) => [reason, index] as const));
+  const priority = new Map<string, number>(
+    BACKGROUND_RECOVERY_INVALID_REASON_PRIORITY.map((reason, index) => [reason, index] as const)
+  );
   return [...new Set(reasons.filter((reason) => typeof reason === "string" && reason.trim().length > 0))]
     .sort((left, right) => {
       const leftPriority = priority.get(left) ?? Number.MAX_SAFE_INTEGER;
@@ -6150,7 +6153,6 @@ type BackgroundRerankFallbackDebug = {
   attempts: number;
 };
 
-type DebugAssetSource = "generated" | "reused" | "fallback";
 type BackgroundAttemptFailureReason = GenerationFailureReason;
 type ImageCallStage = "background" | "lockup";
 type ImageCallAspect = "wide" | "square" | "vertical";
@@ -8380,9 +8382,12 @@ async function ensureCanonicalFinalistOutputs(params: {
   optionIndex: number;
   optionStyleFamily: StyleFamily;
   templateBrief: TemplateBrief;
-  content: ReturnType<typeof buildOverlayDisplayContent>;
-  lockupRecipe: LockupRecipe | undefined;
-  lockupPresetId: string;
+  content: {
+    title: string;
+    subtitle: string;
+  };
+  lockupRecipe: LockupRecipe;
+  lockupPresetId?: string | null;
   fontSeed: string;
   lockupIntegrationMode: LockupIntegrationMode;
   directionSpec: PlannedDirectionSpec | null;
@@ -10848,10 +10853,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const startIndex = aggregatedCandidates.length;
           aggregatedCandidates.push(...result.candidates);
           backgroundAttempts.push(result.attemptDebug);
-          if (result.winner) {
-            globalWinnerIndex = startIndex + result.winnerIndex;
+          const attemptWinner = result.winner;
+          const attemptWinnerIndex = result.winnerIndex;
+          if (attemptWinner && attemptWinnerIndex !== null) {
+            globalWinnerIndex = startIndex + attemptWinnerIndex;
             winner = {
-              ...result.winner,
+              ...attemptWinner,
               index: globalWinnerIndex
             };
           }
@@ -11163,11 +11170,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           textScrub: initialMasterSelection.textScrub || null,
           backgroundRecovery: initialMasterSelection.backgroundRecovery
         });
-        return {
+        provisionalResult = {
           generationId: plannedGeneration.id,
           optionStatus: fallbackResult.optionStatus,
           failureReason: fallbackResult.failureReason
         };
+        return;
       }
       let masterAttempt = initialMasterSelection.attempt;
       let selectedBackgroundTextScrub = initialMasterSelection.textScrub || masterAttempt.textScrubDebug || null;
@@ -11187,11 +11195,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             textScrub: originalityMasterSelection.textScrub || selectedBackgroundTextScrub,
             backgroundRecovery: originalityMasterSelection.backgroundRecovery
           });
-          return {
+          provisionalResult = {
             generationId: plannedGeneration.id,
             optionStatus: fallbackResult.optionStatus,
             failureReason: fallbackResult.failureReason
           };
+          return;
         }
         masterAttempt = originalityMasterSelection.attempt;
         selectedBackgroundTextScrub = originalityMasterSelection.textScrub || masterAttempt.textScrubDebug || selectedBackgroundTextScrub;
@@ -11812,7 +11821,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
       const completionValidation = resolveProductionValidOption({
         output: completedOutput,
         dbStatus: "COMPLETED",
-        assets: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows]
+        assets: [...backgroundAssetRows, lockupAssetRow, ...finalAssetRows].map(r => ({
+          kind: r.kind!,
+          slot: r.slot ?? null,
+          file_path: r.file_path
+        }))
       });
       const persistedProductionValidation = toPersistedProductionValidationSnapshot(completionValidation);
       const completedOutputWithValidation: GenerationOutputPayload = {
