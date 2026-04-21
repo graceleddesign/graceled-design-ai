@@ -10,6 +10,8 @@ import type {
   AiRunStatus
 } from "@/lib/ai-harness/core/types";
 import { readAiErrorClass, readAiProviderErrorMetadata } from "@/lib/ai-harness/core/errors";
+import { generateFalImage } from "@/lib/fal-image";
+import { buildFluxBackgroundPrompt } from "@/lib/graphics-domain/flux-prompt";
 import { resolveGraphicsBackgroundImageSize, type GraphicsPreviewShape } from "@/lib/graphics-domain/assets";
 import {
   GRAPHICS_BACKGROUND_FEATURE_KEY,
@@ -24,7 +26,7 @@ export type GraphicsBackgroundAiRunHandle = {
 
 export type GraphicsBackgroundAiAttemptTrace = {
   runId: string;
-  attemptId: string;
+  attemptId: string | null;
   providerKey: string;
   modelKey: string;
   providerModel: string;
@@ -159,7 +161,55 @@ export async function runGraphicsBackgroundImageGeneration(params: {
   meta?: {
     debug?: GptImageDebugMeta;
   };
+  // Optional fields used by the Flux prompt builder (ignored by OpenAI path).
+  brief?: { title: string; seriesDescription?: string; scripture?: string | null };
+  bibleCreativeBrief?: { themes: string[]; motifs: string[]; markIdeas: string[] } | null;
+  motifFocus?: string[];
+  styleFamily?: { name: string };
+  tone?: string;
+  directionSpec?: { lanePrompt?: string };
 }): Promise<{ imagePng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
+  if (process.env.FAL_API_KEY?.trim()) {
+    const sizeStr = resolveGraphicsBackgroundImageSize(params.shape);
+    const [widthStr, heightStr] = sizeStr.split("x");
+    const width = parseInt(widthStr, 10);
+    const height = parseInt(heightStr, 10);
+    const falPrompt = buildFluxBackgroundPrompt({
+      seriesTitle: params.brief?.title ?? "",
+      seriesDescription: params.brief?.seriesDescription,
+      scripturePassages: params.brief?.scripture ?? undefined,
+      bibleCreativeBrief: params.bibleCreativeBrief,
+      motifFocus: params.motifFocus,
+      styleFamily: params.styleFamily?.name,
+      tone: params.tone,
+      lanePrompt: params.directionSpec?.lanePrompt,
+      generationId: params.runHandle?.run?.id ?? "unknown",
+    });
+    console.log("[FLUX PROMPT]", falPrompt);
+    let b64: string;
+    try {
+      b64 = await generateFalImage(falPrompt, width, height);
+    } catch (falErr) {
+      console.error("[FAL ERROR]", String(falErr));
+      throw falErr;
+    }
+    const imagePng = Buffer.from(b64, "base64");
+    return {
+      imagePng,
+      aiTrace: {
+        runId: params.runHandle.run.id,
+        attemptId: null,
+        providerKey: "fal",
+        modelKey: "flux-dev",
+        providerModel: "fal-ai/flux/dev",
+        providerConfigVersion: "1",
+        operationKey: "generate_background_image",
+        promptVersion: params.promptVersion ?? GRAPHICS_BACKGROUND_PROMPT_VERSION,
+        providerRequestId: null
+      }
+    };
+  }
+
   const trace = await generateImageWithOpenAiHarness({
     run: params.runHandle.run,
     operationKey: "generate_background_image",
