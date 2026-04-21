@@ -2,13 +2,9 @@ import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 import { Prisma } from "@prisma/client";
-import sharp from "sharp";
 import { getSession } from "@/lib/auth";
 import { buildFallbackDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { buildFinalSvg } from "@/lib/final-deliverables";
-import { generatePngFromPrompt } from "@/lib/openai-image";
 import { prisma } from "@/lib/prisma";
-import { pickStyleRefsForOptions } from "@/lib/style-library";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -123,6 +119,7 @@ async function writePreviewFile(fileName: string, png: Buffer): Promise<string> 
 }
 
 async function normalizePngToShape(png: Buffer, shape: PreviewShape): Promise<Buffer> {
+  const sharp = (await import("sharp")).default;
   const dimensions = PREVIEW_DIMENSIONS[shape];
   return sharp(png)
     .resize({
@@ -136,6 +133,8 @@ async function normalizePngToShape(png: Buffer, shape: PreviewShape): Promise<Bu
 }
 
 async function renderCompositedPreviewPng(designDoc: DesignDoc): Promise<Buffer> {
+  const { buildFinalSvg } = await import("@/lib/final-deliverables");
+  const sharp = (await import("sharp")).default;
   const svg = await buildFinalSvg(designDoc);
   return sharp(Buffer.from(svg))
     .resize({
@@ -240,6 +239,7 @@ export async function GET() {
 
   const generationId = randomUUID();
   const palette = parsePaletteJson(project.brandKit.paletteJson);
+  const { pickStyleRefsForOptions } = await import("@/lib/style-library");
   const refs = (await pickStyleRefsForOptions(1))[0] || [];
 
   const input = {
@@ -275,6 +275,7 @@ export async function GET() {
     });
 
     const references = refs.map((ref) => ({ dataUrl: ref.dataUrl }));
+    const { generatePngFromPrompt } = await import("@/lib/openai-image");
     const masterBgSourcePng = await generatePngFromPrompt({
       prompt: masterPrompt,
       size: OPENAI_IMAGE_SIZE_BY_SHAPE[OPTION_MASTER_BACKGROUND_SHAPE],

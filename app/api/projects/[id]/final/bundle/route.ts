@@ -1,9 +1,6 @@
 import { readFile } from "fs/promises";
 import path from "path";
-import JSZip from "jszip";
-import { buildFinalBundle } from "@/lib/final-deliverables";
-import { loadAuthorizedFinalDesign } from "@/lib/final-deliverables-api";
-import { buildProductionBlockedMessage } from "@/lib/production-valid-option";
+import type JSZipType from "jszip";
 
 function resolvePublicAssetAbsolutePath(filePath: string): string | null {
   if (!filePath.trim() || /^https?:\/\//i.test(filePath) || /^data:/i.test(filePath)) {
@@ -21,7 +18,7 @@ function resolvePublicAssetAbsolutePath(filePath: string): string | null {
 }
 
 async function addAssetFileOrThrow(params: {
-  zip: JSZip;
+  zip: JSZipType;
   filePath: string | null;
   archivePath: string;
   label: string;
@@ -44,6 +41,10 @@ async function addAssetFileOrThrow(params: {
 
 export async function GET(_: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
+  const { loadAuthorizedFinalDesign } = await import("@/lib/final-deliverables-api");
+  const { buildFinalBundle } = await import("@/lib/final-deliverables");
+  const { buildProductionBlockedMessage } = await import("@/lib/production-valid-option");
+  const JSZip = (await import("jszip")).default;
   const finalDesign = await loadAuthorizedFinalDesign(id);
 
   if (!finalDesign.ok) {

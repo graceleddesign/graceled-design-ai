@@ -1,8 +1,7 @@
-import { buildFinalPng } from "@/lib/final-deliverables";
-import { loadAuthorizedFinalDesign } from "@/lib/final-deliverables-api";
-
 export async function GET(_: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
+  const { loadAuthorizedFinalDesign } = await import("@/lib/final-deliverables-api");
+  const { buildFinalPng } = await import("@/lib/final-deliverables");
   const finalDesign = await loadAuthorizedFinalDesign(id);
 
   if (!finalDesign.ok) {

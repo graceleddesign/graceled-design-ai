@@ -1,14 +1,10 @@
 import { readFile } from "fs/promises";
 import path from "path";
-import sharp from "sharp";
 import { getSession } from "@/lib/auth";
-import { extractBibleCreativeBrief } from "@/lib/bible-creative-brief";
 import { resolveEffectiveBrandKit } from "@/lib/brand-kit";
 import { buildFallbackDesignDoc, normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { buildFinalSvg } from "@/lib/final-deliverables";
-import { composeLockupOnBackground, LOCKUP_SAFE_REGION_RATIOS, type LockupIntegrationMode } from "@/lib/lockup-compositor";
 import { prisma } from "@/lib/prisma";
-import { resolveProductionValidOption, toAssetUrl } from "@/lib/production-valid-option";
+import type { LockupIntegrationMode } from "@/lib/lockup-compositor";
 
 export const dynamic = "force-dynamic";
 
@@ -355,7 +351,8 @@ function clamp(value: number, min: number, max: number): number {
   return value;
 }
 
-function computeLockupSafeRegionBox(shape: PreviewShape, width: number, height: number): StageDebugRect {
+async function computeLockupSafeRegionBox(shape: PreviewShape, width: number, height: number): Promise<StageDebugRect> {
+  const { LOCKUP_SAFE_REGION_RATIOS } = await import("@/lib/lockup-compositor");
   const ratios = LOCKUP_SAFE_REGION_RATIOS[shape];
   return {
     left: Math.round(width * ratios.left),
@@ -384,6 +381,7 @@ async function computeCompositedLockupBox(params: {
   height: number;
   align?: "left" | "center" | "right";
 }): Promise<StageDebugRect | null> {
+  const sharp = (await import("sharp")).default;
   const lockupMetadata = await sharp(params.lockupPng, { failOn: "none" }).metadata();
   const lockupWidth = Math.max(1, Math.round(lockupMetadata.width || 1));
   const lockupHeight = Math.max(1, Math.round(lockupMetadata.height || 1));
@@ -391,7 +389,7 @@ async function computeCompositedLockupBox(params: {
     return null;
   }
 
-  const safeRegion = computeLockupSafeRegionBox(params.shape, params.width, params.height);
+  const safeRegion = await computeLockupSafeRegionBox(params.shape, params.width, params.height);
   const safeWidth = Math.max(1, safeRegion.width);
   const safeHeight = Math.max(1, safeRegion.height);
   const scale = clamp(Math.min(safeWidth / lockupWidth, safeHeight / lockupHeight), 0.1, 4);
@@ -449,7 +447,7 @@ async function applyStageDebugOverlay(params: {
   height: number;
   lockupPng?: Buffer | null;
 }): Promise<Buffer> {
-  const safeRegion = computeLockupSafeRegionBox(params.shape, params.width, params.height);
+  const safeRegion = await computeLockupSafeRegionBox(params.shape, params.width, params.height);
   const lockupBounds = params.lockupPng
     ? await computeCompositedLockupBox({
         lockupPng: params.lockupPng,
@@ -466,6 +464,7 @@ async function applyStageDebugOverlay(params: {
     lockupBounds
   });
 
+  const sharp = (await import("sharp")).default;
   return sharp(params.basePng, { failOn: "none" })
     .resize({
       width: params.width,
@@ -545,8 +544,11 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     return new Response("Generation not found", { status: 404, headers: noStoreHeaders() });
   }
 
+  const { resolveProductionValidOption, toAssetUrl } = await import("@/lib/production-valid-option");
+
   if (isDebugBriefEnabled(url)) {
     const designNotes = generation.project.designNotes || readSeriesPreferenceDesignNotes(generation.input);
+    const { extractBibleCreativeBrief } = await import("@/lib/bible-creative-brief");
     const extractedBrief = await extractBibleCreativeBrief({
       title: generation.project.series_title,
       subtitle: generation.project.series_subtitle,
@@ -655,6 +657,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       try {
         const [backgroundPng, lockupPng] = await Promise.all([readFile(backgroundLocalPath), readFile(lockupLocalPath)]);
         const integrationMode = readLockupIntegrationModeFromOutput(generation.output);
+        const { composeLockupOnBackground } = await import("@/lib/lockup-compositor");
         const compositedBase = await composeLockupOnBackground({
           backgroundPng,
           lockupPng,
@@ -718,6 +721,8 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       height
     );
 
+  const { buildFinalSvg } = await import("@/lib/final-deliverables");
+  const sharp = (await import("sharp")).default;
   const svg = await buildFinalSvg(sourceDesignDoc);
   const pngBuffer = await sharp(Buffer.from(svg))
     .resize({

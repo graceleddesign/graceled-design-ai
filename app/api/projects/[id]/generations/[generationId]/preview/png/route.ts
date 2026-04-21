@@ -1,7 +1,5 @@
-import sharp from "sharp";
 import { getSession } from "@/lib/auth";
 import { normalizeDesignDoc, type DesignDoc } from "@/lib/design-doc";
-import { buildFinalSvg } from "@/lib/final-deliverables";
 import { prisma } from "@/lib/prisma";
 
 const SLOT_DIMENSIONS = {
@@ -89,6 +87,8 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     });
   }
 
+  const { buildFinalSvg } = await import("@/lib/final-deliverables");
+  const sharp = (await import("sharp")).default;
   const svg = await buildFinalSvg(designDoc);
   const { width, height } = SLOT_DIMENSIONS[slot];
   const pngBuffer = await sharp(Buffer.from(svg))
