@@ -27,6 +27,7 @@
     "db:seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
+    "@fal-ai/client": "^1.9.5",
     "@fontsource/abril-fatface": "^5.2.7",
     "@fontsource/alfa-slab-one": "^5.2.8",
     "@fontsource/archivo-narrow": "^5.2.8",

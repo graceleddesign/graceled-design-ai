@@ -61,31 +61,26 @@ function parseResponseText(response: unknown): string {
 }
 
 function extractGeneratedImageB64(response: unknown): string {
-  if (!response || typeof response !== "object" || !("output" in response)) {
-    throw new Error("OpenAI response did not include output items");
+  if (!response || typeof response !== "object" || !("data" in response)) {
+    throw new Error("OpenAI images response did not include data");
   }
 
-  const output = (response as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    throw new Error("OpenAI response output is not an array");
+  const data = (response as { data?: unknown }).data;
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("OpenAI images response data is empty");
   }
 
-  for (const item of output) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if ((item as { type?: unknown }).type !== "image_generation_call") {
-      continue;
-    }
-
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === "string" && result.trim()) {
-      return result;
-    }
+  const first = data[0];
+  if (!first || typeof first !== "object") {
+    throw new Error("OpenAI images response data[0] is not an object");
   }
 
-  throw new Error("OpenAI response had no image_generation_call result");
+  const b64 = (first as { b64_json?: unknown }).b64_json;
+  if (typeof b64 === "string" && b64.trim()) {
+    return b64;
+  }
+
+  throw new Error("OpenAI images response had no b64_json");
 }
 
 async function generatePngFromPromptLocal(params: {
@@ -94,63 +89,17 @@ async function generatePngFromPromptLocal(params: {
   size: OpenAiImageSize;
   references: string[];
 }): Promise<Buffer> {
-  const referenceItems = params.references
-    .map((dataUrl) => dataUrl.trim())
-    .filter((value) => /^data:image\//i.test(value))
-    .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
+  const model = process.env.OPENAI_IMAGE_MODEL?.trim() || "gpt-image-1";
+  const response = await params.client.images.generate({
+    model,
+    prompt: params.prompt,
+    size: params.size,
+    quality: "medium",
+    n: 1
+  });
 
-  const modelCandidates = Array.from(
-    new Set(
-      [
-        process.env.OPENAI_IMAGE_MODEL?.trim(),
-        process.env.OPENAI_MAIN_MODEL?.trim(),
-        "gpt-image-1",
-        "gpt-4.1-mini",
-        "gpt-4o-mini"
-      ].filter((value): value is string => Boolean(value))
-    )
-  );
-
-  let lastError: unknown = null;
-  for (const model of modelCandidates) {
-    try {
-      const response = await params.client.responses.create({
-        model,
-        input: [
-          {
-            role: "user",
-            content: [{ type: "input_text", text: params.prompt }, ...referenceItems]
-          }
-        ],
-        tool_choice: { type: "image_generation" },
-        tools: [
-          {
-            type: "image_generation",
-            size: params.size,
-            quality: "medium",
-            background: "opaque"
-          }
-        ]
-      });
-
-      const b64 = extractGeneratedImageB64(response);
-      return Buffer.from(b64, "base64");
-    } catch (error) {
-      lastError = error;
-      const status = typeof error === "object" && error && "status" in error ? (error as { status?: unknown }).status : null;
-      const message =
-        typeof error === "object" && error && "message" in error ? String((error as { message?: unknown }).message || "") : "";
-      const isModelAccessIssue =
-        status === 403 ||
-        status === 404 ||
-        (status === 400 && /not supported with the Responses API/i.test(message));
-      if (!isModelAccessIssue || model === modelCandidates[modelCandidates.length - 1]) {
-        throw error;
-      }
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error("Image generation failed");
+  const b64 = extractGeneratedImageB64(response);
+  return Buffer.from(b64, "base64");
 }
 
 async function hasReadableText(client: OpenAI, image: Buffer): Promise<boolean> {

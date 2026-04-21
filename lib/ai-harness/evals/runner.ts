@@ -21,17 +21,18 @@ export async function runAiEvalDefinitions<TSubject>(params: {
       subject: params.subject
     });
     await params.assertActive?.();
-    results.push(
-      await persistAiEvalResult({
-        runId: params.runId,
-        attemptId: params.attemptId ?? null,
-        evalKey: definition.evalKey,
-        passed: outcome.passed,
-        score: outcome.score ?? null,
-        reasonKey: outcome.reasonKey ?? null,
-        detailsJson: outcome.detailsJson ?? null
-      })
-    );
+    const persisted = await persistAiEvalResult({
+      runId: params.runId,
+      attemptId: params.attemptId ?? null,
+      evalKey: definition.evalKey,
+      passed: outcome.passed,
+      score: outcome.score ?? null,
+      reasonKey: outcome.reasonKey ?? null,
+      detailsJson: outcome.detailsJson ?? null
+    });
+    if (persisted !== null) {
+      results.push(persisted);
+    }
   }
 
   return results;

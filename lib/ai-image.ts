@@ -78,7 +78,7 @@ export async function generateBackgroundPng(params: {
           prompt,
           size: SIZE_BY_SHAPE[params.shape],
           quality: (process.env.OPENAI_IMAGE_QUALITY as "low" | "medium" | "high" | "auto") ?? "medium",
-          response_format: "b64_json"
+          background: "opaque",
         })
       )
     );

@@ -115,7 +115,7 @@ export async function generateBackgroundPng(params: {
         prompt: params.prompt,
         size: params.size,
         quality: normalizeAiImageQuality(params.quality ?? process.env.AI_IMAGE_QUALITY?.trim()),
-        response_format: "b64_json"
+        background: "opaque",
       } as never)
     )
   );

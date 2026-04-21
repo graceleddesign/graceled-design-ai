@@ -2,8 +2,10 @@ import "server-only";
 
 import { getOpenAI } from "@/lib/openai";
 import { type ProviderFailureReason } from "@/lib/generation-state";
+import { runWithGptImage429Retry, runWithGptImageBudget } from "@/lib/gptImageRateLimit";
+import { generateFalImage } from "@/lib/fal-image";
 
-export type ImageProviderName = "openai";
+export type ImageProviderName = "openai" | "fal";
 export type ImageProviderSize = "1024x1024" | "1536x1024" | "1024x1536";
 export type ImageProviderQuality = "low" | "medium" | "high";
 
@@ -25,8 +27,8 @@ export type ImageProviderPreflightResult = {
   message: string | null;
 };
 
-const DEFAULT_IMAGE_MODEL = "gpt-4.1-mini";
-const PREFLIGHT_PROMPT =
+const DEFAULT_IMAGE_MODEL = "gpt-image-1";
+export const PREFLIGHT_PROMPT =
   "Provider preflight: abstract gradient background only, no text, no letters, no words, no logos, no watermarks.";
 
 let preflightCache:
@@ -116,7 +118,17 @@ function isImagePreviewGenerationEnabled(): boolean {
 }
 
 export function resolveImageProviderConfig(): ImageProviderConfig {
-  const envModel = process.env.OPENAI_IMAGE_MODEL?.trim() || "";
+  if (process.env.FAL_API_KEY?.trim()) {
+    return {
+      provider: "fal",
+      model: "flux-dev",
+      providerPath: "fal:flux-dev",
+      defaultModel: "flux-dev",
+      usingDefaultModel: true
+    };
+  }
+
+  const envModel = process.env.OPENAI_IMAGE_MODEL?.trim() || DEFAULT_IMAGE_MODEL;
   const model = envModel || DEFAULT_IMAGE_MODEL;
 
   return {
@@ -129,31 +141,26 @@ export function resolveImageProviderConfig(): ImageProviderConfig {
 }
 
 export function extractGeneratedImageB64(response: unknown): string {
-  if (!response || typeof response !== "object" || !("output" in response)) {
-    throw new Error("OpenAI response did not include output items");
+  if (!response || typeof response !== "object" || !("data" in response)) {
+    throw new Error("OpenAI images response did not include data");
   }
 
-  const output = (response as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    throw new Error("OpenAI response output is not an array");
+  const data = (response as { data?: unknown }).data;
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("OpenAI images response data is empty");
   }
 
-  for (const item of output) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if ((item as { type?: unknown }).type !== "image_generation_call") {
-      continue;
-    }
-
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === "string" && result.trim()) {
-      return result;
-    }
+  const first = data[0];
+  if (!first || typeof first !== "object") {
+    throw new Error("OpenAI images response data[0] is not an object");
   }
 
-  throw new Error("OpenAI response had no image_generation_call result");
+  const b64 = (first as { b64_json?: unknown }).b64_json;
+  if (typeof b64 === "string" && b64.trim()) {
+    return b64;
+  }
+
+  throw new Error("OpenAI images response had no b64_json");
 }
 
 export function classifyImageProviderFailureReason(error: unknown): ProviderFailureReason {
@@ -192,6 +199,10 @@ export function classifyImageProviderFailureReason(error: unknown): ProviderFail
     lowerType.includes("permission")
   ) {
     return "PROVIDER_AUTH_OR_CONFIG_ERROR";
+  }
+
+  if (status === 400) {
+    return "PROVIDER_CONTENT_POLICY";
   }
 
   if ((status !== null && status >= 500) || status === 408 || messageLooksLikeTransientIssue(message, code)) {
@@ -253,6 +264,19 @@ export async function preflightImageProvider(params?: {
   ttlMs?: number;
 }): Promise<ImageProviderPreflightResult> {
   const config = resolveImageProviderConfig();
+
+  if (config.provider === "fal") {
+    return {
+      ok: true,
+      provider: "fal",
+      model: config.model,
+      providerPath: config.providerPath,
+      checkedAt: new Date().toISOString(),
+      failureReason: null,
+      message: null
+    };
+  }
+
   const ttlMs = Math.max(0, params?.ttlMs ?? 30_000);
   const cacheKey = `${config.providerPath}|${process.env.OPENAI_API_KEY ? "key" : "nokey"}|${process.env.OPENAI_IMAGE_PREVIEWS_ENABLED || ""}`;
 
@@ -288,18 +312,12 @@ export async function preflightImageProvider(params?: {
     }
 
     try {
-      const response = await getOpenAI().responses.create({
+      const response = await getOpenAI().images.generate({
         model: config.model,
-        input: PREFLIGHT_PROMPT,
-        tool_choice: { type: "image_generation" },
-        tools: [
-          {
-            type: "image_generation",
-            size: params?.size ?? "1024x1024",
-            quality: params?.quality ?? "low",
-            background: "opaque"
-          }
-        ]
+        prompt: PREFLIGHT_PROMPT,
+        size: params?.size ?? "1024x1024",
+        quality: params?.quality ?? "low",
+        n: 1
       });
       extractGeneratedImageB64(response);
 
@@ -333,4 +351,52 @@ export async function preflightImageProvider(params?: {
   };
 
   return promise;
+}
+
+function deriveOpenAISize(width: number, height: number): ImageProviderSize {
+  const ratio = width / height;
+  if (Math.abs(ratio - 1) < 0.15) return "1024x1024";
+  if (ratio > 1) return "1536x1024";
+  return "1024x1536";
+}
+
+export async function generateProviderImageBuffer(
+  prompt: string,
+  width: number,
+  height: number,
+  quality?: "low" | "medium" | "high" | "auto"
+): Promise<Buffer> {
+  if (process.env.FAL_API_KEY?.trim()) {
+    try {
+      const b64 = await generateFalImage(prompt, width, height);
+      return Buffer.from(b64, "base64");
+    } catch (falError) {
+      console.error("[FAL DEBUG] Raw fal error:", falError);
+      throw falError;
+    }
+  }
+
+  const config = resolveImageProviderConfig();
+  const size = deriveOpenAISize(width, height);
+  const q = (quality === "auto" ? "high" : quality) ?? "medium";
+  const style = process.env.OPENAI_IMAGE_STYLE?.trim() || "";
+
+  try {
+    const response = await runWithGptImage429Retry(() =>
+      runWithGptImageBudget(() =>
+        getOpenAI().images.generate({
+          model: config.model,
+          prompt,
+          size,
+          quality: q,
+          background: "opaque",
+          ...(style ? { style } : {})
+        } as never)
+      )
+    );
+    const b64 = extractGeneratedImageB64(response);
+    return Buffer.from(b64, "base64");
+  } catch (error) {
+    throw normalizeImageProviderError(error, config);
+  }
 }

@@ -32,22 +32,28 @@ async function loadAiEvalResult(id: string): Promise<AiEvalResultRecord> {
   );
 }
 
-export async function persistAiEvalResult(input: AiEvalPersistInput): Promise<AiEvalResultRecord> {
-  return mapAiEvalResult(
-    await prisma.aiEvalResult.create({
-      data: {
-        runId: input.runId,
-        attemptId: input.attemptId ?? null,
-        evalKey: input.evalKey,
-        passed: input.passed,
-        score: input.score ?? null,
-        reasonKey: input.reasonKey ?? null,
-        detailsJson: toNullableJsonInput(input.detailsJson ?? null)
-      }
-    })
-  );
+export async function persistAiEvalResult(input: AiEvalPersistInput): Promise<AiEvalResultRecord | null> {
+  try {
+    return mapAiEvalResult(
+      await prisma.aiEvalResult.create({
+        data: {
+          runId: input.runId,
+          attemptId: input.attemptId ?? null,
+          evalKey: input.evalKey,
+          passed: input.passed,
+          score: input.score ?? null,
+          reasonKey: input.reasonKey ?? null,
+          detailsJson: toNullableJsonInput(input.detailsJson ?? null)
+        }
+      })
+    );
+  } catch (error) {
+    console.error("[EVAL-WRITE-FAILED]", error);
+    return null;
+  }
 }
 
 export async function persistAiEvalResults(inputs: readonly AiEvalPersistInput[]): Promise<AiEvalResultRecord[]> {
-  return Promise.all(inputs.map((input) => persistAiEvalResult(input)));
+  const results = await Promise.all(inputs.map((input) => persistAiEvalResult(input)));
+  return results.filter((r): r is AiEvalResultRecord => r !== null);
 }

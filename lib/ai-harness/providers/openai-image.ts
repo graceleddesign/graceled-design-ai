@@ -46,31 +46,26 @@ function hashReferenceImage(dataUrl: string): string {
 }
 
 function extractGeneratedImageB64(response: unknown): string {
-  if (!response || typeof response !== "object" || !("output" in response)) {
-    throw new Error("OpenAI response did not include output items");
+  if (!response || typeof response !== "object" || !("data" in response)) {
+    throw new Error("OpenAI images response did not include data");
   }
 
-  const output = (response as { output?: unknown }).output;
-  if (!Array.isArray(output)) {
-    throw new Error("OpenAI response output is not an array");
+  const data = (response as { data?: unknown }).data;
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("OpenAI images response data is empty");
   }
 
-  for (const item of output) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if ((item as { type?: unknown }).type !== "image_generation_call") {
-      continue;
-    }
-
-    const result = (item as { result?: unknown }).result;
-    if (typeof result === "string" && result.trim()) {
-      return result;
-    }
+  const first = data[0];
+  if (!first || typeof first !== "object") {
+    throw new Error("OpenAI images response data[0] is not an object");
   }
 
-  throw new Error("OpenAI response had no image_generation_call result");
+  const b64 = (first as { b64_json?: unknown }).b64_json;
+  if (typeof b64 === "string" && b64.trim()) {
+    return b64;
+  }
+
+  throw new Error("OpenAI images response had no b64_json");
 }
 
 export async function generateImageWithOpenAiHarness(params: {
@@ -107,19 +102,6 @@ export async function generateImageWithOpenAiHarness(params: {
   }
 
   const quality = normalizeQuality(process.env.OPENAI_IMAGE_QUALITY?.trim(), params.quality ?? DEFAULT_IMAGE_QUALITY);
-  const referenceItems = (params.references || [])
-    .map((reference) => reference.dataUrl?.trim())
-    .filter((value): value is string => Boolean(value) && /^data:image\//i.test(value))
-    .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
-  const input =
-    referenceItems.length > 0
-      ? [
-          {
-            role: "user" as const,
-            content: [{ type: "input_text" as const, text: params.prompt }, ...referenceItems]
-          }
-        ]
-      : params.prompt;
 
   return traceAiProviderCall({
     run: params.run,
@@ -136,18 +118,13 @@ export async function generateImageWithOpenAiHarness(params: {
       const runImageRequest = () =>
         runWithGptImageBudget(
           () =>
-            getOpenAI().responses.create({
+            getOpenAI().images.generate({
               model: route.model.providerModel,
-              input,
-              tool_choice: { type: "image_generation" },
-              tools: [
-                {
-                  type: "image_generation",
-                  size: params.size,
-                  quality,
-                  background: "opaque"
-                }
-              ]
+              prompt: params.prompt,
+              size: params.size,
+              quality,
+              background: "opaque",
+              n: 1
             }),
           params.meta
         );
@@ -184,7 +161,7 @@ export async function generateImageWithOpenAiHarness(params: {
           bytes: imagePng.byteLength,
           size: params.size,
           quality,
-          referenceCount: referenceItems.length
+          referenceCount: (params.references || []).length
         }
       };
     }

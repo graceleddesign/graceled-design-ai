@@ -44,35 +44,16 @@ export async function generatePngFromPrompt(params: {
   const providerConfig = resolveImageProviderConfig();
 
   try {
-    const referenceItems = (params.references || [])
-      .map((reference) => reference.dataUrl?.trim())
-      .filter((value): value is string => Boolean(value) && /^data:image\//i.test(value))
-      .map((imageUrl) => ({ type: "input_image" as const, image_url: imageUrl, detail: "high" as const }));
-    const input =
-      referenceItems.length > 0
-        ? [
-            {
-              role: "user" as const,
-              content: [{ type: "input_text" as const, text: params.prompt }, ...referenceItems]
-            }
-          ]
-        : params.prompt;
-
     const runImageCall = () =>
       runWithGptImageBudget(
         () =>
-          getOpenAI().responses.create({
+          getOpenAI().images.generate({
             model: providerConfig.model,
-            input,
-            tool_choice: { type: "image_generation" },
-            tools: [
-              {
-                type: "image_generation",
-                size: params.size,
-                quality,
-                background: "opaque"
-              }
-            ]
+            prompt: params.prompt,
+            size: params.size,
+            quality,
+            background: "opaque",
+            n: 1
           }),
         params.meta
       );

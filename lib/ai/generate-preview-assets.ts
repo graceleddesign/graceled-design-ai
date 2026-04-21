@@ -119,18 +119,13 @@ async function generatePngWithOpenAi(params: {
   try {
     const response = await runWithGptImage429Retry(() =>
       runWithGptImageBudget(() =>
-        getOpenAI().responses.create({
+        getOpenAI().images.generate({
           model: providerConfig.model,
-          input: params.prompt,
-          tool_choice: { type: "image_generation" },
-          tools: [
-            {
-              type: "image_generation",
-              size: params.size,
-              quality: params.quality,
-              background: "opaque"
-            }
-          ]
+          prompt: params.prompt,
+          size: params.size,
+          quality: params.quality,
+          background: "opaque",
+          n: 1
         })
       )
     );

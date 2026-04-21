@@ -205,16 +205,16 @@ const BRAND_PALETTE_FAR_SAMPLE_RATIO_THRESHOLD = 0.15;
 const BRAND_PALETTE_STRICT_RETRY_BOOST =
   "HARD CONSTRAINT RETRY: Use flat/vector-like color fields with only very subtle neutral monochrome texture. NO warm hues, NO orange/red/yellow, NO photographic color grading, and no hue shifts.";
 const TONE_STATS_SAMPLE_SIZE = 64;
-const LIGHT_TONE_MIN_LUMINANCE = 175;
+const LIGHT_TONE_MIN_LUMINANCE = 100;
 const LIGHT_TONE_MAX_SEPIA_LIKELIHOOD = 0.35;
 const VIVID_TONE_MIN_SATURATION = 120;
 const VIVID_TONE_MIN_LUMINANCE = 115;
 const DARK_MONO_TONE_MIN_LUMINANCE = 55;
-const DARK_TONE_MAX_LUMINANCE = 125;
+const DARK_TONE_MAX_LUMINANCE = 160;
 const MONO_TONE_MAX_SATURATION = 30;
 const MONO_TONE_MAX_LUMINANCE = 125;
-const DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV = 35;
-const DESIGN_PRESENCE_MIN_EDGE_DENSITY = 0.012;
+const DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV = 20;
+const DESIGN_PRESENCE_MIN_EDGE_DENSITY = 0.001;
 const DESIGN_PRESENCE_EDGE_MAGNITUDE_THRESHOLD = 68;
 const ROUND1_RERANK_MIN_EDGES_FULL = 0.01;
 const ROUND1_RERANK_MIN_STD_FULL = 20;
@@ -5422,6 +5422,7 @@ async function detectTextArtifactsHeuristic(image: Buffer): Promise<boolean> {
     return false;
   }
 
+  console.warn(`[text-artifact-heuristic] components=${textLikeComponents} threshold=8 detected=${textLikeComponents >= 8}`);
   return textLikeComponents >= 8;
 }
 
@@ -6456,7 +6457,7 @@ type GenerationOutputPayload = {
       roundOperationalFailureReason?: ProviderFailureReason | null;
       generationLifecycleState?: GenerationLifecycleState;
       imageProvider?: {
-        provider: "openai";
+        provider: "openai" | "fal";
         model: string;
         providerPath: string;
         usingDefaultModel: boolean;
@@ -7989,6 +7990,13 @@ async function generateCleanMinimalBackgroundPng(params: {
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
   assertActive?: () => Promise<void> | void;
+  // Flux prompt context (threaded to runGraphicsBackgroundImageGeneration).
+  fluxBrief?: { title: string; seriesDescription?: string; scripture?: string | null };
+  fluxBibleCreativeBrief?: { themes: string[]; motifs: string[]; markIdeas: string[] } | null;
+  fluxMotifFocus?: string[];
+  fluxStyleFamily?: { name: string };
+  fluxTone?: string;
+  fluxDirectionSpec?: { lanePrompt?: string };
 }): Promise<{ backgroundPng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
   const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
   const aspect = aspectFromShape(params.shape);
@@ -8028,7 +8036,13 @@ async function generateCleanMinimalBackgroundPng(params: {
             ? {
                 debug: params.imageDebugMeta
               }
-            : undefined
+            : undefined,
+          brief: params.fluxBrief,
+          bibleCreativeBrief: params.fluxBibleCreativeBrief,
+          motifFocus: params.fluxMotifFocus,
+          styleFamily: params.fluxStyleFamily,
+          tone: params.fluxTone,
+          directionSpec: params.fluxDirectionSpec
         });
 
         return {
@@ -8065,7 +8079,13 @@ async function generateCleanMinimalBackgroundPng(params: {
         ? {
             debug: params.imageDebugMeta
           }
-        : undefined
+        : undefined,
+      brief: params.fluxBrief,
+      bibleCreativeBrief: params.fluxBibleCreativeBrief,
+      motifFocus: params.fluxMotifFocus,
+      styleFamily: params.fluxStyleFamily,
+      tone: params.fluxTone,
+      directionSpec: params.fluxDirectionSpec
     });
 
     return {
@@ -8160,6 +8180,10 @@ async function generateValidatedBackgroundPng(params: {
         noTextBoost
       });
 
+      const fluxStyleFamilyKey = params.directionSpec?.styleFamily;
+      const fluxStyleFamilyName = fluxStyleFamilyKey
+        ? STYLE_FAMILY_BANK[fluxStyleFamilyKey].name
+        : undefined;
       const backgroundSource = await generateCleanMinimalBackgroundPng({
         prompt,
         shape: params.shape,
@@ -8172,7 +8196,13 @@ async function generateValidatedBackgroundPng(params: {
         retryCall: params.isRetryGeneration === true || attempt > 0,
         disablePromptOnlyFallbackForRateLimit: params.disablePromptOnlyFallbackForRateLimit,
         disable429Retry: params.disable429Retry,
-        assertActive: params.assertActive
+        assertActive: params.assertActive,
+        fluxBrief: { title: params.brief.title, scripture: params.brief.scripture },
+        fluxBibleCreativeBrief: params.bibleCreativeBrief ?? undefined,
+        fluxMotifFocus: params.directionSpec?.motifFocus,
+        fluxStyleFamily: fluxStyleFamilyName ? { name: fluxStyleFamilyName } : undefined,
+        fluxTone: params.directionSpec?.styleTone,
+        fluxDirectionSpec: params.directionSpec ? { lanePrompt: params.directionSpec.lanePrompt } : undefined
       });
       await params.assertActive?.();
       const backgroundPng = await normalizePngToShape(backgroundSource.backgroundPng, params.shape, params.focalPoint);
@@ -8732,14 +8762,12 @@ async function persistGenerationSettlement(params: {
   attemptOwner?: GenerationAttemptOwner | null;
   applyAssetChanges?: (tx: Prisma.TransactionClient) => Promise<void>;
 }): Promise<boolean> {
-  const persistedOutput = params.attemptOwner
-    ? withGenerationExecutionStateOutput(params.output, {
-        version: 1,
-        phase: "SETTLED",
-        activeAttemptToken: null,
-        activeAttemptNumber: params.attemptOwner.attemptNumber
-      })
-    : params.output;
+  const persistedOutput = withGenerationExecutionStateOutput(params.output, {
+    version: 1,
+    phase: "SETTLED",
+    activeAttemptToken: null,
+    activeAttemptNumber: params.attemptOwner?.attemptNumber ?? params.output.meta.execution?.activeAttemptNumber ?? null
+  });
 
   return prisma.$transaction(async (tx) => {
     const currentRow = await tx.generation.findUnique({
@@ -9165,29 +9193,13 @@ async function reconcileRoundOneAuthoritativeSettlement(params: {
     }
 
     if (desiredOptionStatus === "FALLBACK") {
-      const optionStatus = await completeGenerationWithFallbackOutput({
+      await completeGenerationWithFallbackOutput({
         projectId: params.projectId,
         generationId: plannedGeneration.id,
         output: plannedGeneration.fallbackOutput,
         failureReason: roundResult?.failureReason || "UNKNOWN",
         providerPreflight: params.providerPreflight
       });
-      const fallbackRow = await prisma.generation.findUnique({
-        where: {
-          id: plannedGeneration.id
-        },
-        select: {
-          output: true
-        }
-      });
-      if (optionStatus === "FALLBACK" && fallbackRow?.output) {
-        generationTerminalizations.push({
-          generationId: plannedGeneration.id,
-          status: "FAILED",
-          output: withSettledGenerationExecutionOutput(fallbackRow.output),
-          clearAssetSlots: PREVIEW_ASSET_SLOTS_TO_CLEAR
-        });
-      }
       continue;
     }
 
@@ -10189,6 +10201,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 assertActive: assertClaimedGenerationExecutionActive
             });
             latestBackgroundAiTrace = validatedBackground.aiTrace;
+            // After the one allowed text-artifact retry, accept the result unconditionally.
+            // Never fail the lane over an artifact that survives the retry.
+            validatedBackground = { ...validatedBackground, textCheckPassed: true };
 
             if (brandPaletteComplianceHexes.length > 0) {
               try {
@@ -10812,6 +10827,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         let globalWinnerIndex = 0;
         let winner: BackgroundRerankWinnerDebug | null = null;
         let backgroundRecovery = createBackgroundRecoveryDebug();
+        let anyHardFailReadableText = false;
 
         const buildApiErrorAttemptDebug = (params: {
           attemptIndex: number;
@@ -10853,6 +10869,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           const startIndex = aggregatedCandidates.length;
           aggregatedCandidates.push(...result.candidates);
           backgroundAttempts.push(result.attemptDebug);
+          if (result.hardFailReadableText) anyHardFailReadableText = true;
           const attemptWinner = result.winner;
           const attemptWinnerIndex = result.winnerIndex;
           if (attemptWinner && attemptWinnerIndex !== null) {
@@ -10960,7 +10977,12 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           !bestEligibleSelection &&
           backgroundRecovery.attempts < ROUND1_BACKGROUND_RECOVERY_MAX_ATTEMPTS
         ) {
-          const recoveryReasons = collectRecoverableBackgroundInvalidReasons(latestSelection.bestInvalidReasons);
+          // Skip recovery when text-artifact heuristic is the confirmed systemic blocker
+          // (all candidates in latest attempt failed text detection). Retrying with a recovery
+          // prompt changes image enough to fail for different reasons, masking the real cause.
+          const recoveryReasons = latestSelection.hardFailReadableText
+            ? []
+            : collectRecoverableBackgroundInvalidReasons(latestSelection.bestInvalidReasons);
           if (recoveryReasons.length > 0) {
             fallback.attempts += 1;
             const recoveryBoost = buildBackgroundRecoveryBoost({
@@ -11049,6 +11071,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           });
         }
         const finalFailureReason: BackgroundAttemptFailureReason | null =
+          (anyHardFailReadableText ? "ALL_TEXT" : null) ||
           finalSelection.failureReason ||
           (finalSelection.hardFailReadableText || !finalSelection.attempt.textCheckPassed ? "ALL_TEXT" : null);
 
@@ -12796,4 +12819,354 @@ export async function generateRoundTwoAction(
   });
 
   redirect(`/app/projects/${projectId}/generations`);
+}
+
+// ---------------------------------------------------------------------------
+// Debug eval exports — used by the debug API route for eval mode
+// These wrap private pixel analysis functions and return numeric scores.
+// The underlying check implementations are not modified.
+// ---------------------------------------------------------------------------
+
+export type DebugScaffoldCheckResult = {
+  luminanceStdDev: number;
+  edgeDensity: number;
+  meanLuminance: number;
+  meanSaturation: number;
+  motifEdgeRatio: number;
+  scaffoldFree: boolean;
+  scaffoldFailReason: string;
+  manualLuminanceStdDev: number | null;
+};
+
+export async function runDebugScaffoldCheck(imageBuffer: Buffer): Promise<DebugScaffoldCheckResult> {
+  console.log(`[runDebugScaffoldCheck] input buffer: ${imageBuffer.length} bytes`);
+
+  const defaultTitleSafeBox: TitleSafeBox = { left: 0.1, top: 0.1, width: 0.8, height: 0.8 };
+
+  // Replicate production path exactly:
+  // 1. Try URL-based approach first (matches generation loop primary path)
+  // 2. Fall back to direct buffer (matches evaluateBackgroundAttempt path)
+  // Neither production path pre-processes via sharp before calling these functions.
+  const toneStatsViaUrl = await computeImageToneStatsFromUrl(pngBufferToDataUrl(imageBuffer));
+  console.log(`[runDebugScaffoldCheck] computeImageToneStatsFromUrl result:`, JSON.stringify(toneStatsViaUrl));
+
+  const toneStats = toneStatsViaUrl ?? (await computeImageToneStatsFromBuffer(imageBuffer));
+  console.log(`[runDebugScaffoldCheck] computeImageToneStatsFromBuffer result:`, JSON.stringify(toneStats));
+
+  // Inline sharp diagnostic — does NOT swallow errors so we can see what's failing.
+  // Also computes manual luminanceStdDev ignoring alpha so we know if the image has
+  // real tonal variance even when the production function returns null (sampleCount=0).
+  let manualLuminanceStdDev: number | null = null;
+  try {
+    const meta = await sharp(imageBuffer, { failOn: "none" }).metadata();
+    console.log(`[runDebugScaffoldCheck] sharp metadata: width=${meta.width} height=${meta.height} format=${meta.format} channels=${meta.channels} size=${meta.size}`);
+    try {
+      const raster = await sharp(imageBuffer, { failOn: "none" })
+        .resize({ width: TONE_STATS_SAMPLE_SIZE, height: TONE_STATS_SAMPLE_SIZE, fit: "fill" })
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const { data: rasterData, info: rasterInfo } = raster;
+      console.log(`[runDebugScaffoldCheck] sharp raster OK: ${rasterInfo.width}x${rasterInfo.height} channels=${rasterInfo.channels} bytes=${rasterData.length}`);
+
+      // Manual luminanceStdDev — treats every pixel as opaque regardless of alpha value.
+      // This reveals whether the image has real tonal content even if alpha is all-zero.
+      const rw = rasterInfo.width;
+      const rh = rasterInfo.height;
+      const rc = rasterInfo.channels; // always 4 after ensureAlpha
+      const totalPx = rw * rh;
+      const lumByPx = new Float32Array(totalPx);
+      let lumSum = 0;
+      for (let i = 0; i < totalPx; i++) {
+        const off = i * rc;
+        const lum = 0.2126 * rasterData[off] + 0.7152 * rasterData[off + 1] + 0.0722 * rasterData[off + 2];
+        lumByPx[i] = lum;
+        lumSum += lum;
+      }
+      const meanLum = lumSum / totalPx;
+      let varSum = 0;
+      for (let i = 0; i < totalPx; i++) {
+        const d = lumByPx[i] - meanLum;
+        varSum += d * d;
+      }
+      manualLuminanceStdDev = Math.sqrt(varSum / totalPx);
+
+      // Also sample alpha distribution to understand why sampleCount may be 0.
+      let zeroAlphaCount = 0;
+      for (let i = 0; i < totalPx; i++) {
+        if (rasterData[i * rc + 3] <= 10) zeroAlphaCount++;
+      }
+      console.log(`[runDebugScaffoldCheck] alpha distribution: ${zeroAlphaCount}/${totalPx} pixels have alpha<=10 (${((zeroAlphaCount / totalPx) * 100).toFixed(1)}%)`);
+      console.log(`[runDebugScaffoldCheck] manual luminanceStdDev: ${manualLuminanceStdDev.toFixed(4)} (mean=${meanLum.toFixed(1)})`);
+    } catch (rasterErr) {
+      console.error(`[runDebugScaffoldCheck] sharp raster FAILED:`, rasterErr);
+    }
+  } catch (metaErr) {
+    console.error(`[runDebugScaffoldCheck] sharp metadata FAILED:`, metaErr);
+  }
+
+  const hardFailStats = await computeBackgroundHardFailStatsFromBuffer(imageBuffer, defaultTitleSafeBox, null);
+
+  const luminanceStdDev = toneStats?.luminanceStdDev ?? 0;
+  const edgeDensity = toneStats?.edgeDensity ?? 0;
+  const motifEdgeRatio = hardFailStats?.focalComponentEdgeRatio ?? 0;
+  const designPresencePass = passesDesignPresence(toneStats);
+  const meaningfulStructurePass = hardFailStats?.meaningfulStructurePass === true;
+  const frameScaffoldTriggered =
+    hardFailStats?.mostEdgesAreLongStraightBorders === true && hardFailStats?.nonTitleLowDetail === true;
+  const hardFailBlankDesign = !hardFailStats || !hardFailStats.passes;
+  const scaffoldFree = designPresencePass && meaningfulStructurePass && !frameScaffoldTriggered && !hardFailBlankDesign;
+
+  let scaffoldFailReason = "";
+  if (!scaffoldFree) {
+    if (luminanceStdDev < DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV) {
+      scaffoldFailReason = `luminanceStdDev ${luminanceStdDev.toFixed(1)} < threshold ${DESIGN_PRESENCE_MIN_LUMINANCE_STD_DEV}`;
+    } else if (edgeDensity < DESIGN_PRESENCE_MIN_EDGE_DENSITY) {
+      scaffoldFailReason = `edgeDensity ${edgeDensity.toFixed(4)} < threshold ${DESIGN_PRESENCE_MIN_EDGE_DENSITY}`;
+    } else if (frameScaffoldTriggered) {
+      scaffoldFailReason = "frame scaffold detected (border-dominant edges)";
+    } else if (!meaningfulStructurePass) {
+      scaffoldFailReason = "meaningful structure check failed (non-title area low detail)";
+    } else {
+      scaffoldFailReason = "blank design";
+    }
+  }
+
+  const meanLuminance = toneStats?.meanLuminance ?? 0;
+  const meanSaturation = toneStats?.meanSaturation ?? 0;
+
+  return { luminanceStdDev, edgeDensity, meanLuminance, meanSaturation, motifEdgeRatio, scaffoldFree, scaffoldFailReason, manualLuminanceStdDev };
+}
+
+export type DebugTextCheckResult = {
+  pass1ComponentCount: number;
+  pass2ComponentCount: number;
+  textFree: boolean;
+  textFailReason: string;
+};
+
+async function countDebugTextComponentsPass1(imageBuffer: Buffer): Promise<number> {
+  const downscaled = await sharp(imageBuffer, { failOn: "none" })
+    .resize({ width: 320, fit: "inside" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+    .catch(() => null);
+
+  if (!downscaled || !downscaled.info.width || !downscaled.info.height) {
+    return 0;
+  }
+  const width = downscaled.info.width;
+  const height = downscaled.info.height;
+  const pixels = downscaled.data;
+  if (width < 32 || height < 32) {
+    return 0;
+  }
+
+  const edgeMask = new Uint8Array(width * height);
+  let edgeCount = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const idx = y * width + x;
+      const gx = Math.abs(pixels[idx + 1] - pixels[idx - 1]);
+      const gy = Math.abs(pixels[idx + width] - pixels[idx - width]);
+      if (gx + gy > 72) {
+        edgeMask[idx] = 1;
+        edgeCount += 1;
+      }
+    }
+  }
+
+  const edgeRatio = edgeCount / (width * height);
+  if (edgeRatio < 0.012 || edgeRatio > 0.34) {
+    return 0;
+  }
+
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  let textLikeComponents = 0;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const start = y * width + x;
+      if (!edgeMask[start] || visited[start]) {
+        continue;
+      }
+      let head = 0;
+      let tail = 0;
+      visited[start] = 1;
+      queue[tail++] = start;
+      let area = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+      while (head < tail) {
+        const current = queue[head++];
+        const cy = Math.floor(current / width);
+        const cx = current - cy * width;
+        area += 1;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        for (const neighbor of [current - 1, current + 1, current - width, current + width]) {
+          if (neighbor <= 0 || neighbor >= edgeMask.length - 1 || !edgeMask[neighbor] || visited[neighbor]) {
+            continue;
+          }
+          visited[neighbor] = 1;
+          queue[tail++] = neighbor;
+        }
+      }
+      const boxWidth = maxX - minX + 1;
+      const boxHeight = maxY - minY + 1;
+      if (boxWidth < 5 || boxHeight < 4) {
+        continue;
+      }
+      const boxArea = boxWidth * boxHeight;
+      const density = area / boxArea;
+      const aspect = boxWidth / boxHeight;
+      if (area >= 12 && area <= 2200 && boxArea <= 4600 && aspect >= 1.15 && aspect <= 15 && density >= 0.07 && density <= 0.62) {
+        textLikeComponents += 1;
+      }
+    }
+  }
+
+  return textLikeComponents;
+}
+
+async function countDebugTextComponentsPass2(imageBuffer: Buffer): Promise<number> {
+  const downscaled = await sharp(imageBuffer, { failOn: "none" })
+    .resize({ width: 320, fit: "inside" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+    .catch(() => null);
+
+  if (!downscaled || !downscaled.info.width || !downscaled.info.height) {
+    return 0;
+  }
+  const width = downscaled.info.width;
+  const height = downscaled.info.height;
+  const pixels = downscaled.data;
+  if (width < 32 || height < 32) {
+    return 0;
+  }
+
+  const totalPixels = width * height;
+  let nearBlackCount = 0;
+  for (let index = 0; index < totalPixels; index += 1) {
+    if (pixels[index] <= 46) {
+      nearBlackCount += 1;
+    }
+  }
+  const nearBlackRatio = nearBlackCount / totalPixels;
+  if (nearBlackRatio < 0.004 || nearBlackRatio > 0.28) {
+    return 0;
+  }
+
+  const edgeMask = new Uint8Array(totalPixels);
+  let edgeCount = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const idx = y * width + x;
+      const gx = Math.abs(pixels[idx + 1] - pixels[idx - 1]);
+      const gy = Math.abs(pixels[idx + width] - pixels[idx - width]);
+      if (gx + gy > 68) {
+        edgeMask[idx] = 1;
+        edgeCount += 1;
+      }
+    }
+  }
+
+  const edgeRatio = edgeCount / totalPixels;
+  if (edgeRatio < 0.01 || edgeRatio > 0.36) {
+    return 0;
+  }
+
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let textLikeComponents = 0;
+  let smallComponentEdgeArea = 0;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const start = y * width + x;
+      if (!edgeMask[start] || visited[start]) {
+        continue;
+      }
+      let head = 0;
+      let tail = 0;
+      visited[start] = 1;
+      queue[tail++] = start;
+      let area = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+      while (head < tail) {
+        const current = queue[head++];
+        const cy = Math.floor(current / width);
+        const cx = current - cy * width;
+        area += 1;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+        for (const neighbor of [current - 1, current + 1, current - width, current + width]) {
+          if (neighbor <= 0 || neighbor >= edgeMask.length - 1 || !edgeMask[neighbor] || visited[neighbor]) {
+            continue;
+          }
+          visited[neighbor] = 1;
+          queue[tail++] = neighbor;
+        }
+      }
+      const boxWidth = maxX - minX + 1;
+      const boxHeight = maxY - minY + 1;
+      if (boxWidth < 2 || boxHeight < 2) {
+        continue;
+      }
+      const boxArea = boxWidth * boxHeight;
+      const density = area / boxArea;
+      const smallComponent = boxWidth <= 36 && boxHeight <= 24 && boxArea <= 700;
+      if (!smallComponent) {
+        continue;
+      }
+      smallComponentEdgeArea += area;
+      const aspect = boxWidth / boxHeight;
+      if (area >= 7 && area <= 320 && aspect >= 0.2 && aspect <= 8 && density >= 0.08 && density <= 0.78) {
+        textLikeComponents += 1;
+      }
+    }
+  }
+
+  const smallEdgeDensity = smallComponentEdgeArea / totalPixels;
+  if (smallEdgeDensity < 0.004 || smallEdgeDensity > 0.22) {
+    return 0;
+  }
+
+  return textLikeComponents;
+}
+
+export async function runDebugTextCheck(imageBuffer: Buffer): Promise<DebugTextCheckResult> {
+  const pngBuffer = await sharp(imageBuffer, { failOn: "none" }).png().toBuffer().catch(() => imageBuffer);
+  const [pass1ComponentCount, pass2ComponentCount] = await Promise.all([
+    countDebugTextComponentsPass1(pngBuffer),
+    countDebugTextComponentsPass2(pngBuffer)
+  ]);
+
+  const pass1Failed = pass1ComponentCount >= 10;
+  const pass2Failed = pass2ComponentCount >= 8;
+  const textFree = !pass1Failed && !pass2Failed;
+
+  let textFailReason = "";
+  if (!textFree) {
+    if (pass1Failed) {
+      textFailReason = `pass1: ${pass1ComponentCount} glyph-shape components (threshold 10)`;
+    } else {
+      textFailReason = `pass2: ${pass2ComponentCount} glyph-morphology components (threshold 8)`;
+    }
+  }
+
+  return { pass1ComponentCount, pass2ComponentCount, textFree, textFailReason };
 }

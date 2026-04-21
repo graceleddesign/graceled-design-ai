@@ -25,6 +25,7 @@ import {
   summarizeProductionInvalidReasons,
   type ProductionValidationFailedChecks
 } from "@/lib/production-valid-option";
+import { type PlannedDirectionSpec } from "@/lib/direction-planner";
 import {
   isStyleBucketKey,
   isStyleFamilyKey,
@@ -702,6 +703,7 @@ function readDesignSpecSummary(
             referenceId?: unknown;
             referenceCluster?: unknown;
             variationTemplateKey?: unknown;
+            refinementMutationAxis?: PlannedDirectionSpec["refinementMutationAxis"];
           }
         | null;
     }

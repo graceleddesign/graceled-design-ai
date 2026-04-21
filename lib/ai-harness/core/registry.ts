@@ -12,7 +12,7 @@ import type {
   AiProviderKey
 } from "@/lib/ai-harness/core/types";
 
-const DEFAULT_OPENAI_IMAGE_MODEL = "gpt-4.1-mini";
+const DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-1";
 const DEFAULT_OPENAI_TEXT_MODEL = "gpt-4.1-mini";
 
 function readBooleanEnvFlag(value: string | undefined, fallback: boolean): boolean {
