@@ -206,10 +206,12 @@ const BRAND_PALETTE_STRICT_RETRY_BOOST =
   "HARD CONSTRAINT RETRY: Use flat/vector-like color fields with only very subtle neutral monochrome texture. NO warm hues, NO orange/red/yellow, NO photographic color grading, and no hue shifts.";
 const TONE_STATS_SAMPLE_SIZE = 64;
 const LIGHT_TONE_MIN_LUMINANCE = 100;
-const LIGHT_TONE_MAX_SEPIA_LIKELIHOOD = 0.35;
+const LIGHT_TONE_MAX_SEPIA_LIKELIHOOD = 0.50;
 const VIVID_TONE_MIN_SATURATION = 120;
 const VIVID_TONE_MIN_LUMINANCE = 115;
-const DARK_MONO_TONE_MIN_LUMINANCE = 55;
+// Raised from 30 (was 55): dark-tone cinematics legitimately have mean luminance 30-54;
+// the original threshold was rejecting high-quality dark atmospheric images as "too-dark".
+const DARK_MONO_TONE_MIN_LUMINANCE = 30;
 const DARK_TONE_MAX_LUMINANCE = 160;
 const MONO_TONE_MAX_SATURATION = 30;
 const MONO_TONE_MAX_LUMINANCE = 125;
@@ -10358,7 +10360,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           null;
         const candidateCountForAttempt =
           params.stage === "background_recovery"
-            ? Math.max(1, Math.min(backgroundCandidateCount, ROUND1_BACKGROUND_RECOVERY_CANDIDATE_COUNT))
+            // Use the recovery count directly — do not cap by backgroundCandidateCount.
+            // When backgroundCandidateCount=1 (no-notes path), Math.min(1,2)=1 silently
+            // collapsed recovery to a single candidate, defeating its purpose.
+            ? ROUND1_BACKGROUND_RECOVERY_CANDIDATE_COUNT
             : backgroundCandidateCount;
         const candidateTemplateKeys = buildBackgroundCandidateTemplateKeys({
           seed: `${runSeed}|${plannedGeneration.optionIndex}|${candidateTag}|attempt-${params.attemptNumber}`,
