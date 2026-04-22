@@ -8001,6 +8001,10 @@ async function generateCleanMinimalBackgroundPng(params: {
   fluxStyleFamily?: { name: string };
   fluxTone?: string;
   fluxDirectionSpec?: { lanePrompt?: string };
+  // Recovery/retry boost flags — threaded into Flux prompt builder.
+  fluxBoostTone?: boolean;
+  fluxBoostMotif?: boolean;
+  fluxBoostNoText?: boolean;
 }): Promise<{ backgroundPng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
   const runImageGeneration = params.runImageGeneration || passthroughConcurrencyLimiter;
   const aspect = aspectFromShape(params.shape);
@@ -8046,7 +8050,10 @@ async function generateCleanMinimalBackgroundPng(params: {
           motifFocus: params.fluxMotifFocus,
           styleFamily: params.fluxStyleFamily,
           tone: params.fluxTone,
-          directionSpec: params.fluxDirectionSpec
+          directionSpec: params.fluxDirectionSpec,
+          boostTone: params.fluxBoostTone,
+          boostMotif: params.fluxBoostMotif,
+          boostNoText: params.fluxBoostNoText
         });
 
         return {
@@ -8089,7 +8096,10 @@ async function generateCleanMinimalBackgroundPng(params: {
       motifFocus: params.fluxMotifFocus,
       styleFamily: params.fluxStyleFamily,
       tone: params.fluxTone,
-      directionSpec: params.fluxDirectionSpec
+      directionSpec: params.fluxDirectionSpec,
+      boostTone: params.fluxBoostTone,
+      boostMotif: params.fluxBoostMotif,
+      boostNoText: params.fluxBoostNoText
     });
 
     return {
@@ -8149,6 +8159,10 @@ async function generateValidatedBackgroundPng(params: {
   disablePromptOnlyFallbackForRateLimit?: boolean;
   disable429Retry?: boolean;
   assertActive?: () => Promise<void> | void;
+  /** Recovery/retry boost flags — threaded directly into the Flux prompt. */
+  fluxBoostTone?: boolean;
+  fluxBoostMotif?: boolean;
+  fluxBoostNoText?: boolean;
 }): Promise<{
   backgroundPng: Buffer;
   prompt: string;
@@ -8206,7 +8220,11 @@ async function generateValidatedBackgroundPng(params: {
         fluxMotifFocus: params.directionSpec?.motifFocus,
         fluxStyleFamily: fluxStyleFamilyName ? { name: fluxStyleFamilyName } : undefined,
         fluxTone: params.directionSpec?.styleTone,
-        fluxDirectionSpec: params.directionSpec ? { lanePrompt: params.directionSpec.lanePrompt } : undefined
+        fluxDirectionSpec: params.directionSpec ? { lanePrompt: params.directionSpec.lanePrompt } : undefined,
+        // For text retries (attempt > 0), activate the no-text boost; otherwise thread caller-provided flags.
+        fluxBoostTone: params.fluxBoostTone,
+        fluxBoostMotif: params.fluxBoostMotif,
+        fluxBoostNoText: params.fluxBoostNoText || attempt > 0
       });
       await params.assertActive?.();
       const backgroundPng = await normalizePngToShape(backgroundSource.backgroundPng, params.shape, params.focalPoint);
@@ -9916,6 +9934,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         directionSpecOverride?: PlannedDirectionSpec | null;
         originalityBoost?: string;
         candidateSuffix?: string;
+        /** Flux-specific boost flags — set by recovery/retry callers to strengthen Flux prompt. */
+        fluxBoostTone?: boolean;
+        fluxBoostMotif?: boolean;
+        fluxBoostNoText?: boolean;
       } = {}) => {
         await assertClaimedGenerationExecutionActive();
         const activeDirectionSpec =
@@ -9996,7 +10018,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           registerImageCall,
           disablePromptOnlyFallbackForRateLimit: shouldDisablePromptFallbackOnRateLimit,
           disable429Retry: shouldDisable429Retry,
-          assertActive: assertClaimedGenerationExecutionActive
+          assertActive: assertClaimedGenerationExecutionActive,
+          // Thread Flux-specific boost flags from caller (recovery/retry paths).
+          fluxBoostTone: attemptParams.fluxBoostTone,
+          fluxBoostMotif: attemptParams.fluxBoostMotif,
+          fluxBoostNoText: attemptParams.fluxBoostNoText
         });
         latestBackgroundAiTrace = initialBackground.aiTrace;
 
@@ -10302,11 +10328,18 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         attemptNumber: number;
         directionSpecOverride?: PlannedDirectionSpec | null;
         originalityBoost?: string;
+        /** Flux-specific boost flags to thread into the Flux prompt. */
+        fluxBoostTone?: boolean;
+        fluxBoostMotif?: boolean;
+        fluxBoostNoText?: boolean;
       }) => {
         if (!shouldRunExplorationToneCheck || shouldReuseBackground) {
           const attempt = await renderMasterAttempt({
             directionSpecOverride: params.directionSpecOverride,
-            originalityBoost: params.originalityBoost
+            originalityBoost: params.originalityBoost,
+            fluxBoostTone: params.fluxBoostTone,
+            fluxBoostMotif: params.fluxBoostMotif,
+            fluxBoostNoText: params.fluxBoostNoText
           });
           return {
             attempt,
@@ -10443,7 +10476,10 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             attempt = await renderMasterAttempt({
               directionSpecOverride: candidateDirectionSpec,
               originalityBoost: params.originalityBoost,
-              candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`
+              candidateSuffix: `|${candidateTag}-bg-candidate-${candidateIndex}`,
+              fluxBoostTone: params.fluxBoostTone,
+              fluxBoostMotif: params.fluxBoostMotif,
+              fluxBoostNoText: params.fluxBoostNoText
             });
           } catch (error) {
             if (isRound1ImageCallCapReachedError(error)) {
@@ -10748,7 +10784,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
             const recoveryAttempt = await renderMasterAttempt({
               directionSpecOverride: activeDirectionSpec,
               originalityBoost: recoveryOriginalityBoost,
-              candidateSuffix: "|background-recovery"
+              candidateSuffix: "|background-recovery",
+              // Flux-specific boost flags derived from the recovery reasons.
+              fluxBoostTone: recoverableReasons.includes("background_tone_fit_failed"),
+              fluxBoostMotif:
+                recoverableReasons.includes("background_blank_or_motif_weak") ||
+                recoverableReasons.includes("background_scaffold_like"),
+              fluxBoostNoText: recoverableReasons.includes("background_text_detected")
             });
             const recoveryEvaluation = await evaluateBackgroundAttempt({
               attempt: recoveryAttempt,
@@ -10940,7 +10982,8 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               stage: "text_retry",
               attemptNumber: fallback.attempts,
               directionSpecOverride: activeDirectionSpec,
-              originalityBoost: retryBoost
+              originalityBoost: retryBoost,
+              fluxBoostNoText: true
             });
             appendAttempt(latestSelection);
           } catch (error) {
@@ -11002,7 +11045,13 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 stage: "background_recovery",
                 attemptNumber: fallback.attempts,
                 directionSpecOverride: activeDirectionSpec,
-                originalityBoost: recoveryOriginalityBoost
+                originalityBoost: recoveryOriginalityBoost,
+                // Flux-specific boost flags derived from the recovery reasons.
+                fluxBoostTone: recoveryReasons.includes("background_tone_fit_failed"),
+                fluxBoostMotif:
+                  recoveryReasons.includes("background_blank_or_motif_weak") ||
+                  recoveryReasons.includes("background_scaffold_like"),
+                fluxBoostNoText: recoveryReasons.includes("background_text_detected")
               });
               appendAttempt(latestSelection);
               if (latestSelection.winner) {

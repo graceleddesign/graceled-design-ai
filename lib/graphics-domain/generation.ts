@@ -168,6 +168,10 @@ export async function runGraphicsBackgroundImageGeneration(params: {
   styleFamily?: { name: string };
   tone?: string;
   directionSpec?: { lanePrompt?: string };
+  /** Recovery/retry boost flags — threaded into the Flux prompt when active. */
+  boostTone?: boolean;
+  boostMotif?: boolean;
+  boostNoText?: boolean;
 }): Promise<{ imagePng: Buffer; aiTrace: GraphicsBackgroundAiAttemptTrace }> {
   if (process.env.FAL_API_KEY?.trim()) {
     const sizeStr = resolveGraphicsBackgroundImageSize(params.shape);
@@ -184,6 +188,9 @@ export async function runGraphicsBackgroundImageGeneration(params: {
       tone: params.tone,
       lanePrompt: params.directionSpec?.lanePrompt,
       generationId: params.runHandle?.run?.id ?? "unknown",
+      boostTone: params.boostTone,
+      boostMotif: params.boostMotif,
+      boostNoText: params.boostNoText,
     });
     console.log("[FLUX PROMPT]", falPrompt);
     let b64: string;

@@ -7,11 +7,25 @@
  */
 
 const TONE_ATMOSPHERE: Record<string, string> = {
-  light: "High-key, airy atmosphere. Bright whites, pale gold, and soft cream tones dominate.",
+  light: "High-key, very bright airy atmosphere. Predominantly bright whites and pale tones, light and exposed throughout.",
   dark: "Deep shadows and rich darks with dramatic contrast. Warm highlights emerge from darkness.",
   vivid: "Saturated, bold color with strong tonal contrast. Rich and vibrant.",
   mono: "Black and white or near-monochrome. Depth through value contrast alone.",
   neutral: "Balanced mid-tone palette, neither bright nor dark. Muted, sophisticated color.",
+};
+
+// Stronger tone descriptions used during tone-boost recovery attempts.
+const TONE_ATMOSPHERE_BOOST: Record<string, string> = {
+  light:
+    "CRITICAL TONE: This image MUST be high-key and very bright. Extremely light, airy, and exposed — predominantly white, pale cream, and soft gold. The overall mean brightness must be very high. Avoid any shadowy or dim areas.",
+  dark:
+    "CRITICAL TONE: This image MUST be deep and cinematic dark. Rich shadows, deep blacks, and warm accent light only. Minimal bright areas.",
+  vivid:
+    "CRITICAL TONE: This image MUST be highly saturated and vibrant. Bold, rich, saturated color throughout. High chromatic intensity.",
+  mono:
+    "CRITICAL TONE: This image MUST be black and white or near-monochrome. No color; depth only through value contrast.",
+  neutral:
+    "CRITICAL TONE: This image MUST use a balanced mid-tone palette — neither bright nor dark. Muted, sophisticated.",
 };
 
 const DESIGN_SYSTEM_TERMS = [
@@ -64,6 +78,12 @@ export function buildFluxBackgroundPrompt(params: {
   tone?: string;
   lanePrompt?: string;
   generationId: string;
+  /** Recovery boost: strengthen focal element language */
+  boostMotif?: boolean;
+  /** Recovery boost: use critical tone requirement language */
+  boostTone?: boolean;
+  /** Text retry: extra no-text enforcement */
+  boostNoText?: boolean;
 }): string {
   const motifs = gatherMotifs(params);
   const themes = params.bibleCreativeBrief?.themes?.filter(Boolean) ?? [];
@@ -73,23 +93,51 @@ export function buildFluxBackgroundPrompt(params: {
 
   // --- Primary scene from motifs or fallback ---
   if (motifs.length > 0) {
-    lines.push(`${capitalize(motifs[0])} forms emerge with physical materiality and depth.`);
+    if (params.boostMotif) {
+      // Recovery: demand a single concentrated focal subject instead of diffuse forms
+      lines.push(
+        `A single dominant ${motifs[0]} subject stands as the clear visual focal point — physical presence, concentrated weight, distinct from background.`
+      );
+    } else {
+      lines.push(`${capitalize(motifs[0])} forms emerge with physical materiality and depth.`);
+    }
     if (motifs.length > 1) {
       lines.push(`${capitalize(motifs.slice(1).join(" and "))} woven subtly into the composition.`);
     }
   } else if (params.seriesTitle) {
-    lines.push(
-      `Abstract atmospheric scene evoking the essence of "${params.seriesTitle}." Organic forms with layered depth.`
-    );
+    if (params.boostMotif) {
+      lines.push(
+        `One clear dominant visual subject evoking "${params.seriesTitle}" — concentrated focal presence, clean separation from background.`
+      );
+    } else {
+      lines.push(
+        `Abstract atmospheric scene evoking the essence of "${params.seriesTitle}." Organic forms with layered depth.`
+      );
+    }
   } else {
-    lines.push("Abstract atmospheric scene. Organic layered forms with tactile depth.");
+    if (params.boostMotif) {
+      lines.push("One clear dominant visual subject — concentrated, focal, with visual weight. Clean background separation.");
+    } else {
+      lines.push("Abstract atmospheric scene. Organic layered forms with tactile depth.");
+    }
+  }
+
+  // --- Motif recovery: explicit focal emphasis ---
+  if (params.boostMotif) {
+    lines.push(
+      "IMPORTANT: Do NOT distribute visual interest evenly across the image. One primary subject must dominate with concentrated edge presence."
+    );
   }
 
   // --- Tone atmosphere ---
-  lines.push(TONE_ATMOSPHERE[tone] ?? TONE_ATMOSPHERE.neutral);
+  if (params.boostTone) {
+    lines.push(TONE_ATMOSPHERE_BOOST[tone] ?? `CRITICAL TONE: ${TONE_ATMOSPHERE[tone] ?? TONE_ATMOSPHERE.neutral}`);
+  } else {
+    lines.push(TONE_ATMOSPHERE[tone] ?? TONE_ATMOSPHERE.neutral);
+  }
 
   // --- Material / texture ---
-  lines.push("Paper grain texture throughout. Painterly, quiet, considered.");
+  lines.push("Subtle surface texture. Painterly, quiet, considered.");
 
   // --- Thematic resonance ---
   if (themes.length > 0) {
@@ -105,11 +153,15 @@ export function buildFluxBackgroundPrompt(params: {
 
   // --- Composition guidance ---
   lines.push(
-    "Left side open, low-contrast negative space. Right side carries visual interest."
+    "Left side open, low-contrast negative space. Right side carries the primary visual subject."
   );
 
   // --- Safety ---
-  lines.push("No text, letters, words, or typographic forms. No human faces.");
+  if (params.boostNoText) {
+    lines.push("CRITICAL: ZERO text. No letters, numbers, words, symbols, or typographic marks of any kind.");
+  } else {
+    lines.push("No text, letters, words, or typographic forms. No human faces.");
+  }
 
   // --- Seed ---
   lines.push(`Seed: ${params.generationId.slice(0, 8)}.`);
