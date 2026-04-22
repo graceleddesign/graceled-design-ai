@@ -3934,6 +3934,9 @@ function buildBackgroundAttemptFailureReason(invalidReasons: string[]): Backgrou
   ) {
     return "ALL_SCAFFOLD";
   }
+  if (invalidReasons.includes("background_tone_fit_failed")) {
+    return "ALL_TONE_FAIL";
+  }
   return "UNKNOWN";
 }
 
@@ -4051,12 +4054,11 @@ async function evaluateBackgroundAttempt(params: {
     toneFit: params.toneTarget ? tonePass : null,
     referenceFit: null
   };
+  const acceptance = evaluateBackgroundAcceptance({ evidence });
 
   return {
     evidence,
-    acceptance: evaluateBackgroundAcceptance({
-      evidence
-    }),
+    acceptance,
     textArtifactDetected,
     checks: {
       textFree,
@@ -12031,7 +12033,9 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         fallbackOutput,
         providerPreflight: params.providerPreflight,
         attemptOwner: plannedGeneration.attemptOwner,
-        failureReason: failSafeReason,
+        // Prefer the failure reason recorded by completeWithBackgroundFallback (via provisionalResult)
+        // over the generic failSafeReason="UNKNOWN" that is only updated in the exception path.
+        failureReason: provisionalResult?.failureReason ?? failSafeReason,
         input: failSafeInput,
         provisionalResult,
         failSafeMessage

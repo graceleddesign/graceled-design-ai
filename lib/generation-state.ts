@@ -11,6 +11,7 @@ export type ProviderFailureReason = (typeof PROVIDER_FAILURE_REASONS)[number];
 export const GENERATION_FAILURE_REASONS = [
   "ALL_TEXT",
   "ALL_SCAFFOLD",
+  "ALL_TONE_FAIL",
   ...PROVIDER_FAILURE_REASONS,
   "CLAIM_TIMEOUT",
   "BUDGET",

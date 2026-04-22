@@ -327,6 +327,9 @@ function formatBackgroundFailureReasonLabel(reason: GenerationFailureReason | st
   if (reason === "ALL_SCAFFOLD") {
     return "all candidates looked scaffold-like";
   }
+  if (reason === "ALL_TONE_FAIL") {
+    return "all candidates failed tone compliance";
+  }
   if (reason === "PROVIDER_MODEL_UNAVAILABLE") {
     return "configured image model was unavailable";
   }
@@ -843,6 +846,8 @@ export function evaluateBackgroundAcceptance(params: {
       addReason(invalidReasons, "background_text_detected");
     } else if (backgroundFailureReason === "ALL_SCAFFOLD") {
       addReason(invalidReasons, "background_scaffold_like");
+    } else if (backgroundFailureReason === "ALL_TONE_FAIL") {
+      addReason(invalidReasons, "background_tone_fit_failed");
     } else {
       addReason(invalidReasons, `background_generation_failed:${backgroundFailureReason}`);
     }
