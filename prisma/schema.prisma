@@ -103,6 +103,7 @@ model Project {
   avoidColors         String?
   designNotes         String?
   brandMode           String        @default("fresh")
+  round1EngineOverride String?
   brandKit            BrandKit?
   generations         Generation[]
   finalDesign         FinalDesign?

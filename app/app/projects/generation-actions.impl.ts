@@ -148,6 +148,15 @@ import {
   toPersistedProductionValidationSnapshot
 } from "@/lib/production-valid-option";
 import { resolvePromptProfile } from "@/lib/prompt-profiles";
+import {
+  detectPlannerToneFamilyIncompatibility,
+  detectPlannerBackgroundFamilyRisk,
+  reroutePlannerBackgroundRiskLane,
+  resolveMultiReasonBackgroundRescueFluxFlags,
+  buildPlannerRescueState,
+  type PlannerRescueState
+} from "@/lib/round1-rescue-policy";
+import { resolveRound1Engine, runRoundOneV2 } from "@/lib/round1-v2/orchestrator";
 
 export type GenerationActionState = {
   error?: string;
@@ -6743,6 +6752,7 @@ async function getProjectForGeneration(projectId: string, organizationId: string
       scripture_passages: true,
       series_description: true,
       brandMode: true,
+      round1EngineOverride: true,
       preferredAccentColors: true,
       avoidColors: true,
       designNotes: true,
@@ -9947,6 +9957,68 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
         return shouldCheckToneCompliance(styleTone) ? styleTone : null;
       };
 
+      // Planner-side guardrail: detect family compatibility issues PRE-GENERATION to avoid
+      // spending image budget on lanes that will fail the background eval regardless of
+      // recovery boosts. Three classes of issue are checked in priority order:
+      //
+      //   1. Tone incompatibility — native tone vs. assigned tone structurally conflict
+      //      (e.g. dark family assigned vivid → predicted background_tone_fit_failed)
+      //
+      //   2. Text artifact risk — family visual vocabulary generates pseudo-letterforms
+      //      (e.g. topographic_contour_lines → predicted background_text_detected)
+      //
+      //   3. Scaffold risk — family generates empty-template-like compositions
+      //      (e.g. modern_geometric_blocks → predicted background_scaffold_like)
+      //
+      // A single reroute is applied per lane via reroutePlannerBackgroundRiskLane, which
+      // avoids ALL risk families so the replacement is safe on all three dimensions.
+      let plannerRescueState: PlannerRescueState | null = null;
+      if (!shouldReuseBackground && directionSpec && isStyleFamilyKey(directionSpec.styleFamily)) {
+        const assignedStyleTone = isStyleToneKey(directionSpec.styleTone) ? directionSpec.styleTone : null;
+
+        const toneIssue = detectPlannerToneFamilyIncompatibility({
+          styleFamily: directionSpec.styleFamily,
+          styleTone: assignedStyleTone
+        });
+        const bgRiskIssue = !toneIssue
+          ? detectPlannerBackgroundFamilyRisk(directionSpec.styleFamily)
+          : null;
+
+        const activeIssue = toneIssue ?? bgRiskIssue;
+        if (activeIssue) {
+          const reroutedFamily = reroutePlannerBackgroundRiskLane({
+            currentStyleFamily: directionSpec.styleFamily,
+            toneTarget: assignedStyleTone,
+            runSeed,
+            laneFamily: directionSpec.laneFamily
+          });
+          plannerRescueState = buildPlannerRescueState({
+            failureClass: activeIssue,
+            reroutedTo: reroutedFamily,
+            budgetUsed: reroutedFamily ? 1 : 0,
+            outcome: reroutedFamily ? "succeeded" : "no_rescue_available"
+          });
+          console.info("[rescue-policy/planner]", {
+            optionIndex: plannedGeneration.optionIndex,
+            failureClass: activeIssue,
+            originalFamily: directionSpec.styleFamily,
+            assignedTone: assignedStyleTone,
+            reroutedTo: reroutedFamily,
+            outcome: plannerRescueState.outcome
+          });
+          if (reroutedFamily) {
+            const reroutedRecord = STYLE_FAMILY_BANK[reroutedFamily];
+            backgroundDirectionSpec = {
+              ...directionSpec,
+              styleFamily: reroutedFamily,
+              styleBucket: reroutedRecord.bucket,
+              styleMedium: reroutedRecord.medium
+              // styleTone intentionally unchanged: it's the target we're routing toward
+            };
+          }
+        }
+      }
+
       const renderMasterAttempt = async (attemptParams: {
         directionSpecOverride?: PlannedDirectionSpec | null;
         originalityBoost?: string;
@@ -10793,6 +10865,11 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
           });
           const recoverableReasons = collectRecoverableBackgroundInvalidReasons(attemptEvaluation.acceptance.invalidReasons);
           if (!attemptEvaluation.acceptance.accepted && recoverableReasons.length > 0) {
+            console.info("[rescue-policy/background]", {
+              optionIndex: plannedGeneration.optionIndex,
+              reasons: recoverableReasons,
+              rescueFlags: resolveMultiReasonBackgroundRescueFluxFlags(recoverableReasons)
+            });
             const recoveryBoost = buildBackgroundRecoveryBoost({
               invalidReasons: recoverableReasons,
               toneTarget
@@ -10802,12 +10879,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               directionSpecOverride: activeDirectionSpec,
               originalityBoost: recoveryOriginalityBoost,
               candidateSuffix: "|background-recovery",
-              // Flux-specific boost flags derived from the recovery reasons.
-              fluxBoostTone: recoverableReasons.includes("background_tone_fit_failed"),
-              fluxBoostMotif:
-                recoverableReasons.includes("background_blank_or_motif_weak") ||
-                recoverableReasons.includes("background_scaffold_like"),
-              fluxBoostNoText: recoverableReasons.includes("background_text_detected")
+              ...resolveMultiReasonBackgroundRescueFluxFlags(recoverableReasons)
             });
             const recoveryEvaluation = await evaluateBackgroundAttempt({
               attempt: recoveryAttempt,
@@ -11063,12 +11135,7 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 attemptNumber: fallback.attempts,
                 directionSpecOverride: activeDirectionSpec,
                 originalityBoost: recoveryOriginalityBoost,
-                // Flux-specific boost flags derived from the recovery reasons.
-                fluxBoostTone: recoveryReasons.includes("background_tone_fit_failed"),
-                fluxBoostMotif:
-                  recoveryReasons.includes("background_blank_or_motif_weak") ||
-                  recoveryReasons.includes("background_scaffold_like"),
-                fluxBoostNoText: recoveryReasons.includes("background_text_detected")
+                ...resolveMultiReasonBackgroundRescueFluxFlags(recoveryReasons)
               });
               appendAttempt(latestSelection);
               if (latestSelection.winner) {
@@ -12274,6 +12341,10 @@ export async function generateRoundOneAction(
   };
 
   try {
+    if (resolveRound1Engine(project.round1EngineOverride) === "v2") {
+      return await runRoundOneV2(projectId);
+    }
+
     const enabledPresets = await findEnabledPresetsForOrganization(session.organizationId);
     const presetIdByKey = new Map(enabledPresets.map((preset) => [preset.key, preset.id] as const));
     const runSeed = randomUUID();
