@@ -2986,6 +2986,23 @@ function makeFlatLockupRetryRecipe(lockupRecipe: LockupRecipe): LockupRecipe {
   };
 }
 
+/**
+ * Returns a compact variant of the lockup recipe that constrains maxTitleWidthPct to 0.40.
+ * After normalizeRecipeForAspect applies the wide-canvas +0.045 boost, the effective
+ * width is 0.445 — narrow enough to force a short title like "The Way Home" (11 chars)
+ * to wrap to two lines, producing a taller lockup that passes the notTooSmall check.
+ * Use this as a single retry when a candidate fails notTooSmall.
+ */
+function makeCompactLockupRecipeForFit(lockupRecipe: LockupRecipe): LockupRecipe {
+  return {
+    ...lockupRecipe,
+    placement: {
+      ...lockupRecipe.placement,
+      maxTitleWidthPct: 0.40
+    }
+  };
+}
+
 function makeFlatLockupRetryPalette(
   palette: Awaited<ReturnType<typeof chooseTextPaletteForBackground>>
 ): Awaited<ReturnType<typeof chooseTextPaletteForBackground>> {
@@ -11484,6 +11501,54 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
               };
 
               const selectedCandidate = winner?.candidate || bestCandidate.candidate;
+
+              // Compact-width retry: if no eligible winner and the best candidate failed
+              // notTooSmall (lockup too short), re-render with a narrower maxTitleWidthPct
+              // so the title wraps to two lines and produces a taller, fitting lockup.
+              if (!winner && !selectedCandidate.checks.notTooSmall) {
+                const compactRecipe = makeCompactLockupRecipeForFit(lockupRecipeForRender);
+                imageCallSummary.byStage.lockup += 1;
+                const compactComputation = await renderValidatedLockupPng({
+                  width: masterDimensions.width,
+                  height: masterDimensions.height,
+                  content,
+                  palette: lockupPaletteForRender,
+                  lockupRecipe: compactRecipe,
+                  lockupPresetId,
+                  styleFamily: optionStyleFamily,
+                  fontSeed: `${fontSeedBase}|lockup-compact`,
+                  lockupPrompt
+                });
+                const compactFit = evaluateLockupFit({
+                  lockupWidth: compactComputation.renderResult.width,
+                  lockupHeight: compactComputation.renderResult.height,
+                  shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                  canvasWidth: masterDimensions.width,
+                  canvasHeight: masterDimensions.height,
+                  marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
+                  titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
+                });
+                if (compactFit.notTooSmall || compactFit.safeHeightRatio > selectedCandidate.fit.safeHeightRatio) {
+                  const { evidence: compactEvidence, acceptance: compactAcceptance } =
+                    buildLockupAcceptanceResult({
+                      source: "generated",
+                      sourceGenerationId: null,
+                      reusableValidation: null,
+                      textValidation: compactComputation.textValidation,
+                      fit: compactFit
+                    });
+                  return {
+                    renderResult: compactComputation.renderResult,
+                    effectivePrompt: compactComputation.effectivePrompt,
+                    textValidation: compactComputation.textValidation,
+                    textOverrideRetried: compactComputation.textOverrideRetried,
+                    fit: compactFit,
+                    evidence: compactEvidence,
+                    acceptance: compactAcceptance
+                  };
+                }
+              }
+
               return {
                 renderResult: selectedCandidate.computation.renderResult,
                 effectivePrompt: selectedCandidate.computation.effectivePrompt,
@@ -11512,6 +11577,49 @@ async function createOpenAiPreviewAssetsForPlannedGenerations(params: {
                 textValidation: computation.textValidation,
                 fit
               });
+
+              // Compact-width retry for non-exploration path: same notTooSmall fallback
+              if (!fit.notTooSmall) {
+                const compactRecipe = makeCompactLockupRecipeForFit(lockupRecipeForRender);
+                imageCallSummary.byStage.lockup += 1;
+                const compactComputation = await renderValidatedLockupPng({
+                  width: masterDimensions.width,
+                  height: masterDimensions.height,
+                  content,
+                  palette: lockupPaletteForRender,
+                  lockupRecipe: compactRecipe,
+                  lockupPresetId,
+                  styleFamily: optionStyleFamily,
+                  fontSeed: `${fontSeedBase}|lockup-compact`,
+                  lockupPrompt
+                });
+                const compactFit = evaluateLockupFit({
+                  lockupWidth: compactComputation.renderResult.width,
+                  lockupHeight: compactComputation.renderResult.height,
+                  shape: OPTION_MASTER_BACKGROUND_SHAPE,
+                  canvasWidth: masterDimensions.width,
+                  canvasHeight: masterDimensions.height,
+                  marginRatio: ROUND1_EXPLORATION_LOCKUP_SAFE_MARGIN_RATIO,
+                  titleSafeBox: titleSafeBoxForDirection(backgroundDirectionSpec)
+                });
+                if (compactFit.notTooSmall || compactFit.safeHeightRatio > fit.safeHeightRatio) {
+                  const { evidence: compactEvidence, acceptance: compactAcceptance } =
+                    buildLockupAcceptanceResult({
+                      source: "generated",
+                      sourceGenerationId: null,
+                      reusableValidation: null,
+                      textValidation: compactComputation.textValidation,
+                      fit: compactFit
+                    });
+                  return {
+                    ...compactComputation,
+                    fit: compactFit,
+                    evidence: compactEvidence,
+                    acceptance: compactAcceptance
+                  };
+                }
+              }
+
               return {
                 ...computation,
                 fit,
