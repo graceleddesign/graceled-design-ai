@@ -263,6 +263,35 @@ const BACKGROUND_REF_TYPOGRAPHY_RISK_FAMILY_SET = new Set<StyleFamilyKey>([
   "emblem_seal_system"
 ]);
 
+/**
+ * Families structurally prone to scaffold-like outputs for text-free sermon backgrounds.
+ *
+ * These families generate large empty-looking planes, magazine-grid whitespace, or
+ * diagrammatic compositions that read as templates rather than intentional background art.
+ * Used at planning time (scoring penalty) and at generation time (reroute guardrail).
+ */
+export const SCAFFOLD_RISK_FAMILY_SET = new Set<StyleFamilyKey>([
+  "typographic_only_statement", // minimal bg by design → almost always template-like
+  "editorial_grid_minimal",     // grid whitespace lanes → magazine-layout wireframe
+  "modern_geometric_blocks",    // large empty geometric planes → blank block template
+  "blueprint_diagram"           // technical line diagram → wireframe / scaffold appearance
+]);
+
+/**
+ * Families structurally prone to generating text artifacts in AI-generated backgrounds.
+ *
+ * AI models tend to produce pseudo-letterforms when prompted with dense line systems,
+ * annotation marks, or label-heavy visual vocabularies. These families reliably trigger
+ * the background_text_detected failure class.
+ * Used at planning time (scoring penalty) and at generation time (reroute guardrail).
+ */
+export const TEXT_ARTIFACT_RISK_FAMILY_SET = new Set<StyleFamilyKey>([
+  "topographic_contour_lines", // contour interval lines → AI generates pseudo-letterforms
+  "manuscript_marginalia",     // annotation marks → generates pseudo-text glyphs
+  "blueprint_diagram",         // callout annotations → generates label text artifacts
+  "map_wayfinding"             // route labels / wayfinding marks → generates text
+]);
+
 function resolveExplorationTier(familyKey: StyleFamilyKey): ExplorationTier {
   if (HERO_EXPLORATION_FAMILY_SET.has(familyKey)) {
     return "hero";

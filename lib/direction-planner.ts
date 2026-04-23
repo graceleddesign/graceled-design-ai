@@ -15,6 +15,8 @@ import {
   isStyleToneKey,
   STYLE_FAMILY_BANK,
   STYLE_FAMILY_KEYS,
+  SCAFFOLD_RISK_FAMILY_SET,
+  TEXT_ARTIFACT_RISK_FAMILY_SET,
   type StyleBucketKey,
   type StyleFamilyKey,
   type StyleMediumKey,
@@ -1322,6 +1324,18 @@ function styleFamilyScore(params: {
 
   if (params.spec.referenceMediumHint) {
     score += familyRecord.medium === params.spec.referenceMediumHint ? 5 : -3;
+  }
+
+  // Downrank families with known background generation reliability issues.
+  // These are not hard-blocked here — the per-lane generation-time planner guardrail
+  // (detectPlannerBackgroundFamilyRisk + reroutePlannerBackgroundRiskLane) provides
+  // the hard safety net. The score penalty reduces how often they are planned in the
+  // first place, saving generation budget.
+  if (SCAFFOLD_RISK_FAMILY_SET.has(params.family)) {
+    score -= 8;
+  }
+  if (TEXT_ARTIFACT_RISK_FAMILY_SET.has(params.family)) {
+    score -= 8;
   }
 
   return score;
