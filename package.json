@@ -15,6 +15,7 @@
     "debug:matrix": "tsx scripts/debug-matrix.ts",
     "debug:style-families": "tsx scripts/debug-style-families.ts",
     "debug:templates": "node --import tsx scripts/debug-template-families.ts",
+    "debug:v2-scouts": "node --import tsx scripts/debug-round1-v2-scouts.ts",
     "test:font-render": "node --import tsx scripts/test-lockup-font-render.ts",
     "test:font-assets": "node --import tsx scripts/test-font-assets.ts",
     "test:scripture-scope": "node --import tsx scripts/test-scripture-scope.ts",
