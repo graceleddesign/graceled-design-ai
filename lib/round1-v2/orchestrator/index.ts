@@ -3,37 +3,10 @@ import "server-only";
 import { randomUUID } from "crypto";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
-import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
-import { normalizeBrief } from "../briefs/normalize-brief";
-import { buildScoutPlan } from "./build-scout-plan";
-import { runScoutBatch } from "./run-scout-batch";
+// Type-only imports are erased at compile time — safe on the startup path.
+import type { Prisma } from "@prisma/client";
 import type { ScoutGenerationResult } from "./run-scout-batch";
-import { evaluateScout } from "../eval/evaluate-scout";
 import type { ScoutEvalResult } from "../eval/evaluate-scout";
-import { selectScouts } from "./select-scouts";
-import { runRebuildBatch } from "./run-rebuild-batch";
-import {
-  computeCleanMinimalLayout,
-  chooseTextPaletteForBackground,
-  buildCleanMinimalOverlaySvg,
-  buildCleanMinimalDesignDoc,
-} from "@/lib/templates/type-clean-min";
-import {
-  renderTrimmedLockupPngFromSvg,
-  composeLockupOnBackground,
-} from "@/lib/lockup-compositor";
-import {
-  createScoutRun,
-  updateScoutRunResult,
-  createScoutEval,
-  createRebuildAttempt,
-  updateRebuildAttemptResult,
-  buildCreateScoutRunInput,
-  buildUpdateScoutRunResultInput,
-  buildCreateScoutEvalInput,
-  buildCreateRebuildAttemptInput,
-} from "../storage";
 import type { Round1Engine, Round1V2Result } from "../types";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -83,6 +56,26 @@ export class RoundOneV2NotImplementedError extends Error {
 
 export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> {
   console.log(`[v2] start project=${projectId}`);
+
+  // All heavy runtime imports are deferred to here so they never land on the
+  // startup module graph. They load once on first invocation and are cached.
+  const { prisma } = await import("@/lib/prisma");
+  const { normalizeBrief } = await import("../briefs/normalize-brief");
+  const { buildScoutPlan } = await import("./build-scout-plan");
+  const { runScoutBatch } = await import("./run-scout-batch");
+  const { evaluateScout } = await import("../eval/evaluate-scout");
+  const { selectScouts } = await import("./select-scouts");
+  const { runRebuildBatch } = await import("./run-rebuild-batch");
+  const {
+    computeCleanMinimalLayout,
+    chooseTextPaletteForBackground,
+    buildCleanMinimalOverlaySvg,
+    buildCleanMinimalDesignDoc,
+  } = await import("@/lib/templates/type-clean-min");
+  const { renderTrimmedLockupPngFromSvg, composeLockupOnBackground } = await import(
+    "@/lib/lockup-compositor"
+  );
+  const storage = await import("../storage");
 
   // ── 1. Look up project ─────────────────────────────────────────────────────
 
@@ -185,7 +178,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             grammarKey: scout.grammarKey,
             diversityFamily: scout.diversityFamily,
             compositeScore: scout.compositeScore,
-          } as Prisma.InputJsonValue,
+          } as unknown as Prisma.InputJsonValue,
         },
       })
     )
@@ -201,8 +194,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     const scout = selection.selected[i];
     const generationId = generationIds[i];
     try {
-      const scoutRun = await createScoutRun(
-        buildCreateScoutRunInput({
+      const scoutRun = await storage.createScoutRun(
+        storage.buildCreateScoutRunInput({
           generationId,
           runSeed,
           slotIndex: scout.slotIndex,
@@ -211,8 +204,12 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
           prompt: scout.result.prompt,
         })
       );
-      await updateScoutRunResult(buildUpdateScoutRunResultInput(scoutRun.id, scout.result));
-      await createScoutEval(buildCreateScoutEvalInput(scoutRun.id, scout.eval));
+      await storage.updateScoutRunResult(
+        storage.buildUpdateScoutRunResultInput(scoutRun.id, scout.result)
+      );
+      await storage.createScoutEval(
+        storage.buildCreateScoutEvalInput(scoutRun.id, scout.eval)
+      );
       scoutRunIdBySlotIndex.set(scout.slotIndex, scoutRun.id);
     } catch (err) {
       console.warn(`[v2] scout run persistence failed for ${scout.label}: ${String(err)}`);
@@ -229,7 +226,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     selection.selected,
     falNanaBananaPro,
     falNanaBanana
-    // No generationId option — we handle per-lane persistence below
+    // No generationId option — per-lane persistence is handled below
   );
 
   console.log(
@@ -237,6 +234,57 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   );
 
   // ── 10. Per-lane: persist rebuild attempt + lockup composition + settle ─────
+
+  const DEFAULT_PALETTE: {
+    primary: string;
+    secondary: string;
+    tertiary: string;
+    rule: string;
+    accent: string;
+    autoScrim: boolean;
+    scrimTint: "#FFFFFF" | "#000000";
+    forceTitleOutline: boolean;
+    forceTitleShadow: boolean;
+    forceSubtitleShadow: boolean;
+    safeVariantApplied: boolean;
+  } = {
+    primary: "#F8FAFC",
+    secondary: "#E2E8F0",
+    tertiary: "#CBD5E1",
+    rule: "#F8FAFC",
+    accent: "#F8FAFC",
+    autoScrim: false,
+    scrimTint: "#000000",
+    forceTitleOutline: false,
+    forceTitleShadow: false,
+    forceSubtitleShadow: false,
+    safeVariantApplied: false,
+  };
+
+  const buildV2FailedOutput = (
+    reason: string,
+    label: string
+  ): object => {
+    const content = { title: brief.title, subtitle: brief.subtitle, passage: brief.scripturePassages };
+    const designDoc = buildCleanMinimalDesignDoc({
+      width: WIDE_WIDTH,
+      height: WIDE_HEIGHT,
+      content,
+      palette: DEFAULT_PALETTE,
+      backgroundImagePath: null,
+    });
+    return {
+      status: "FAILED",
+      designDoc,
+      designDocByShape: { wide: designDoc },
+      notes: `V2 lane ${label} failed: ${reason}`,
+      meta: {
+        styleRefCount: 0,
+        usedStylePaths: [],
+        debug: { v2: true, failureReason: reason },
+      },
+    };
+  };
 
   const laneLog: string[] = [];
 
@@ -247,16 +295,18 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
     // Persist rebuild attempt record (best-effort)
     try {
-      const rebuildAttempt = await createRebuildAttempt(
-        buildCreateRebuildAttemptInput({
+      const rebuildAttempt = await storage.createRebuildAttempt(
+        storage.buildCreateRebuildAttemptInput({
           generationId,
           selected: scout,
           scoutRunId: scoutRunIdBySlotIndex.get(scout.slotIndex),
-          providerId: rebuildResult.providerId ?? (rebuildResult.usedFallback ? "fal.nano-banana" : "fal.nano-banana-pro"),
+          providerId:
+            rebuildResult.providerId ??
+            (rebuildResult.usedFallback ? "fal.nano-banana" : "fal.nano-banana-pro"),
           attemptOrder: 0,
         })
       );
-      await updateRebuildAttemptResult({
+      await storage.updateRebuildAttemptResult({
         id: rebuildAttempt.id,
         status: rebuildResult.status === "success" ? "SUCCESS" : "FAILED",
         failureReason: rebuildResult.error ?? undefined,
@@ -271,10 +321,12 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       const reason = rebuildResult.error ?? "unknown";
       console.warn(`[v2] lane ${scout.label} rebuild failed: ${reason}`);
 
-      const failedOutput = buildV2FailedOutput(brief, `Rebuild failed: ${reason}`, scout.label);
       await prisma.generation.update({
         where: { id: generationId },
-        data: { status: "FAILED", output: failedOutput as Prisma.InputJsonValue },
+        data: {
+          status: "FAILED",
+          output: buildV2FailedOutput(`Rebuild failed: ${reason}`, scout.label) as unknown as Prisma.InputJsonValue,
+        },
       });
 
       laneLog.push(`${scout.label}=failed(rebuild:${reason.slice(0, 40)})`);
@@ -299,7 +351,12 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         height: WIDE_HEIGHT,
       });
 
-      const lockupSvg = buildCleanMinimalOverlaySvg({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette });
+      const lockupSvg = buildCleanMinimalOverlaySvg({
+        width: WIDE_WIDTH,
+        height: WIDE_HEIGHT,
+        content,
+        palette,
+      });
       const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(lockupSvg);
 
       const finalPng = await composeLockupOnBackground({
@@ -349,7 +406,10 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       await prisma.$transaction(async (tx) => {
         await tx.generation.update({
           where: { id: generationId },
-          data: { status: "COMPLETED", output: completedOutput as Prisma.InputJsonValue },
+          data: {
+            status: "COMPLETED",
+            output: completedOutput as unknown as Prisma.InputJsonValue,
+          },
         });
         await tx.asset.createMany({
           data: [
@@ -393,11 +453,13 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       const reason = err instanceof Error ? err.message : String(err);
       console.error(`[v2] lane ${scout.label} lockup/settlement error: ${reason}`);
 
-      const failedOutput = buildV2FailedOutput(brief, `Lockup/settlement failed: ${reason}`, scout.label);
       try {
         await prisma.generation.update({
           where: { id: generationId },
-          data: { status: "FAILED", output: failedOutput as Prisma.InputJsonValue },
+          data: {
+            status: "FAILED",
+            output: buildV2FailedOutput(`Lockup/settlement failed: ${reason}`, scout.label) as unknown as Prisma.InputJsonValue,
+          },
         });
       } catch (settleErr) {
         console.error(`[v2] lane ${scout.label} failed to settle: ${String(settleErr)}`);
@@ -412,58 +474,3 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   return {};
 }
-
-// ── Output helpers ────────────────────────────────────────────────────────────
-
-function buildV2FailedOutput(
-  brief: { title: string; subtitle: string | null; scripturePassages: string | null },
-  reason: string,
-  label: string
-): object {
-  const content = { title: brief.title, subtitle: brief.subtitle, passage: brief.scripturePassages };
-  const designDoc = buildCleanMinimalDesignDoc({
-    width: WIDE_WIDTH,
-    height: WIDE_HEIGHT,
-    content,
-    palette: DEFAULT_PALETTE,
-    backgroundImagePath: null,
-  });
-
-  return {
-    status: "FAILED",
-    designDoc,
-    designDocByShape: { wide: designDoc },
-    notes: `V2 lane ${label} failed: ${reason}`,
-    meta: {
-      styleRefCount: 0,
-      usedStylePaths: [],
-      debug: { v2: true, failureReason: reason },
-    },
-  };
-}
-
-const DEFAULT_PALETTE: {
-  primary: string;
-  secondary: string;
-  tertiary: string;
-  rule: string;
-  accent: string;
-  autoScrim: boolean;
-  scrimTint: "#FFFFFF" | "#000000";
-  forceTitleOutline: boolean;
-  forceTitleShadow: boolean;
-  forceSubtitleShadow: boolean;
-  safeVariantApplied: boolean;
-} = {
-  primary: "#F8FAFC",
-  secondary: "#E2E8F0",
-  tertiary: "#CBD5E1",
-  rule: "#F8FAFC",
-  accent: "#F8FAFC",
-  autoScrim: false,
-  scrimTint: "#000000",
-  forceTitleOutline: false,
-  forceTitleShadow: false,
-  forceSubtitleShadow: false,
-  safeVariantApplied: false,
-};
