@@ -39,6 +39,19 @@ enum AiRunStatus {
   FAILED
 }
 
+enum ScoutRunStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum RebuildStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
 model User {
   id            String       @id @default(cuid())
   email         String       @unique
@@ -169,10 +182,12 @@ model Generation {
   status        GenerationStatus  @default(QUEUED)
   input         Json?
   output        Json?
-  finalDesigns  FinalDesign[]
-  assets        Asset[]
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
+  finalDesigns    FinalDesign[]
+  assets          Asset[]
+  scoutRuns       ScoutRun[]
+  rebuildAttempts RebuildAttempt[]
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   project       Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
   preset        Preset?           @relation(fields: [presetId], references: [id], onDelete: SetNull)
@@ -293,4 +308,72 @@ model BenchmarkRun {
   updatedAt             DateTime      @updatedAt
   benchmarkCase         BenchmarkCase @relation(fields: [caseKey], references: [caseKey], onDelete: Cascade)
   run                   AiRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
+}
+
+// ── Round 1 V2 lineage ────────────────────────────────────────────────────────
+
+model ScoutRun {
+  id              String         @id @default(cuid())
+  generationId    String
+  runSeed         String
+  slotIndex       Int
+  grammarKey      String
+  diversityFamily String
+  tone            String
+  motifBinding    Json
+  seed            Int
+  providerId      String
+  prompt          String
+  promptSpecJson  Json
+  status          ScoutRunStatus @default(PENDING)
+  failureReason   String?
+  assetPath       String?
+  latencyMs       Int?
+  providerModel   String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  generation      Generation     @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  eval            ScoutEval?
+  rebuildAttempts RebuildAttempt[]
+
+  @@index([generationId])
+  @@index([runSeed])
+}
+
+model ScoutEval {
+  id             String    @id @default(cuid())
+  scoutRunId     String    @unique
+  hardReject     Boolean
+  rejectReasons  Json
+  textDetected   Boolean
+  toneScore      Float
+  structureScore Float
+  marginScore    Float
+  compositeScore Float
+  imageStatsJson Json?
+  createdAt      DateTime  @default(now())
+
+  scoutRun       ScoutRun  @relation(fields: [scoutRunId], references: [id], onDelete: Cascade)
+}
+
+model RebuildAttempt {
+  id            String        @id @default(cuid())
+  generationId  String
+  scoutRunId    String?
+  optionIndex   Int
+  providerId    String
+  attemptOrder  Int
+  status        RebuildStatus @default(PENDING)
+  failureReason String?
+  assetPath     String?
+  latencyMs     Int?
+  providerModel String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  generation    Generation    @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  scoutRun      ScoutRun?     @relation(fields: [scoutRunId], references: [id], onDelete: SetNull)
+
+  @@index([generationId])
 }
