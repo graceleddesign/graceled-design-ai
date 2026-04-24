@@ -8,12 +8,20 @@ import {
   RebuildResult,
 } from "./rebuild-provider";
 
-const MODEL_ID = "fal-ai/flux-pro";
+// Fallback rebuild provider: Nano Banana (base) via FAL.
+// Used when Nano Banana Pro is rate-limited, unavailable, or times out.
+// Uses aspect_ratio (not image_size); no seed parameter supported.
+const MODEL_ID = "fal-ai/nano-banana";
 
-type FluxProOutput = {
+type NanoBananaOutput = {
   images: Array<{ url: string }>;
-  seed?: number;
+  description?: string;
 };
+
+function deriveAspectRatio(widthPx: number, heightPx: number): "16:9" | "1:1" {
+  const ratio = widthPx / heightPx;
+  return ratio >= 1.6 ? "16:9" : "1:1";
+}
 
 async function fetchImageBytes(url: string): Promise<Buffer> {
   let last: Error | null = null;
@@ -44,9 +52,8 @@ function classifyFalError(err: unknown): RebuildProviderError {
   return new RebuildProviderError("UNKNOWN", msg, err);
 }
 
-// Primary rebuild provider: Flux Pro via FAL.
-export const falFluxProProvider: RebuildProvider = {
-  id: "fal.flux-pro",
+export const falNanaBanana: RebuildProvider = {
+  id: "fal.nano-banana",
 
   async generate(req: RebuildRequest): Promise<RebuildResult> {
     const apiKey = process.env.FAL_API_KEY?.trim();
@@ -60,10 +67,9 @@ export const falFluxProProvider: RebuildProvider = {
       raw = await fal.subscribe(MODEL_ID, {
         input: {
           prompt: req.prompt,
-          image_size: { width: req.widthPx, height: req.heightPx },
-          seed: req.seed,
-          safety_tolerance: "6",
+          aspect_ratio: deriveAspectRatio(req.widthPx, req.heightPx),
           num_images: 1,
+          output_format: "png",
         },
       });
     } catch (err) {
@@ -71,9 +77,9 @@ export const falFluxProProvider: RebuildProvider = {
     }
 
     const latencyMs = Date.now() - started;
-    const output = (raw as { data: FluxProOutput }).data;
+    const output = (raw as { data: NanoBananaOutput }).data;
     const imageUrl = output?.images?.[0]?.url;
-    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Flux Pro returned no image URL");
+    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Nano Banana returned no image URL");
 
     let imageBytes: Buffer;
     try {
@@ -86,7 +92,7 @@ export const falFluxProProvider: RebuildProvider = {
       imageBytes,
       latencyMs,
       providerModel: MODEL_ID,
-      seed: output.seed ?? req.seed,
+      seed: req.seed, // model does not return a seed; echo the request seed for lineage
     };
   },
 };

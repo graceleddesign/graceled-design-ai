@@ -9,7 +9,7 @@ export const ROUND1_V2_CONFIG = {
   scoutConcurrency: 4,
 
   // Rebuild stage
-  rebuildFallbackBudget: 1, // max extra Flux Dev fallback attempts per lane on Flux Pro failure
+  rebuildFallbackBudget: 1, // max extra Nano Banana 2 fallback attempts per lane on Nano Banana Pro failure
 
   // Shadow mode
   shadowSamplingRate: 0.1, // fraction of V1 launches that also run V2 in shadow

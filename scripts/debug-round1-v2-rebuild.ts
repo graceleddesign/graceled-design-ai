@@ -78,8 +78,8 @@ const { runScoutBatch } = await import("../lib/round1-v2/orchestrator/run-scout-
 const { evaluateScout } = await import("../lib/round1-v2/eval/evaluate-scout");
 const { selectScouts } = await import("../lib/round1-v2/orchestrator/select-scouts");
 const { runRebuildBatch } = await import("../lib/round1-v2/orchestrator/run-rebuild-batch");
-const { falFluxProProvider } = await import("../lib/round1-v2/providers/fal-flux-pro");
-const { falFluxDevProvider } = await import("../lib/round1-v2/providers/fal-flux-dev");
+const { falNanaBananaPro } = await import("../lib/round1-v2/providers/fal-nano-banana-pro");
+const { falNanaBanana } = await import("../lib/round1-v2/providers/fal-nano-banana");
 
 const outDir = join("/tmp", "v2-rebuild", fixture.id);
 mkdirSync(outDir, { recursive: true });
@@ -127,7 +127,7 @@ if (selection.selected.length === 0) {
 
 // Stage 4: Rebuild
 console.log(`\n--- Rebuilding ${selection.selected.length} selected scouts via Nano Banana Pro ---`);
-const rebuildResult = await runRebuildBatch(brief, selection.selected, falFluxProProvider, falFluxDevProvider);
+const rebuildResult = await runRebuildBatch(brief, selection.selected, falNanaBananaPro, falNanaBanana);
 
 console.log("\n--- Rebuild Results ---");
 for (const r of rebuildResult.results) {
