@@ -183,13 +183,13 @@ test("buildCreateRebuildAttemptInput maps selection correctly", () => {
     generationId: "gen_xyz",
     selected,
     scoutRunId: "scout_run_1",
-    providerId: "nano-banana-pro",
+    providerId: "fal.flux-pro",
     attemptOrder: 0,
   });
   assert.equal(input.generationId, "gen_xyz");
   assert.equal(input.scoutRunId, "scout_run_1");
   assert.equal(input.optionIndex, 0); // slotIndex of selected scout
-  assert.equal(input.providerId, "nano-banana-pro");
+  assert.equal(input.providerId, "fal.flux-pro");
   assert.equal(input.attemptOrder, 0);
 });
 
@@ -199,7 +199,7 @@ test("buildCreateRebuildAttemptInput handles missing scoutRunId", () => {
   const input = buildCreateRebuildAttemptInput({
     generationId: "gen_xyz",
     selected,
-    providerId: "nano-banana-pro",
+    providerId: "fal.flux-pro",
     attemptOrder: 1,
   });
   assert.equal(input.scoutRunId, undefined);

@@ -87,8 +87,8 @@ function makeFailProvider(id: string, kind: RebuildProviderError["kind"]): Rebui
 test("successful rebuild returns one result per selected scout", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0), makeSelected("B", 2), makeSelected("C", 4)];
-  const primary = makeSuccessProvider("nano-banana-pro");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeSuccessProvider("fal.flux-pro");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -100,8 +100,8 @@ test("successful rebuild returns one result per selected scout", async () => {
 test("successful result has imageBytes and correct label", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeSuccessProvider("nano-banana-pro");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeSuccessProvider("fal.flux-pro");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
   const r = batch.results[0];
@@ -117,22 +117,22 @@ test("successful result has imageBytes and correct label", async () => {
 test("falls back to secondary on RATE_LIMIT from primary", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "RATE_LIMIT");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeFailProvider("fal.flux-pro", "RATE_LIMIT");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
   const r = batch.results[0];
 
   assert.equal(r.status, "success");
   assert.equal(r.usedFallback, true);
-  assert.ok(r.providerId?.includes("nano-banana-2"));
+  assert.ok(r.providerId?.includes("fal.flux-dev"));
 });
 
 test("falls back to secondary on MODEL_UNAVAILABLE from primary", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "MODEL_UNAVAILABLE");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeFailProvider("fal.flux-pro", "MODEL_UNAVAILABLE");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -143,8 +143,8 @@ test("falls back to secondary on MODEL_UNAVAILABLE from primary", async () => {
 test("falls back to secondary on TIMEOUT from primary", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "TIMEOUT");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeFailProvider("fal.flux-pro", "TIMEOUT");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -155,8 +155,8 @@ test("falls back to secondary on TIMEOUT from primary", async () => {
 test("does NOT fall back on CONTENT_POLICY — lane fails immediately", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "CONTENT_POLICY");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeFailProvider("fal.flux-pro", "CONTENT_POLICY");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -167,8 +167,8 @@ test("does NOT fall back on CONTENT_POLICY — lane fails immediately", async ()
 test("does NOT fall back on UNKNOWN error — lane fails immediately", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "UNKNOWN");
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const primary = makeFailProvider("fal.flux-pro", "UNKNOWN");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -179,8 +179,8 @@ test("does NOT fall back on UNKNOWN error — lane fails immediately", async () 
 test("fails cleanly when both primary and fallback fail with retryable error", async () => {
   const brief = makeBrief();
   const selected = [makeSelected("A", 0)];
-  const primary = makeFailProvider("nano-banana-pro", "RATE_LIMIT");
-  const fallback = makeFailProvider("nano-banana-2", "RATE_LIMIT");
+  const primary = makeFailProvider("fal.flux-pro", "RATE_LIMIT");
+  const fallback = makeFailProvider("fal.flux-dev", "RATE_LIMIT");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 
@@ -207,7 +207,7 @@ test("each lane is independent — one failure does not block others", async () 
       return { imageBytes: Buffer.from("ok"), latencyMs: 100, providerModel: "m", seed: _req.seed };
     },
   };
-  const fallback = makeSuccessProvider("nano-banana-2");
+  const fallback = makeSuccessProvider("fal.flux-dev");
 
   const batch = await runRebuildBatch(brief, selected, primary, fallback);
 

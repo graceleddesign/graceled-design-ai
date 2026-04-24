@@ -44,8 +44,9 @@ function classifyFalError(err: unknown): RebuildProviderError {
   return new RebuildProviderError("UNKNOWN", msg, err);
 }
 
-export const falNanaBananaPro: RebuildProvider = {
-  id: "fal.nano-banana-pro",
+// Primary rebuild provider: Flux Pro via FAL.
+export const falFluxProProvider: RebuildProvider = {
+  id: "fal.flux-pro",
 
   async generate(req: RebuildRequest): Promise<RebuildResult> {
     const apiKey = process.env.FAL_API_KEY?.trim();
@@ -72,7 +73,7 @@ export const falNanaBananaPro: RebuildProvider = {
     const latencyMs = Date.now() - started;
     const output = (raw as { data: FluxProOutput }).data;
     const imageUrl = output?.images?.[0]?.url;
-    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Nano Banana Pro returned no image URL");
+    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Flux Pro returned no image URL");
 
     let imageBytes: Buffer;
     try {

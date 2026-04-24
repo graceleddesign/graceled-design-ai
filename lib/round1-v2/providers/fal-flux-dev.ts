@@ -8,8 +8,8 @@ import {
   RebuildResult,
 } from "./rebuild-provider";
 
-// Nano Banana 2: bounded fallback via Flux Dev.
-// Used when Nano Banana Pro is rate-limited, unavailable, or times out.
+// Fallback rebuild provider: Flux Dev via FAL.
+// Used when Flux Pro is rate-limited, unavailable, or times out.
 
 const MODEL_ID = "fal-ai/flux/dev";
 
@@ -47,8 +47,8 @@ function classifyFalError(err: unknown): RebuildProviderError {
   return new RebuildProviderError("UNKNOWN", msg, err);
 }
 
-export const falNanaBanana2: RebuildProvider = {
-  id: "fal.nano-banana-2",
+export const falFluxDevProvider: RebuildProvider = {
+  id: "fal.flux-dev",
 
   async generate(req: RebuildRequest): Promise<RebuildResult> {
     const apiKey = process.env.FAL_API_KEY?.trim();
@@ -76,7 +76,7 @@ export const falNanaBanana2: RebuildProvider = {
     const latencyMs = Date.now() - started;
     const output = (raw as { data: FluxDevOutput }).data;
     const imageUrl = output?.images?.[0]?.url;
-    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Nano Banana 2 returned no image URL");
+    if (!imageUrl) throw new RebuildProviderError("UNKNOWN", "Flux Dev returned no image URL");
 
     let imageBytes: Buffer;
     try {
