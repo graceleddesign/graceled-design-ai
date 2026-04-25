@@ -11,6 +11,10 @@ export const ROUND1_V2_CONFIG = {
   // Rebuild stage
   rebuildFallbackBudget: 1, // max extra Nano Banana 2 fallback attempts per lane on Nano Banana Pro failure
 
+  // Backfill stage — if a lane fails rebuild/validation, try this many additional
+  // scouts from the already-generated (not-selected) pool before giving up.
+  laneBackfillBudget: 2,
+
   // Shadow mode
   shadowSamplingRate: 0.1, // fraction of V1 launches that also run V2 in shadow
 

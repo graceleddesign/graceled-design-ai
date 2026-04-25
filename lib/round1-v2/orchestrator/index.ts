@@ -9,6 +9,8 @@ import type { ScoutGenerationResult } from "./run-scout-batch";
 import type { ScoutEvalResult } from "../eval/evaluate-scout";
 import type { Round1Engine, Round1V2Result } from "../types";
 import type { ProductionBackgroundValidationEvidence } from "@/lib/production-valid-option";
+import type { BackfillDebugMeta, TextRetryMeta } from "./lane-backfill";
+import { ROUND1_V2_CONFIG } from "../config";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -67,7 +69,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { runScoutBatch } = await import("./run-scout-batch");
   const { evaluateScout } = await import("../eval/evaluate-scout");
   const { selectScouts } = await import("./select-scouts");
-  const { runRebuildBatch } = await import("./run-rebuild-batch");
+  const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
   const {
     computeCleanMinimalLayout,
     chooseTextPaletteForBackground,
@@ -220,23 +222,27 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   }
 
   // ── 9. Rebuild selected scouts (Nano Banana Pro → Nano Banana fallback) ────
+  //      Backfill loop: if a lane fails, try eligible non-selected scouts.
 
   const { falNanaBananaPro } = await import("../providers/fal-nano-banana-pro");
   const { falNanaBanana } = await import("../providers/fal-nano-banana");
 
-  const rebuildBatch = await runRebuildBatch(
-    brief,
-    selection.selected,
-    falNanaBananaPro,
-    falNanaBanana
-    // No generationId option — per-lane persistence is handled below
-  );
+  // Build the backfill pool from non-selected scouts that passed eval.
+  const selectedSlotIndices = new Set(selection.selected.map((s) => s.slotIndex));
+  const backfillPool = buildBackfillPool({
+    plan,
+    results: scoutBatch.results,
+    evals,
+    selectedSlotIndices,
+  });
 
-  console.log(
-    `[v2] rebuild: ${rebuildBatch.successCount}/${rebuildBatch.results.length} succeeded in ${rebuildBatch.totalLatencyMs}ms`
-  );
+  console.log(`[v2] backfill pool: ${backfillPool.length} candidates available`);
 
-  // ── 10. Per-lane: persist rebuild attempt + lockup composition + settle ─────
+  // Track which scout slot indices are committed to completed lanes.
+  // No scout may be used by more than one completed lane.
+  const completedSlotIndices = new Set<number>();
+
+  // ── 10. Per-lane: backfill loop + lockup composition + settle ──────────────
 
   const DEFAULT_PALETTE: {
     primary: string;
@@ -298,161 +304,123 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   for (let i = 0; i < selection.selected.length; i++) {
     const scout = selection.selected[i];
-    const rebuildResult = rebuildBatch.results[i];
     const generationId = generationIds[i];
 
-    // Persist rebuild attempt record (best-effort)
+    // Grammar keys used by this lane and by already-completed lanes — for diversity preference.
+    const completedGrammarKeys = new Set<string>();
+    for (const si of completedSlotIndices) {
+      const cs = selection.selected.find((s) => s.slotIndex === si);
+      if (cs) completedGrammarKeys.add(cs.grammarKey);
+    }
+    const preferNotGrammarKeys = new Set([scout.grammarKey, ...completedGrammarKeys]);
+
+    const { candidates: eligibleBackfills, diversityRelaxed: poolDiversityRelaxed } =
+      selectEligibleBackfill({
+        pool: backfillPool,
+        completedSlotIndices,
+        preferNotGrammarKeys,
+        maxCount: ROUND1_V2_CONFIG.laneBackfillBudget,
+      });
+
+    console.log(
+      `[v2] lane ${scout.label}: primary slot=${scout.slotIndex} backfill_pool=${eligibleBackfills.length} diversityRelaxed=${poolDiversityRelaxed}`
+    );
+
+    const laneResult = await runLaneWithBackfill({
+      laneLabel: scout.label,
+      primaryScout: scout,
+      backfillCandidates: eligibleBackfills,
+      budget: ROUND1_V2_CONFIG.laneBackfillBudget,
+      negativeHints: brief.negativeHints,
+      primaryProvider: falNanaBananaPro,
+      fallbackProvider: falNanaBanana,
+      rebuildFallbackBudget: ROUND1_V2_CONFIG.rebuildFallbackBudget,
+      preferNotGrammarKeys,
+      evalFn: (args) => evaluateScout(args),
+      acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
+    });
+
+    // Persist a rebuild attempt record (best-effort; reflects the accepted/last attempt)
     try {
+      const usedSlotIndex =
+        laneResult.status === "accepted" ? laneResult.usedScoutSlotIndex : scout.slotIndex;
+      const providerId =
+        laneResult.status === "accepted"
+          ? laneResult.providerId
+          : laneResult.status === "exhausted" && laneResult.backfillDebug.attemptCount === 0
+          ? "fal.nano-banana-pro"
+          : "fal.nano-banana-pro";
       const rebuildAttempt = await storage.createRebuildAttempt(
         storage.buildCreateRebuildAttemptInput({
           generationId,
           selected: scout,
-          scoutRunId: scoutRunIdBySlotIndex.get(scout.slotIndex),
-          providerId:
-            rebuildResult.providerId ??
-            (rebuildResult.usedFallback ? "fal.nano-banana" : "fal.nano-banana-pro"),
+          scoutRunId: scoutRunIdBySlotIndex.get(usedSlotIndex),
+          providerId,
           attemptOrder: 0,
         })
       );
       await storage.updateRebuildAttemptResult({
         id: rebuildAttempt.id,
-        status: rebuildResult.status === "success" ? "SUCCESS" : "FAILED",
-        failureReason: rebuildResult.error ?? undefined,
-        latencyMs: rebuildResult.latencyMs,
-        providerModel: rebuildResult.providerModel,
+        status: laneResult.status === "accepted" ? "SUCCESS" : "FAILED",
+        failureReason:
+          laneResult.status === "exhausted" ? laneResult.lastFailureReason : undefined,
+        providerModel:
+          laneResult.status === "accepted" ? laneResult.providerModel : undefined,
       });
     } catch (err) {
       console.warn(`[v2] rebuild attempt persistence failed for ${scout.label}: ${String(err)}`);
     }
 
-    if (rebuildResult.status === "failed" || !rebuildResult.imageBytes) {
-      const reason = rebuildResult.error ?? "unknown";
-      console.warn(`[v2] lane ${scout.label} rebuild failed: ${reason}`);
+    if (laneResult.status === "exhausted") {
+      const reason = laneResult.lastFailureReason;
+      console.warn(
+        `[v2] lane ${scout.label} exhausted all candidates: ${reason} attempts=${laneResult.backfillDebug.attemptCount}`
+      );
+
+      const failedOutput = buildV2FailedOutput(reason, scout.label, laneResult.lastFailureEvidence);
+      const failedOutputWithBackfill = {
+        ...failedOutput,
+        meta: {
+          ...(failedOutput as any).meta,
+          debug: {
+            ...(failedOutput as any).meta?.debug,
+            textRetry: laneResult.textRetryMeta,
+            backfill: laneResult.backfillDebug,
+          },
+        },
+      };
 
       await prisma.generation.update({
         where: { id: generationId },
         data: {
           status: "FAILED",
-          output: buildV2FailedOutput(`Rebuild failed: ${reason}`, scout.label) as unknown as Prisma.InputJsonValue,
+          output: failedOutputWithBackfill as unknown as Prisma.InputJsonValue,
         },
       });
 
-      laneLog.push(`${scout.label}=failed(rebuild:${reason.slice(0, 40)})`);
+      laneLog.push(
+        `${scout.label}=failed(exhausted[${laneResult.backfillDebug.attemptCount}]:${reason.slice(0, 60)})`
+      );
       continue;
     }
 
-    // Background acceptance: evaluate rebuilt image before committing to COMPLETED
+    // laneResult.status === "accepted" — compose lockup and settle as COMPLETED.
+    // Track the used scout so it cannot be reused for other lanes.
+    completedSlotIndices.add(laneResult.usedScoutSlotIndex);
+
+    const acceptedBackgroundPng = laneResult.imageBytes;
+    const finalBackgroundEvidence = laneResult.backgroundEvidence;
+    const textRetryMeta: TextRetryMeta = laneResult.textRetryMeta;
+    const backfillDebug: BackfillDebugMeta = laneResult.backfillDebug;
+
     try {
-      const rawBackgroundPng = rebuildResult.imageBytes;
-
-      // Re-evaluate the rebuilt image using the same scout eval infrastructure.
-      // This produces honest textFree/scaffoldFree/motifPresent/toneFit evidence.
-      const rebuildEval = await evaluateScout({ slot: scout.slot, imageBytes: rawBackgroundPng });
-
-      const backgroundEvidence: ProductionBackgroundValidationEvidence = {
-        source: "generated",
-        sourceGenerationId: null,
-        textFree: !rebuildEval.rejectReasons.includes("text_artifact_detected"),
-        scaffoldFree: !rebuildEval.rejectReasons.includes("scaffold_collapse"),
-        motifPresent: !rebuildEval.rejectReasons.includes("design_presence_absent"),
-        toneFit: !rebuildEval.rejectReasons.includes("tone_implausible"),
-        referenceFit: null,
-      };
-
-      const acceptance = evaluateBackgroundAcceptance({ evidence: backgroundEvidence });
-
-      // ── Text-detection retry (V2 only) ───────────────────────────────────────
-      // When the only (or one of the) rejection reasons is background_text_detected,
-      // retry once with a stronger text-removal prompt before giving up.
-      let textRetryMeta: {
-        attempted: boolean;
-        originalRejectionReason: string | null;
-        retryRejectionReason: string | null;
-        retryBecameAccepted: boolean;
-      } = { attempted: false, originalRejectionReason: null, retryRejectionReason: null, retryBecameAccepted: false };
-
-      let acceptedBackgroundPng = rawBackgroundPng;
-      let finalBackgroundEvidence = backgroundEvidence;
-
-      if (!acceptance.accepted && acceptance.invalidReasons.includes("background_text_detected")) {
-        const originalRejectionReason = acceptance.invalidReasons.join("; ");
-        textRetryMeta = { attempted: true, originalRejectionReason, retryRejectionReason: null, retryBecameAccepted: false };
-
-        const { runV2BackgroundTextRetry, textRetrySeed } = await import("./run-text-retry");
-        const retryResult = await runV2BackgroundTextRetry({
-          scout,
-          negativeHints: brief.negativeHints,
-          primaryProvider: falNanaBananaPro,
-          fallbackProvider: falNanaBanana,
-          retrySeed: textRetrySeed(scout.slot.seed),
-          evalFn: (args) => evaluateScout(args),
-          acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
-        });
-
-        console.log(`[v2] lane ${scout.label} text-retry: status=${retryResult.status}`);
-
-        if (retryResult.status === "accepted" && retryResult.imageBytes && retryResult.backgroundEvidence) {
-          acceptedBackgroundPng = retryResult.imageBytes;
-          finalBackgroundEvidence = retryResult.backgroundEvidence;
-          textRetryMeta = { ...textRetryMeta, retryRejectionReason: null, retryBecameAccepted: true };
-        } else {
-          const retryRejectionReason =
-            retryResult.status === "rejected"
-              ? (retryResult.retryRejectionReasons ?? []).join("; ")
-              : (retryResult.error ?? "generation_failed");
-          textRetryMeta = { ...textRetryMeta, retryRejectionReason, retryBecameAccepted: false };
-
-          // Use the retry's evidence if available (more informative), else original
-          const persistEvidence = retryResult.backgroundEvidence ?? backgroundEvidence;
-          const reason = `Background acceptance failed after text retry: ${retryRejectionReason}`;
-          console.warn(`[v2] lane ${scout.label} text-retry also failed: ${retryRejectionReason}`);
-
-          await prisma.generation.update({
-            where: { id: generationId },
-            data: {
-              status: "FAILED",
-              output: {
-                ...buildV2FailedOutput(reason, scout.label, persistEvidence),
-                meta: {
-                  ...(buildV2FailedOutput(reason, scout.label, persistEvidence) as any).meta,
-                  debug: {
-                    v2: true,
-                    failureReason: reason,
-                    textRetry: textRetryMeta,
-                  },
-                },
-              } as unknown as Prisma.InputJsonValue,
-            },
-          });
-
-          laneLog.push(`${scout.label}=failed(text-retry:${retryRejectionReason.slice(0, 60)})`);
-          continue;
-        }
-      } else if (!acceptance.accepted) {
-        const reason = acceptance.invalidReasons.join("; ");
-        console.warn(`[v2] lane ${scout.label} background rejected: ${reason}`);
-
-        await prisma.generation.update({
-          where: { id: generationId },
-          data: {
-            status: "FAILED",
-            output: buildV2FailedOutput(`Background acceptance failed: ${reason}`, scout.label, backgroundEvidence) as unknown as Prisma.InputJsonValue,
-          },
-        });
-
-        laneLog.push(`${scout.label}=failed(acceptance:${reason.slice(0, 60)})`);
-        continue;
-      }
-
-      // Acceptance passed — compose wide lockup and settle as direction preview (COMPLETED).
-      // Round 1 V2 produces a wide-only direction preview. Square/vertical are generated at export.
       const content = {
         title: brief.title,
         subtitle: brief.subtitle,
         passage: brief.scripturePassages,
       };
 
-      // Wide lockup
+      // Wide lockup composition
       const wideLayout = computeCleanMinimalLayout({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content });
       const widePalette = await chooseTextPaletteForBackground({
         backgroundPng: acceptedBackgroundPng,
@@ -479,55 +447,54 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       const wideFinPath = await writeV2File(`${prefix}-wide.png`, wideFinalPng);
 
       // Wide design doc
-      const wideDesignDoc = buildCleanMinimalDesignDoc({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette, backgroundImagePath: bgPath });
+      const wideDesignDoc = buildCleanMinimalDesignDoc({
+        width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette, backgroundImagePath: bgPath,
+      });
 
       const lockupEvidence = {
         source: "generated" as const,
         sourceGenerationId: null,
-        textIntegrity: true,   // SVG-rendered lockup — content is deterministically correct
-        fitPass: true,          // template-controlled layout
+        textIntegrity: true,
+        fitPass: true,
         insideTitleSafeWithMargin: null,
         notTooSmall: null,
       };
+
+      // Use the accepted scout's metadata (may differ from primary if backfill was used)
+      const usedGrammarKey = laneResult.usedGrammarKey;
+      const usedDiversityFamily = laneResult.usedDiversityFamily;
+      const usedCompositeScore = laneResult.usedCompositeScore;
+      const usedBackfill = laneResult.backfillDebug.finalOutcome === "backfill";
 
       const completedOutput = {
         status: "COMPLETED",
         designDoc: wideDesignDoc,
         designDocByShape: { wide: wideDesignDoc },
-        notes: `V2 lane ${scout.label} (${scout.grammarKey}) score=${scout.compositeScore.toFixed(3)} fallback=${rebuildResult.usedFallback}`,
-        // Only wide preview path — square/vertical are generated at export time.
-        preview: {
-          widescreen_main: wideFinPath,
-        },
+        notes: `V2 lane ${scout.label} (${usedGrammarKey}) score=${usedCompositeScore.toFixed(3)} usedBackfill=${usedBackfill}`,
+        preview: { widescreen_main: wideFinPath },
         meta: {
           styleRefCount: 0,
           usedStylePaths: [],
           productionValidation: {
-            // Stage marker: wide-only direction preview — square/vertical not yet generated.
             stage: "direction_preview",
             background: finalBackgroundEvidence,
             lockup: lockupEvidence,
-            aspects: {
-              // Only widescreen is validated in Round 1. Square/vertical are generated at export.
-              widescreen: { provenance: "rendered" },
-            },
+            aspects: { widescreen: { provenance: "rendered" } },
           },
           debug: {
             v2: true,
-            grammarKey: scout.grammarKey,
-            diversityFamily: scout.diversityFamily,
-            compositeScore: scout.compositeScore,
-            usedFallback: rebuildResult.usedFallback,
-            providerModel: rebuildResult.providerModel,
+            grammarKey: usedGrammarKey,
+            diversityFamily: usedDiversityFamily,
+            compositeScore: usedCompositeScore,
+            usedFallback: laneResult.usedFallback,
+            providerModel: laneResult.providerModel,
             backgroundSource: "generated",
             lockupSource: "generated",
             generationLifecycleState: "GENERATION_COMPLETED",
             backgroundFailureReason: null,
             textRetry: textRetryMeta,
-            // Wide asset present; square/vertical intentionally not generated in Round 1.
-            aspectAssets: {
-              widescreen: "ok",
-            },
+            backfill: backfillDebug,
+            aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },
         },
@@ -541,8 +508,6 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             output: completedOutput as unknown as Prisma.InputJsonValue,
           },
         });
-        // Direction preview: 3 assets only (wide_bg, series_lockup, wide).
-        // Square/vertical assets are created during export, not Round 1.
         await tx.asset.createMany({
           data: [
             { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg",       file_path: bgPath,      mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
@@ -552,11 +517,16 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         });
       });
 
-      laneLog.push(`${scout.label}=completed(${rebuildResult.usedFallback ? "fallback" : "primary"})`);
-      console.log(`[v2] lane ${scout.label} settled: wide=${wideFinPath}`);
+      const backfillNote = usedBackfill
+        ? `backfill[slot=${laneResult.usedScoutSlotIndex}]`
+        : laneResult.usedFallback ? "fallback" : "primary";
+      laneLog.push(`${scout.label}=completed(${backfillNote})`);
+      console.log(`[v2] lane ${scout.label} settled: wide=${wideFinPath} backfill=${usedBackfill}`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(`[v2] lane ${scout.label} composition/settlement error: ${reason}`);
+      // Remove from completedSlotIndices since this lane didn't actually complete
+      completedSlotIndices.delete(laneResult.usedScoutSlotIndex);
 
       try {
         await prisma.generation.update({
