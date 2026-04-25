@@ -365,7 +365,74 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
       const acceptance = evaluateBackgroundAcceptance({ evidence: backgroundEvidence });
 
-      if (!acceptance.accepted) {
+      // ── Text-detection retry (V2 only) ───────────────────────────────────────
+      // When the only (or one of the) rejection reasons is background_text_detected,
+      // retry once with a stronger text-removal prompt before giving up.
+      let textRetryMeta: {
+        attempted: boolean;
+        originalRejectionReason: string | null;
+        retryRejectionReason: string | null;
+        retryBecameAccepted: boolean;
+      } = { attempted: false, originalRejectionReason: null, retryRejectionReason: null, retryBecameAccepted: false };
+
+      let acceptedBackgroundPng = rawBackgroundPng;
+      let finalBackgroundEvidence = backgroundEvidence;
+
+      if (!acceptance.accepted && acceptance.invalidReasons.includes("background_text_detected")) {
+        const originalRejectionReason = acceptance.invalidReasons.join("; ");
+        textRetryMeta = { attempted: true, originalRejectionReason, retryRejectionReason: null, retryBecameAccepted: false };
+
+        const { runV2BackgroundTextRetry, textRetrySeed } = await import("./run-text-retry");
+        const retryResult = await runV2BackgroundTextRetry({
+          scout,
+          negativeHints: brief.negativeHints,
+          primaryProvider: falNanaBananaPro,
+          fallbackProvider: falNanaBanana,
+          retrySeed: textRetrySeed(scout.slot.seed),
+          evalFn: (args) => evaluateScout(args),
+          acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
+        });
+
+        console.log(`[v2] lane ${scout.label} text-retry: status=${retryResult.status}`);
+
+        if (retryResult.status === "accepted" && retryResult.imageBytes && retryResult.backgroundEvidence) {
+          acceptedBackgroundPng = retryResult.imageBytes;
+          finalBackgroundEvidence = retryResult.backgroundEvidence;
+          textRetryMeta = { ...textRetryMeta, retryRejectionReason: null, retryBecameAccepted: true };
+        } else {
+          const retryRejectionReason =
+            retryResult.status === "rejected"
+              ? (retryResult.retryRejectionReasons ?? []).join("; ")
+              : (retryResult.error ?? "generation_failed");
+          textRetryMeta = { ...textRetryMeta, retryRejectionReason, retryBecameAccepted: false };
+
+          // Use the retry's evidence if available (more informative), else original
+          const persistEvidence = retryResult.backgroundEvidence ?? backgroundEvidence;
+          const reason = `Background acceptance failed after text retry: ${retryRejectionReason}`;
+          console.warn(`[v2] lane ${scout.label} text-retry also failed: ${retryRejectionReason}`);
+
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "FAILED",
+              output: {
+                ...buildV2FailedOutput(reason, scout.label, persistEvidence),
+                meta: {
+                  ...(buildV2FailedOutput(reason, scout.label, persistEvidence) as any).meta,
+                  debug: {
+                    v2: true,
+                    failureReason: reason,
+                    textRetry: textRetryMeta,
+                  },
+                },
+              } as unknown as Prisma.InputJsonValue,
+            },
+          });
+
+          laneLog.push(`${scout.label}=failed(text-retry:${retryRejectionReason.slice(0, 60)})`);
+          continue;
+        }
+      } else if (!acceptance.accepted) {
         const reason = acceptance.invalidReasons.join("; ");
         console.warn(`[v2] lane ${scout.label} background rejected: ${reason}`);
 
@@ -391,7 +458,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       // Wide lockup
       const wideLayout = computeCleanMinimalLayout({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content });
       const widePalette = await chooseTextPaletteForBackground({
-        backgroundPng: rawBackgroundPng,
+        backgroundPng: acceptedBackgroundPng,
         sampleRegion: wideLayout.textRegion,
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
@@ -399,7 +466,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       const wideLockupSvg = buildCleanMinimalOverlaySvg({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette });
       const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(wideLockupSvg);
       const wideFinalPng = await composeLockupOnBackground({
-        backgroundPng: rawBackgroundPng,
+        backgroundPng: acceptedBackgroundPng,
         lockupPng,
         shape: "wide",
         width: WIDE_WIDTH,
@@ -409,7 +476,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       });
 
       // Square crop + lockup
-      const squareBgPng = await resizeCoverWithFocalPoint({ input: rawBackgroundPng, width: SQUARE_WIDTH, height: SQUARE_HEIGHT });
+      const squareBgPng = await resizeCoverWithFocalPoint({ input: acceptedBackgroundPng, width: SQUARE_WIDTH, height: SQUARE_HEIGHT });
       const squareFinalPng = await composeLockupOnBackground({
         backgroundPng: squareBgPng,
         lockupPng,
@@ -421,7 +488,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       });
 
       // Tall crop + lockup
-      const tallBgPng = await resizeCoverWithFocalPoint({ input: rawBackgroundPng, width: TALL_WIDTH, height: TALL_HEIGHT });
+      const tallBgPng = await resizeCoverWithFocalPoint({ input: acceptedBackgroundPng, width: TALL_WIDTH, height: TALL_HEIGHT });
       const tallFinalPng = await composeLockupOnBackground({
         backgroundPng: tallBgPng,
         lockupPng,
@@ -434,7 +501,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
       // Write all files
       const prefix = generationId;
-      const bgPath = await writeV2File(`${prefix}-wide-bg.png`, rawBackgroundPng);
+      const bgPath = await writeV2File(`${prefix}-wide-bg.png`, acceptedBackgroundPng);
       const lockupPath = await writeV2File(`${prefix}-lockup.png`, lockupPng);
       const wideFinPath = await writeV2File(`${prefix}-wide.png`, wideFinalPng);
       const squareBgPath = await writeV2File(`${prefix}-square-bg.png`, squareBgPng);
@@ -470,7 +537,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
           styleRefCount: 0,
           usedStylePaths: [],
           productionValidation: {
-            background: backgroundEvidence,
+            background: finalBackgroundEvidence,
             lockup: lockupEvidence,
             aspects: {
               widescreen: { provenance: "rendered" },
@@ -489,6 +556,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             lockupSource: "generated",
             generationLifecycleState: "GENERATION_COMPLETED",
             backgroundFailureReason: null,
+            textRetry: textRetryMeta,
             aspectAssets: {
               widescreen: "ok",
               square: "ok",
