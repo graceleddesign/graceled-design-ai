@@ -28,7 +28,7 @@ export function buildCreateScoutRunInput(opts: {
     diversityFamily: opts.slot.diversityFamily,
     tone: opts.slot.tone,
     motifBinding: opts.slot.motifBinding,
-    seed: opts.slot.seed,
+    seed: opts.slot.seed > 0x7fffffff ? opts.slot.seed & 0x7fffffff : opts.slot.seed,
     providerId: opts.providerId,
     prompt: opts.prompt,
     promptSpec: opts.slot.promptSpec as unknown as Record<string, unknown>,

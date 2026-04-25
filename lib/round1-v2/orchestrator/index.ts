@@ -8,11 +8,16 @@ import type { Prisma } from "@prisma/client";
 import type { ScoutGenerationResult } from "./run-scout-batch";
 import type { ScoutEvalResult } from "../eval/evaluate-scout";
 import type { Round1Engine, Round1V2Result } from "../types";
+import type { ProductionBackgroundValidationEvidence } from "@/lib/production-valid-option";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const WIDE_WIDTH = 1920;
 const WIDE_HEIGHT = 1080;
+const SQUARE_WIDTH = 1080;
+const SQUARE_HEIGHT = 1080;
+const TALL_WIDTH = 1080;
+const TALL_HEIGHT = 1920;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -75,6 +80,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { renderTrimmedLockupPngFromSvg, composeLockupOnBackground } = await import(
     "@/lib/lockup-compositor"
   );
+  const { evaluateBackgroundAcceptance } = await import("@/lib/production-valid-option");
+  const { resizeCoverWithFocalPoint } = await import("@/lib/image-cover");
   const storage = await import("../storage");
 
   // ── 1. Look up project ─────────────────────────────────────────────────────
@@ -263,7 +270,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   const buildV2FailedOutput = (
     reason: string,
-    label: string
+    label: string,
+    bgEvidence?: ProductionBackgroundValidationEvidence
   ): object => {
     const content = { title: brief.title, subtitle: brief.subtitle, passage: brief.scripturePassages };
     const designDoc = buildCleanMinimalDesignDoc({
@@ -281,6 +289,10 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       meta: {
         styleRefCount: 0,
         usedStylePaths: [],
+        // Persist real background evidence when available so the UI shows the
+        // honest failure reason (e.g. background_text_detected) rather than
+        // background_text_check_missing.
+        ...(bgEvidence ? { productionValidation: { background: bgEvidence } } : {}),
         debug: { v2: true, failureReason: reason },
       },
     };
@@ -333,34 +345,61 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       continue;
     }
 
-    // Lockup composition for wide background
+    // Background acceptance: evaluate rebuilt image before committing to COMPLETED
     try {
-      const backgroundPng = rebuildResult.imageBytes;
+      const rawBackgroundPng = rebuildResult.imageBytes;
+
+      // Re-evaluate the rebuilt image using the same scout eval infrastructure.
+      // This produces honest textFree/scaffoldFree/motifPresent/toneFit evidence.
+      const rebuildEval = await evaluateScout({ slot: scout.slot, imageBytes: rawBackgroundPng });
+
+      const backgroundEvidence: ProductionBackgroundValidationEvidence = {
+        source: "generated",
+        sourceGenerationId: null,
+        textFree: !rebuildEval.rejectReasons.includes("text_artifact_detected"),
+        scaffoldFree: !rebuildEval.rejectReasons.includes("scaffold_collapse"),
+        motifPresent: !rebuildEval.rejectReasons.includes("design_presence_absent"),
+        toneFit: !rebuildEval.rejectReasons.includes("tone_implausible"),
+        referenceFit: null,
+      };
+
+      const acceptance = evaluateBackgroundAcceptance({ evidence: backgroundEvidence });
+
+      if (!acceptance.accepted) {
+        const reason = acceptance.invalidReasons.join("; ");
+        console.warn(`[v2] lane ${scout.label} background rejected: ${reason}`);
+
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "FAILED",
+            output: buildV2FailedOutput(`Background acceptance failed: ${reason}`, scout.label, backgroundEvidence) as unknown as Prisma.InputJsonValue,
+          },
+        });
+
+        laneLog.push(`${scout.label}=failed(acceptance:${reason.slice(0, 60)})`);
+        continue;
+      }
+
+      // Acceptance passed — compose lockups for all 3 shapes and settle COMPLETED.
       const content = {
         title: brief.title,
         subtitle: brief.subtitle,
         passage: brief.scripturePassages,
       };
 
-      const layout = computeCleanMinimalLayout({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content });
-
-      const palette = await chooseTextPaletteForBackground({
-        backgroundPng,
-        sampleRegion: layout.textRegion,
+      // Wide lockup
+      const wideLayout = computeCleanMinimalLayout({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content });
+      const widePalette = await chooseTextPaletteForBackground({
+        backgroundPng: rawBackgroundPng,
+        sampleRegion: wideLayout.textRegion,
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
       });
-
-      const lockupSvg = buildCleanMinimalOverlaySvg({
-        width: WIDE_WIDTH,
-        height: WIDE_HEIGHT,
-        content,
-        palette,
-      });
-      const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(lockupSvg);
-
-      const finalPng = await composeLockupOnBackground({
-        backgroundPng,
+      const wideLockupSvg = buildCleanMinimalOverlaySvg({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette });
+      const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(wideLockupSvg);
+      const wideFinalPng = await composeLockupOnBackground({
+        backgroundPng: rawBackgroundPng,
         lockupPng,
         shape: "wide",
         width: WIDE_WIDTH,
@@ -369,29 +408,76 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         integrationMode: "clean",
       });
 
-      // Write files to public/uploads
-      const prefix = generationId;
-      const bgPath = await writeV2File(`${prefix}-wide-bg.png`, backgroundPng);
-      const lockupPath = await writeV2File(`${prefix}-lockup.png`, lockupPng);
-      const finalPath = await writeV2File(`${prefix}-wide.png`, finalPng);
-
-      // Build DesignDoc from layout + palette
-      const designDoc = buildCleanMinimalDesignDoc({
-        width: WIDE_WIDTH,
-        height: WIDE_HEIGHT,
-        content,
-        palette,
-        backgroundImagePath: bgPath,
+      // Square crop + lockup
+      const squareBgPng = await resizeCoverWithFocalPoint({ input: rawBackgroundPng, width: SQUARE_WIDTH, height: SQUARE_HEIGHT });
+      const squareFinalPng = await composeLockupOnBackground({
+        backgroundPng: squareBgPng,
+        lockupPng,
+        shape: "square",
+        width: SQUARE_WIDTH,
+        height: SQUARE_HEIGHT,
+        align: "left",
+        integrationMode: "clean",
       });
+
+      // Tall crop + lockup
+      const tallBgPng = await resizeCoverWithFocalPoint({ input: rawBackgroundPng, width: TALL_WIDTH, height: TALL_HEIGHT });
+      const tallFinalPng = await composeLockupOnBackground({
+        backgroundPng: tallBgPng,
+        lockupPng,
+        shape: "tall",
+        width: TALL_WIDTH,
+        height: TALL_HEIGHT,
+        align: "left",
+        integrationMode: "clean",
+      });
+
+      // Write all files
+      const prefix = generationId;
+      const bgPath = await writeV2File(`${prefix}-wide-bg.png`, rawBackgroundPng);
+      const lockupPath = await writeV2File(`${prefix}-lockup.png`, lockupPng);
+      const wideFinPath = await writeV2File(`${prefix}-wide.png`, wideFinalPng);
+      const squareBgPath = await writeV2File(`${prefix}-square-bg.png`, squareBgPng);
+      const squareFinPath = await writeV2File(`${prefix}-square.png`, squareFinalPng);
+      const tallBgPath = await writeV2File(`${prefix}-tall-bg.png`, tallBgPng);
+      const tallFinPath = await writeV2File(`${prefix}-tall.png`, tallFinalPng);
+
+      // DesignDocs for all shapes
+      const wideDesignDoc = buildCleanMinimalDesignDoc({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette, backgroundImagePath: bgPath });
+      const squareDesignDoc = buildCleanMinimalDesignDoc({ width: SQUARE_WIDTH, height: SQUARE_HEIGHT, content, palette: widePalette, backgroundImagePath: squareBgPath });
+      const tallDesignDoc = buildCleanMinimalDesignDoc({ width: TALL_WIDTH, height: TALL_HEIGHT, content, palette: widePalette, backgroundImagePath: tallBgPath });
+
+      const lockupEvidence = {
+        source: "generated" as const,
+        sourceGenerationId: null,
+        textIntegrity: true,   // SVG-rendered lockup — content is deterministically correct
+        fitPass: true,          // template-controlled layout
+        insideTitleSafeWithMargin: null,
+        notTooSmall: null,
+      };
 
       const completedOutput = {
         status: "COMPLETED",
-        designDoc,
-        designDocByShape: { wide: designDoc },
+        designDoc: wideDesignDoc,
+        designDocByShape: { wide: wideDesignDoc, square: squareDesignDoc, tall: tallDesignDoc },
         notes: `V2 lane ${scout.label} (${scout.grammarKey}) score=${scout.compositeScore.toFixed(3)} fallback=${rebuildResult.usedFallback}`,
+        preview: {
+          widescreen_main: wideFinPath,
+          square_main: squareFinPath,
+          vertical_main: tallFinPath,
+        },
         meta: {
           styleRefCount: 0,
           usedStylePaths: [],
+          productionValidation: {
+            background: backgroundEvidence,
+            lockup: lockupEvidence,
+            aspects: {
+              widescreen: { provenance: "rendered" },
+              square: { provenance: "rendered" },
+              vertical: { provenance: "rendered" },
+            },
+          },
           debug: {
             v2: true,
             grammarKey: scout.grammarKey,
@@ -399,6 +485,15 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             compositeScore: scout.compositeScore,
             usedFallback: rebuildResult.usedFallback,
             providerModel: rebuildResult.providerModel,
+            backgroundSource: "generated",
+            lockupSource: "generated",
+            generationLifecycleState: "GENERATION_COMPLETED",
+            backgroundFailureReason: null,
+            aspectAssets: {
+              widescreen: "ok",
+              square: "ok",
+              vertical: "ok",
+            },
           },
         },
       };
@@ -413,59 +508,36 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         });
         await tx.asset.createMany({
           data: [
-            {
-              projectId,
-              generationId,
-              kind: "BACKGROUND",
-              slot: "wide_bg",
-              file_path: bgPath,
-              mime_type: "image/png",
-              width: WIDE_WIDTH,
-              height: WIDE_HEIGHT,
-            },
-            {
-              projectId,
-              generationId,
-              kind: "LOCKUP",
-              slot: "series_lockup",
-              file_path: lockupPath,
-              mime_type: "image/png",
-              width: null,
-              height: null,
-            },
-            {
-              projectId,
-              generationId,
-              kind: "IMAGE",
-              slot: "wide",
-              file_path: finalPath,
-              mime_type: "image/png",
-              width: WIDE_WIDTH,
-              height: WIDE_HEIGHT,
-            },
+            { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg",        file_path: bgPath,        mime_type: "image/png", width: WIDE_WIDTH,   height: WIDE_HEIGHT   },
+            { projectId, generationId, kind: "BACKGROUND", slot: "square_bg",      file_path: squareBgPath,  mime_type: "image/png", width: SQUARE_WIDTH, height: SQUARE_HEIGHT },
+            { projectId, generationId, kind: "BACKGROUND", slot: "tall_bg",        file_path: tallBgPath,    mime_type: "image/png", width: TALL_WIDTH,   height: TALL_HEIGHT   },
+            { projectId, generationId, kind: "LOCKUP",     slot: "series_lockup",  file_path: lockupPath,    mime_type: "image/png", width: null,         height: null          },
+            { projectId, generationId, kind: "IMAGE",      slot: "wide",           file_path: wideFinPath,   mime_type: "image/png", width: WIDE_WIDTH,   height: WIDE_HEIGHT   },
+            { projectId, generationId, kind: "IMAGE",      slot: "square",         file_path: squareFinPath, mime_type: "image/png", width: SQUARE_WIDTH, height: SQUARE_HEIGHT },
+            { projectId, generationId, kind: "IMAGE",      slot: "tall",           file_path: tallFinPath,   mime_type: "image/png", width: TALL_WIDTH,   height: TALL_HEIGHT   },
           ],
         });
       });
 
       laneLog.push(`${scout.label}=completed(${rebuildResult.usedFallback ? "fallback" : "primary"})`);
-      console.log(`[v2] lane ${scout.label} settled: ${finalPath}`);
+      console.log(`[v2] lane ${scout.label} settled: wide=${wideFinPath} square=${squareFinPath} tall=${tallFinPath}`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      console.error(`[v2] lane ${scout.label} lockup/settlement error: ${reason}`);
+      console.error(`[v2] lane ${scout.label} composition/settlement error: ${reason}`);
 
       try {
         await prisma.generation.update({
           where: { id: generationId },
           data: {
             status: "FAILED",
-            output: buildV2FailedOutput(`Lockup/settlement failed: ${reason}`, scout.label) as unknown as Prisma.InputJsonValue,
+            output: buildV2FailedOutput(`Composition failed: ${reason}`, scout.label) as unknown as Prisma.InputJsonValue,
           },
         });
       } catch (settleErr) {
         console.error(`[v2] lane ${scout.label} failed to settle: ${String(settleErr)}`);
       }
 
-      laneLog.push(`${scout.label}=failed(lockup:${reason.slice(0, 40)})`);
+      laneLog.push(`${scout.label}=failed(composition:${reason.slice(0, 40)})`);
     }
   }
 
