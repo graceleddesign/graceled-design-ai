@@ -22,6 +22,7 @@ import { prisma } from "@/lib/prisma";
 import {
   resolveProductionValidOption,
   resolveProductionValidOptionStatus,
+  readGenerationStageFromOutput,
   summarizeProductionInvalidReasons,
   type ProductionValidationFailedChecks
 } from "@/lib/production-valid-option";
@@ -1290,6 +1291,7 @@ export default async function ProjectGenerationsPage({
                   const failedChecks: ProductionValidationFailedChecks = generationValidation.failedChecks;
                   const finalizeAction = approveFinalDesignAction.bind(null, project.id, generation.id, optionKey);
 
+                  const generationStage = readGenerationStageFromOutput(generation.output);
                   return (
                     <DirectionOptionCard
                       key={generation.id}
@@ -1298,6 +1300,7 @@ export default async function ProjectGenerationsPage({
                       generationId={generation.id}
                       generationStatus={designSpecSummary.optionStatus}
                       generationLifecycleState={designSpecSummary.generationLifecycleState}
+                      generationStage={generationStage}
                       optionLabel={label}
                       tintClass={tintClass}
                       isApprovedFinal={isApprovedFinal}

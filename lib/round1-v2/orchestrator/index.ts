@@ -14,10 +14,7 @@ import type { ProductionBackgroundValidationEvidence } from "@/lib/production-va
 
 const WIDE_WIDTH = 1920;
 const WIDE_HEIGHT = 1080;
-const SQUARE_WIDTH = 1080;
-const SQUARE_HEIGHT = 1080;
-const TALL_WIDTH = 1080;
-const TALL_HEIGHT = 1920;
+// Square/tall assets are generated at export time, not during Round 1 direction preview.
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -81,7 +78,6 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     "@/lib/lockup-compositor"
   );
   const { evaluateBackgroundAcceptance } = await import("@/lib/production-valid-option");
-  const { resizeCoverWithFocalPoint } = await import("@/lib/image-cover");
   const storage = await import("../storage");
 
   // ── 1. Look up project ─────────────────────────────────────────────────────
@@ -448,7 +444,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         continue;
       }
 
-      // Acceptance passed — compose lockups for all 3 shapes and settle COMPLETED.
+      // Acceptance passed — compose wide lockup and settle as direction preview (COMPLETED).
+      // Round 1 V2 produces a wide-only direction preview. Square/vertical are generated at export.
       const content = {
         title: brief.title,
         subtitle: brief.subtitle,
@@ -475,44 +472,14 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         integrationMode: "clean",
       });
 
-      // Square crop + lockup
-      const squareBgPng = await resizeCoverWithFocalPoint({ input: acceptedBackgroundPng, width: SQUARE_WIDTH, height: SQUARE_HEIGHT });
-      const squareFinalPng = await composeLockupOnBackground({
-        backgroundPng: squareBgPng,
-        lockupPng,
-        shape: "square",
-        width: SQUARE_WIDTH,
-        height: SQUARE_HEIGHT,
-        align: "left",
-        integrationMode: "clean",
-      });
-
-      // Tall crop + lockup
-      const tallBgPng = await resizeCoverWithFocalPoint({ input: acceptedBackgroundPng, width: TALL_WIDTH, height: TALL_HEIGHT });
-      const tallFinalPng = await composeLockupOnBackground({
-        backgroundPng: tallBgPng,
-        lockupPng,
-        shape: "tall",
-        width: TALL_WIDTH,
-        height: TALL_HEIGHT,
-        align: "left",
-        integrationMode: "clean",
-      });
-
-      // Write all files
+      // Write wide-only files (3 assets — direction preview contract)
       const prefix = generationId;
       const bgPath = await writeV2File(`${prefix}-wide-bg.png`, acceptedBackgroundPng);
       const lockupPath = await writeV2File(`${prefix}-lockup.png`, lockupPng);
       const wideFinPath = await writeV2File(`${prefix}-wide.png`, wideFinalPng);
-      const squareBgPath = await writeV2File(`${prefix}-square-bg.png`, squareBgPng);
-      const squareFinPath = await writeV2File(`${prefix}-square.png`, squareFinalPng);
-      const tallBgPath = await writeV2File(`${prefix}-tall-bg.png`, tallBgPng);
-      const tallFinPath = await writeV2File(`${prefix}-tall.png`, tallFinalPng);
 
-      // DesignDocs for all shapes
+      // Wide design doc
       const wideDesignDoc = buildCleanMinimalDesignDoc({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette, backgroundImagePath: bgPath });
-      const squareDesignDoc = buildCleanMinimalDesignDoc({ width: SQUARE_WIDTH, height: SQUARE_HEIGHT, content, palette: widePalette, backgroundImagePath: squareBgPath });
-      const tallDesignDoc = buildCleanMinimalDesignDoc({ width: TALL_WIDTH, height: TALL_HEIGHT, content, palette: widePalette, backgroundImagePath: tallBgPath });
 
       const lockupEvidence = {
         source: "generated" as const,
@@ -526,23 +493,23 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       const completedOutput = {
         status: "COMPLETED",
         designDoc: wideDesignDoc,
-        designDocByShape: { wide: wideDesignDoc, square: squareDesignDoc, tall: tallDesignDoc },
+        designDocByShape: { wide: wideDesignDoc },
         notes: `V2 lane ${scout.label} (${scout.grammarKey}) score=${scout.compositeScore.toFixed(3)} fallback=${rebuildResult.usedFallback}`,
+        // Only wide preview path — square/vertical are generated at export time.
         preview: {
           widescreen_main: wideFinPath,
-          square_main: squareFinPath,
-          vertical_main: tallFinPath,
         },
         meta: {
           styleRefCount: 0,
           usedStylePaths: [],
           productionValidation: {
+            // Stage marker: wide-only direction preview — square/vertical not yet generated.
+            stage: "direction_preview",
             background: finalBackgroundEvidence,
             lockup: lockupEvidence,
             aspects: {
+              // Only widescreen is validated in Round 1. Square/vertical are generated at export.
               widescreen: { provenance: "rendered" },
-              square: { provenance: "rendered" },
-              vertical: { provenance: "rendered" },
             },
           },
           debug: {
@@ -557,11 +524,11 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             generationLifecycleState: "GENERATION_COMPLETED",
             backgroundFailureReason: null,
             textRetry: textRetryMeta,
+            // Wide asset present; square/vertical intentionally not generated in Round 1.
             aspectAssets: {
               widescreen: "ok",
-              square: "ok",
-              vertical: "ok",
             },
+            squareVerticalNotGenerated: "round1_direction_preview_only",
           },
         },
       };
@@ -574,21 +541,19 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             output: completedOutput as unknown as Prisma.InputJsonValue,
           },
         });
+        // Direction preview: 3 assets only (wide_bg, series_lockup, wide).
+        // Square/vertical assets are created during export, not Round 1.
         await tx.asset.createMany({
           data: [
-            { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg",        file_path: bgPath,        mime_type: "image/png", width: WIDE_WIDTH,   height: WIDE_HEIGHT   },
-            { projectId, generationId, kind: "BACKGROUND", slot: "square_bg",      file_path: squareBgPath,  mime_type: "image/png", width: SQUARE_WIDTH, height: SQUARE_HEIGHT },
-            { projectId, generationId, kind: "BACKGROUND", slot: "tall_bg",        file_path: tallBgPath,    mime_type: "image/png", width: TALL_WIDTH,   height: TALL_HEIGHT   },
-            { projectId, generationId, kind: "LOCKUP",     slot: "series_lockup",  file_path: lockupPath,    mime_type: "image/png", width: null,         height: null          },
-            { projectId, generationId, kind: "IMAGE",      slot: "wide",           file_path: wideFinPath,   mime_type: "image/png", width: WIDE_WIDTH,   height: WIDE_HEIGHT   },
-            { projectId, generationId, kind: "IMAGE",      slot: "square",         file_path: squareFinPath, mime_type: "image/png", width: SQUARE_WIDTH, height: SQUARE_HEIGHT },
-            { projectId, generationId, kind: "IMAGE",      slot: "tall",           file_path: tallFinPath,   mime_type: "image/png", width: TALL_WIDTH,   height: TALL_HEIGHT   },
+            { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg",       file_path: bgPath,      mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
+            { projectId, generationId, kind: "LOCKUP",     slot: "series_lockup", file_path: lockupPath,  mime_type: "image/png", width: null,       height: null        },
+            { projectId, generationId, kind: "IMAGE",      slot: "wide",          file_path: wideFinPath, mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
           ],
         });
       });
 
       laneLog.push(`${scout.label}=completed(${rebuildResult.usedFallback ? "fallback" : "primary"})`);
-      console.log(`[v2] lane ${scout.label} settled: wide=${wideFinPath} square=${squareFinPath} tall=${tallFinPath}`);
+      console.log(`[v2] lane ${scout.label} settled: wide=${wideFinPath}`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       console.error(`[v2] lane ${scout.label} composition/settlement error: ${reason}`);

@@ -132,6 +132,8 @@ type DirectionOptionCardProps = {
   invalidReasons?: string[];
   failedChecks?: ProductionValidationFailedChecks | null;
   finalizeAction: () => Promise<void>;
+  /** Generation stage — `direction_preview` means wide-only; square/vertical generated at export. */
+  generationStage?: "direction_preview" | "export_package" | null;
 };
 
 export function DirectionOptionCard({
@@ -182,8 +184,10 @@ export function DirectionOptionCard({
   previewModeByFormat,
   invalidReasons = [],
   failedChecks = null,
-  finalizeAction
+  finalizeAction,
+  generationStage = null
 }: DirectionOptionCardProps) {
+  const isDirectionPreview = generationStage === "direction_preview";
   const [activeFormat, setActiveFormat] = useState<DirectionPreviewFormat>("wide");
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [showBestEffortBackground, setShowBestEffortBackground] = useState(false);
@@ -365,18 +369,25 @@ export function DirectionOptionCard({
           {PREVIEW_FORMATS.filter((format) => format !== activeFormat).map((format) => {
             const formatMeta = FORMAT_META[format];
             const previewMode = previewModeByFormat[format];
+            // In direction_preview stage, square/tall are not generated until export.
+            const isExportOnly = isDirectionPreview && format !== "wide";
             return (
               <button
                 key={format}
                 type="button"
-                onClick={() => setActiveFormat(format)}
-                aria-label={`Show ${formatMeta.label} preview for ${optionLabel}`}
-                className="rounded-md border border-slate-200 p-1 text-left transition hover:border-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pine focus-visible:ring-offset-2"
+                onClick={isExportOnly ? undefined : () => setActiveFormat(format)}
+                aria-label={
+                  isExportOnly
+                    ? `${formatMeta.label} — generated after final approval`
+                    : `Show ${formatMeta.label} preview for ${optionLabel}`
+                }
+                disabled={isExportOnly}
+                className={`rounded-md border p-1 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pine focus-visible:ring-offset-2 ${isExportOnly ? "cursor-default border-slate-100 opacity-50" : "border-slate-200 hover:border-slate-300"}`}
               >
                 <GenerationPreviewPane
                   label={formatMeta.label}
-                  imageUrl={previewUrls[format]}
-                  executionState={generationLifecycleState}
+                  imageUrl={isExportOnly ? "" : previewUrls[format]}
+                  executionState={isExportOnly ? undefined : generationLifecycleState}
                   aspectClass={formatMeta.aspectClass}
                   tintClass={tintClass}
                   width={formatMeta.width}
@@ -386,12 +397,23 @@ export function DirectionOptionCard({
                 />
                 <span className="mt-1 block px-1 text-[11px] font-medium text-slate-500">
                   {formatMeta.label}
-                  {isInProgress ? " • generating" : previewMode === "canonical_asset" ? "" : " • fallback"}
+                  {isExportOnly
+                    ? " • after export"
+                    : isInProgress
+                      ? " • generating"
+                      : previewMode === "canonical_asset"
+                        ? ""
+                        : " • fallback"}
                 </span>
               </button>
             );
           })}
         </div>
+        {isDirectionPreview && !isInProgress && generationStatus === "COMPLETED" ? (
+          <p className="text-[10px] text-slate-400">
+            Square and vertical exports are generated after final approval.
+          </p>
+        ) : null}
       </div>
 
       {isInProgress ? (

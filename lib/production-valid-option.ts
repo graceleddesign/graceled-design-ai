@@ -13,6 +13,15 @@ const ASPECT_ASSET_DERIVED_PATH_PATTERN = /(^|[-_/])derived([\-_.\/]|$)/i;
 export type AspectAssetStatus = "ok" | "missing" | "placeholder";
 export type OutputAspect = "widescreen" | "square" | "vertical";
 export type PreviewShape = "square" | "wide" | "tall";
+
+/**
+ * Generation lifecycle stage.
+ *
+ * - `direction_preview` — Round 1 / refinement. Wide-only assets. Square/vertical
+ *   not generated yet. Valid = widescreen direction preview contract passes.
+ * - `export_package` — Full three-aspect export. All 7 assets required for valid.
+ */
+export type GenerationStage = "direction_preview" | "export_package";
 export type DebugAssetSource = "generated" | "reused" | "fallback" | "unknown";
 export type AspectAssetProvenance = "rendered" | "derived" | "fallback" | "unknown";
 export type PreviewMode = "canonical_asset" | "fallback_asset" | "fallback_composite" | "fallback_design_doc";
@@ -158,6 +167,8 @@ export type ProductionValidOptionResult = {
   valid: boolean;
   isProductionValid: boolean;
   status: GenerationOptionStatus;
+  /** The stage detected from this generation's output metadata. */
+  stage: GenerationStage | null;
   invalidReasons: string[];
   reasons: string[];
   hasCanonicalDesignDoc: boolean;
@@ -515,6 +526,20 @@ function readSourceGenerationId(output: unknown, key: "reusedBackgroundFromGener
 function readBackgroundFailureReason(output: unknown): string | null {
   const debug = readOutputDebug(output);
   return readString(debug?.backgroundFailureReason);
+}
+
+/**
+ * Read the generation stage from `output.meta.productionValidation.stage`.
+ * Returns null if absent (treated as export_package / legacy V1 behavior).
+ */
+export function readGenerationStageFromOutput(output: unknown): GenerationStage | null {
+  const meta = readOutputMeta(output);
+  const productionValidation = readNestedRecord(meta, "productionValidation");
+  const stage = productionValidation?.stage;
+  if (stage === "direction_preview" || stage === "export_package") {
+    return stage;
+  }
+  return null;
 }
 
 export function readAspectAssetsFromOutput(output: unknown): Record<OutputAspect, AspectAssetStatus> | null {
@@ -1138,6 +1163,9 @@ export function resolveProductionValidOption(params: {
   dbStatus?: string | null;
   assets?: GenerationAssetRecord[];
 }): ProductionValidOptionResult {
+  const stage = readGenerationStageFromOutput(params.output);
+  const isDirectionPreview = stage === "direction_preview";
+
   const background = validateBackground(params.output);
   const lockup = validateLockup(params.output);
   const aspects = validateAspects({
@@ -1154,6 +1182,13 @@ export function resolveProductionValidOption(params: {
   const executionActive = !terminalDbStatus && isPersistedGenerationExecutionActive(params.output);
   const dbInProgress = isGenerationDbInProgress(params.dbStatus) || executionActive;
   const dbFailedLike = params.dbStatus === "FAILED" || dbInProgress || !params.output;
+
+  // direction_preview only requires the widescreen aspect (square/vertical not generated in Round 1).
+  // export_package (or legacy/null) requires all three aspects.
+  const requiredAspects: readonly OutputAspect[] = isDirectionPreview
+    ? (["widescreen"] as const)
+    : OUTPUT_ASPECTS;
+
   const valid =
     !dbInProgress &&
     !fallbackLike &&
@@ -1161,7 +1196,13 @@ export function resolveProductionValidOption(params: {
     hasCanonicalDesignDoc &&
     background.valid &&
     lockup.valid &&
-    OUTPUT_ASPECTS.every((aspect) => aspects[aspect].valid);
+    requiredAspects.every((aspect) => aspects[aspect].valid);
+
+  // Shapes for which we require a canonical preview in the current stage.
+  // In direction_preview, only wide is required — square/tall are generated at export.
+  const requiredPreviewShapes: readonly PreviewShape[] = isDirectionPreview
+    ? (["wide"] as const)
+    : PREVIEW_SHAPES;
 
   const preview = {} as Record<PreviewShape, PreviewValidationResult>;
   const previewCanonicality = {} as Record<PreviewShape, boolean>;
@@ -1268,19 +1309,21 @@ export function resolveProductionValidOption(params: {
   if (!hasCanonicalDesignDoc) {
     addReason(provenanceReasons, "missing_canonical_design_doc");
   }
-  if (PREVIEW_SHAPES.some((shape) => !preview[shape].canonical)) {
+  // Only check required shapes — for direction_preview, square/tall are not yet generated
+  // and should not be flagged as fallback failures.
+  if (requiredPreviewShapes.some((shape) => !preview[shape].canonical)) {
     addReason(provenanceReasons, "preview_noncanonical");
   }
-  if (PREVIEW_SHAPES.some((shape) => preview[shape].mode !== "canonical_asset")) {
-    const modes = [...new Set(PREVIEW_SHAPES.map((shape) => preview[shape].mode).filter((mode) => mode !== "canonical_asset"))];
+  if (requiredPreviewShapes.some((shape) => preview[shape].mode !== "canonical_asset")) {
+    const modes = [...new Set(requiredPreviewShapes.map((shape) => preview[shape].mode).filter((mode) => mode !== "canonical_asset"))];
     for (const mode of modes) {
       addReason(provenanceReasons, `fallback_preview_mode:${mode}`);
     }
   }
-  if (PREVIEW_SHAPES.some((shape) => preview[shape].source === "fallback_preview_asset")) {
+  if (requiredPreviewShapes.some((shape) => preview[shape].source === "fallback_preview_asset")) {
     addReason(provenanceReasons, "fallback_asset_provenance");
   }
-  if (PREVIEW_SHAPES.some((shape) => preview[shape].mode === "fallback_design_doc")) {
+  if (requiredPreviewShapes.some((shape) => preview[shape].mode === "fallback_design_doc")) {
     addReason(provenanceReasons, "fallback_design_doc_used");
   }
   if (!params.output) {
@@ -1296,16 +1339,18 @@ export function resolveProductionValidOption(params: {
     !fallbackLike &&
     background.invalidReasons.length === 0 &&
     lockup.invalidReasons.length === 0 &&
-    OUTPUT_ASPECTS.every((aspect) => aspects[aspect].invalidReasons.length === 0) &&
+    requiredAspects.every((aspect) => aspects[aspect].invalidReasons.length === 0) &&
     hasCanonicalDesignDoc
   ) {
     addReason(provenanceReasons, "generation_db_status_failed");
   }
 
+  // For direction_preview, exclude square/vertical aspect reasons from the
+  // top-level invalid reasons list (they're not required at this stage).
   const invalidReasons = dedupeReasons([
     ...background.invalidReasons,
     ...lockup.invalidReasons,
-    ...OUTPUT_ASPECTS.flatMap((aspect) => aspects[aspect].invalidReasons),
+    ...requiredAspects.flatMap((aspect) => aspects[aspect].invalidReasons),
     ...provenanceReasons
   ]);
 
@@ -1348,6 +1393,7 @@ export function resolveProductionValidOption(params: {
     valid,
     isProductionValid: valid,
     status,
+    stage,
     invalidReasons,
     reasons: invalidReasons,
     hasCanonicalDesignDoc,
@@ -1470,4 +1516,85 @@ export function isProductionValidOption(params: {
 
 export function toAssetUrl(assetPath: string): string {
   return normalizeAssetUrl(assetPath);
+}
+
+// ── Stage-aware contract validators ──────────────────────────────────────────
+
+export type DirectionPreviewContractResult = {
+  valid: boolean;
+  invalidReasons: string[];
+};
+
+/**
+ * Validate the Direction Preview Contract for a Round 1 / Round 2 lane.
+ *
+ * Requires:
+ * - Wide background asset
+ * - Lockup asset
+ * - Composed wide image asset
+ * - Background productionValidation evidence (textFree, scaffoldFree, motifPresent, toneFit)
+ * - Widescreen aspect with provenance === "rendered"
+ * - `output.preview.widescreen_main` or wide IMAGE asset
+ *
+ * Does NOT require square/vertical assets or aspects.
+ */
+export function validateDirectionPreviewContract(params: {
+  output: unknown;
+  dbStatus?: string | null;
+  assets?: GenerationAssetRecord[];
+}): DirectionPreviewContractResult {
+  const result = resolveProductionValidOption(params);
+  // If the stage is direction_preview, the resolver already applies wide-only logic.
+  // If no stage is set (legacy), check only the widescreen aspect.
+  const widescreenValid = result.aspects.widescreen.valid;
+  const backgroundValid = result.background.valid;
+  const lockupValid = result.lockup.valid;
+  const widePreviewOk = result.preview.wide.canonical || result.preview.wide.mode === "canonical_asset";
+
+  const invalidReasons: string[] = [];
+  if (!backgroundValid) {
+    invalidReasons.push(...result.background.invalidReasons);
+  }
+  if (!lockupValid) {
+    invalidReasons.push(...result.lockup.invalidReasons);
+  }
+  if (!widescreenValid) {
+    invalidReasons.push(...result.aspects.widescreen.invalidReasons);
+  }
+  if (!widePreviewOk) {
+    invalidReasons.push("wide_preview_not_canonical");
+  }
+
+  return {
+    valid: backgroundValid && lockupValid && widescreenValid && widePreviewOk,
+    invalidReasons: [...new Set(invalidReasons)]
+  };
+}
+
+export type ExportPackageContractResult = {
+  valid: boolean;
+  invalidReasons: string[];
+  missingSlots: Array<"square" | "wide" | "tall" | "lockup" | "design_doc">;
+};
+
+/**
+ * Validate the Export Package Contract — required before final export delivery.
+ *
+ * Requires all three aspects (widescreen, square, vertical) and all 7 assets:
+ * - BACKGROUND / wide_bg, square_bg, tall_bg
+ * - LOCKUP / series_lockup
+ * - IMAGE / wide, square, tall
+ *
+ * Direction preview lanes are NOT export-ready by definition.
+ */
+export function validateExportPackageContract(params: {
+  output: unknown;
+  assets?: GenerationAssetRecord[];
+}): ExportPackageContractResult {
+  const result = resolveProductionValidOption(params);
+  return {
+    valid: result.export.eligible,
+    invalidReasons: result.export.invalidReasons,
+    missingSlots: result.export.missingSlots
+  };
 }
