@@ -70,6 +70,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { evaluateScout } = await import("../eval/evaluate-scout");
   const { selectScouts } = await import("./select-scouts");
   const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
+  const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
     chooseTextPaletteForBackground,
@@ -101,7 +102,24 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     return { error: "Project not found" };
   }
 
-  // ── 2. Normalize brief ─────────────────────────────────────────────────────
+  // ── 2. Plan brief signals + normalize brief ────────────────────────────────
+
+  // Deterministic tone/motif planner — no LLM calls.
+  // Infers toneHint and motifHints from project text fields so scout planning
+  // and rebuild prompts receive real visual direction rather than neutral/empty defaults.
+  const briefSignals = planBriefSignals({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes,
+  });
+
+  console.log(
+    `[v2] brief signals: tone=${briefSignals.toneHint} (${briefSignals.debug.toneSource})` +
+    ` motifs=[${briefSignals.motifHints.join(",")}]` +
+    ` signals=[${briefSignals.debug.toneSignalWords.join(",")}]`
+  );
 
   const brief = normalizeBrief({
     title: project.series_title,
@@ -110,8 +128,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     description: project.series_description,
     designNotes: project.designNotes,
     avoidColors: project.avoidColors,
-    toneHint: null,
-    motifHints: [],
+    toneHint: briefSignals.toneHint,
+    motifHints: briefSignals.motifHints,
     negativeHintExtras: [],
   });
 
@@ -183,6 +201,9 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             grammarKey: scout.grammarKey,
             diversityFamily: scout.diversityFamily,
             compositeScore: scout.compositeScore,
+            plannedTone: briefSignals.toneHint,
+            plannedMotifs: briefSignals.motifHints,
+            plannerDebug: briefSignals.debug,
           } as unknown as Prisma.InputJsonValue,
         },
       })
@@ -494,6 +515,9 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             backgroundFailureReason: null,
             textRetry: textRetryMeta,
             backfill: backfillDebug,
+            planner: briefSignals.debug,
+            plannedTone: briefSignals.toneHint,
+            plannedMotifs: briefSignals.motifHints,
             aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },
