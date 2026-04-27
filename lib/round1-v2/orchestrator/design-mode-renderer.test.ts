@@ -58,14 +58,15 @@ test("typography_led renderer returns 3 PNG buffers and honest evidence", async 
   assert.equal(r.debug.noAiBackground, true);
 });
 
-test("minimal_editorial renderer uses minimal_editorial_grid background", async () => {
+test("minimal_editorial renderer uses minimal_editorial_grid background and motifPresent=true (real editorial structure)", async () => {
   const r = await renderDesignModeDirectionPreview({
     ...BASE_INPUT,
     designMode: "minimal_editorial",
   });
   assert.equal(r.debug.backgroundKind, "minimal_editorial_grid");
-  // motifPresent should be false for editorial grid (no motif mark)
-  assert.equal(r.backgroundEvidence.motifPresent, false);
+  // Editorial grid now renders rules + emphasized column + folio label + motif mark.
+  assert.equal(r.backgroundEvidence.motifPresent, true);
+  assert.match(r.debug.motifPresentReason, /rendered_/);
 });
 
 test("modern_abstract renderer uses abstract_blocks background and reports motifPresent=true", async () => {
