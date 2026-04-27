@@ -71,7 +71,11 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { selectScouts } = await import("./select-scouts");
   const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
   const { planDesignModes } = await import("./plan-design-modes");
-  const { getDesignModeLockupRecipe } = await import("./design-mode-lockup-recipes");
+  const {
+    getDesignModeLockupRecipe,
+    getDesignModeLockupRecipeOverride,
+    shouldSuppressAutoScrim,
+  } = await import("./design-mode-lockup-recipes");
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
@@ -155,16 +159,20 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   console.log(`[v2] design modes: ${designModePlan.summary} distinct=${designModePlan.allDistinct}`);
 
-  // ── 3. Build scout plan ────────────────────────────────────────────────────
+  // ── 3. Build scout plan (lane-aware) ───────────────────────────────────────
 
   const plan = buildScoutPlan({
     runSeed,
     tone: brief.toneTarget,
     motifs: brief.motifs,
     negativeHints: brief.negativeHints,
+    lanes: designModePlan.lanes.map((l) => ({ laneKey: l.lane, designMode: l.mode })),
+    slotsPerLane: 3,
   });
 
-  console.log(`[v2] scout plan: ${plan.slots.length} slots tone=${plan.tone}`);
+  console.log(
+    `[v2] scout plan: ${plan.slots.length} slots tone=${plan.tone} laneAware=${plan.laneAware}`
+  );
 
   // ── 4. Generate scouts (Flux Schnell via FAL) ──────────────────────────────
 
@@ -369,16 +377,20 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     }
     const preferNotGrammarKeys = new Set([scout.grammarKey, ...completedGrammarKeys]);
 
-    const { candidates: eligibleBackfills, diversityRelaxed: poolDiversityRelaxed } =
-      selectEligibleBackfill({
-        pool: backfillPool,
-        completedSlotIndices,
-        preferNotGrammarKeys,
-        maxCount: ROUND1_V2_CONFIG.laneBackfillBudget,
-      });
+    const {
+      candidates: eligibleBackfills,
+      diversityRelaxed: poolDiversityRelaxed,
+      modeRelaxed: poolModeRelaxed,
+    } = selectEligibleBackfill({
+      pool: backfillPool,
+      completedSlotIndices,
+      preferNotGrammarKeys,
+      laneLabel: scout.label,
+      maxCount: ROUND1_V2_CONFIG.laneBackfillBudget,
+    });
 
     console.log(
-      `[v2] lane ${scout.label}: primary slot=${scout.slotIndex} backfill_pool=${eligibleBackfills.length} diversityRelaxed=${poolDiversityRelaxed}`
+      `[v2] lane ${scout.label}: primary slot=${scout.slotIndex} backfill_pool=${eligibleBackfills.length} diversityRelaxed=${poolDiversityRelaxed} modeRelaxed=${poolModeRelaxed}`
     );
 
     const laneResult = await runLaneWithBackfill({
@@ -477,27 +489,41 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         passage: brief.scripturePassages,
       };
 
-      // Wide lockup composition — DesignMode-aware lockup preset, alignment, and integration.
+      // Wide lockup composition — DesignMode-aware FULL recipe, alignment, integration,
+      // and scrim suppression. Override recipe (titleScale/clamps/placement) is what
+      // makes typography_led visibly type-dominant and minimal_editorial visibly refined.
       const lockupPresetId = lockupRecipe?.lockupPresetId ?? null;
       const lockupAlign = lockupRecipe?.align ?? "left";
       const lockupIntegrationMode = lockupRecipe?.integrationMode ?? "clean";
+      const fullRecipeOverride = laneDesignMode
+        ? getDesignModeLockupRecipeOverride(laneDesignMode)
+        : undefined;
+      const suppressScrim = laneDesignMode ? shouldSuppressAutoScrim(laneDesignMode) : false;
+
       const wideLayout = computeCleanMinimalLayout({
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
         content,
+        lockupRecipe: fullRecipeOverride,
         lockupPresetId,
       });
-      const widePalette = await chooseTextPaletteForBackground({
+      const sampledPalette = await chooseTextPaletteForBackground({
         backgroundPng: acceptedBackgroundPng,
         sampleRegion: wideLayout.textRegion,
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
       });
+      // Apply mode-specific scrim suppression: typography_led / minimal_editorial
+      // must NOT get the default dark translucent box behind the title.
+      const widePalette = suppressScrim
+        ? { ...sampledPalette, autoScrim: false }
+        : sampledPalette;
       const wideLockupSvg = buildCleanMinimalOverlaySvg({
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
         content,
         palette: widePalette,
+        lockupRecipe: fullRecipeOverride,
         lockupPresetId,
       });
       const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(wideLockupSvg);
@@ -581,8 +607,11 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
                   align: lockupRecipe.align,
                   integrationMode: lockupRecipe.integrationMode,
                   titleDominant: lockupRecipe.titleDominant,
+                  scrimSuppressed: suppressScrim,
+                  recipeOverrideApplied: !!fullRecipeOverride,
                 }
               : null,
+            backfillModeRelaxed: poolModeRelaxed,
             aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },

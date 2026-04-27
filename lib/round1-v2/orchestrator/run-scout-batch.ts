@@ -54,12 +54,29 @@ export async function runScoutBatch(
   // Log one summary of the prompt parameters for this batch (not the full prompts).
   const grammarSummary = [...new Set(plan.slots.map((s) => s.grammarKey))].join(",");
   const primaryMotif = plan.slots[0]?.motifBinding[0] ?? "(none)";
-  console.log(
-    `[v2] prompt summary: grammars=[${grammarSummary}] primaryMotif=${primaryMotif} tone=${plan.tone} textPurge=true`
-  );
+  if (plan.laneAware) {
+    // Lane-aware: report each lane's designMode and grammars.
+    const byLane = new Map<string, string[]>();
+    for (const s of plan.slots) {
+      const k = `${s.laneKey ?? "?"}=${s.designMode ?? "?"}`;
+      const arr = byLane.get(k) ?? [];
+      arr.push(s.grammarKey);
+      byLane.set(k, arr);
+    }
+    const summary = [...byLane.entries()]
+      .map(([k, gs]) => `${k}(${[...new Set(gs)].join(",")})`)
+      .join(" ");
+    console.log(
+      `[v2] scout prompt summary: ${summary} primaryMotif=${primaryMotif} tone=${plan.tone} textPurge=true`
+    );
+  } else {
+    console.log(
+      `[v2] prompt summary: grammars=[${grammarSummary}] primaryMotif=${primaryMotif} tone=${plan.tone} textPurge=true`
+    );
+  }
 
   await asyncPool(plan.slots, concurrency, async (slot, i) => {
-    const prompt = buildScoutPrompt(slot);
+    const prompt = buildScoutPrompt(slot, slot.designMode);
     try {
       const scoutResult: ScoutResult = await provider.generate({
         prompt,

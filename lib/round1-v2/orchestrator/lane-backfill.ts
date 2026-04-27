@@ -54,6 +54,8 @@ export interface BackfillDebugMeta {
   rejectedCandidates: BackfillRejectedAttempt[];
   finalOutcome: "primary" | "backfill" | "exhausted";
   diversityRelaxed: boolean;
+  /** True if backfill had to pull from a different lane/designMode bucket. */
+  modeRelaxed?: boolean;
 }
 
 export interface TextRetryMeta {
@@ -159,33 +161,62 @@ export function selectEligibleBackfill(params: {
   pool: BackfillCandidate[];
   completedSlotIndices: ReadonlySet<number>;
   preferNotGrammarKeys?: ReadonlySet<string>;
+  /** Lane label — when present, prefer same-lane candidates first. */
+  laneLabel?: string;
   maxCount: number;
-}): { candidates: BackfillCandidate[]; diversityRelaxed: boolean } {
-  const { pool, completedSlotIndices, preferNotGrammarKeys, maxCount } = params;
+}): { candidates: BackfillCandidate[]; diversityRelaxed: boolean; modeRelaxed: boolean } {
+  const { pool, completedSlotIndices, preferNotGrammarKeys, laneLabel, maxCount } = params;
 
   const available = pool.filter((c) => !completedSlotIndices.has(c.slotIndex));
-  if (available.length === 0) return { candidates: [], diversityRelaxed: false };
+  if (available.length === 0) return { candidates: [], diversityRelaxed: false, modeRelaxed: false };
 
-  const preferred: BackfillCandidate[] = [];
-  const remainder: BackfillCandidate[] = [];
+  // Bucket 1 — same lane (when laneLabel provided), otherwise everything.
+  const sameLane = laneLabel
+    ? available.filter((c) => c.slot.laneKey === laneLabel)
+    : available;
+  const otherLane = laneLabel
+    ? available.filter((c) => c.slot.laneKey !== laneLabel)
+    : [];
 
-  for (const c of available) {
-    if (preferNotGrammarKeys && preferNotGrammarKeys.has(c.grammarKey)) {
-      remainder.push(c);
-    } else {
-      preferred.push(c);
+  function partitionByGrammar(cs: BackfillCandidate[]): {
+    preferred: BackfillCandidate[];
+    remainder: BackfillCandidate[];
+  } {
+    const preferred: BackfillCandidate[] = [];
+    const remainder: BackfillCandidate[] = [];
+    for (const c of cs) {
+      if (preferNotGrammarKeys && preferNotGrammarKeys.has(c.grammarKey)) {
+        remainder.push(c);
+      } else {
+        preferred.push(c);
+      }
     }
+    return { preferred, remainder };
   }
 
-  const ordered = [...preferred, ...remainder];
+  const sameLaneByGrammar = partitionByGrammar(sameLane);
+  const otherLaneByGrammar = partitionByGrammar(otherLane);
+
+  // Order: same lane preferred, same lane remainder, other lane preferred, other lane remainder.
+  const ordered = [
+    ...sameLaneByGrammar.preferred,
+    ...sameLaneByGrammar.remainder,
+    ...otherLaneByGrammar.preferred,
+    ...otherLaneByGrammar.remainder,
+  ];
   const result = ordered.slice(0, maxCount);
 
-  // diversityRelaxed: true if we had to include any same-grammar candidates
-  const diversityRelaxed =
-    result.length > preferred.length ||
-    (preferred.length === 0 && result.length > 0);
+  const sameLaneCount = sameLane.length === 0 ? 0 : Math.min(sameLane.length, result.length);
+  const usedOtherLane = result.length > sameLaneCount;
+  const modeRelaxed = laneLabel ? usedOtherLane : false;
 
-  return { candidates: result, diversityRelaxed };
+  // diversityRelaxed: any selected candidate shares a grammar key with the preferNot set
+  const diversityRelaxed =
+    result.length === 0
+      ? false
+      : result.some((c) => preferNotGrammarKeys?.has(c.grammarKey) ?? false);
+
+  return { candidates: result, diversityRelaxed, modeRelaxed };
 }
 
 // ── Internal generation helpers ───────────────────────────────────────────────

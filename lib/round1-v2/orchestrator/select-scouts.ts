@@ -1,4 +1,5 @@
-import type { ScoutPlan, ScoutSlot } from "./build-scout-plan";
+import type { ScoutPlan, ScoutSlot, LaneKey } from "./build-scout-plan";
+import { LANE_KEYS } from "./build-scout-plan";
 import type { ScoutGenerationResult } from "./run-scout-batch";
 import type { ScoutEvalResult } from "../eval/evaluate-scout";
 
@@ -87,6 +88,101 @@ export function selectScouts(
   // Sort by composite score descending
   candidates.sort((a, b) => b.eval.compositeScore - a.eval.compositeScore);
 
+  // ── Lane-aware path ──────────────────────────────────────────────────────
+  // When the plan is lane-aware (slots carry laneKey), pick one winner per
+  // lane label from that lane's own scout group. This guarantees A/B/C come
+  // from the planned lane/designMode bucket rather than from a global score
+  // ranking that might collapse to a single mode's winners.
+  if (plan.laneAware) {
+    const laneAwareSelected: SelectedScout[] = [];
+    const consumedSlotIndices = new Set<number>();
+    const remainderForFallback: typeof candidates = [];
+
+    for (const laneKey of LANE_KEYS) {
+      const laneCandidates = candidates.filter(
+        (c) => c.slot.laneKey === laneKey && !consumedSlotIndices.has(c.slotIndex)
+      );
+      if (laneCandidates.length === 0) continue;
+      const winner = laneCandidates[0]; // already sorted by composite score
+      laneAwareSelected.push({
+        label: laneKey as SelectionLabel,
+        slotIndex: winner.slotIndex,
+        slot: winner.slot,
+        result: winner.result,
+        eval: winner.eval,
+        grammarKey: winner.slot.grammarKey,
+        diversityFamily: winner.slot.diversityFamily,
+        compositeScore: winner.eval.compositeScore,
+        selectionReason: `score=${winner.eval.compositeScore.toFixed(3)} grammar=${winner.slot.grammarKey} lane=${laneKey} mode=${winner.slot.designMode ?? "(none)"}`,
+      });
+      consumedSlotIndices.add(winner.slotIndex);
+    }
+
+    // Lanes that had no eligible candidates get filled from cross-lane remainder
+    // (mode-relaxed). Note this is selection-time relaxation; backfill will also
+    // get a chance to relax later.
+    const missingLanes = LANE_KEYS.filter(
+      (lk) => !laneAwareSelected.some((s) => s.label === lk)
+    );
+    if (missingLanes.length > 0) {
+      const crossLaneRemainder = candidates.filter(
+        (c) => !consumedSlotIndices.has(c.slotIndex)
+      );
+      for (const laneKey of missingLanes) {
+        if (crossLaneRemainder.length === 0) break;
+        const fallback = crossLaneRemainder.shift()!;
+        laneAwareSelected.push({
+          label: laneKey as SelectionLabel,
+          slotIndex: fallback.slotIndex,
+          slot: fallback.slot,
+          result: fallback.result,
+          eval: fallback.eval,
+          grammarKey: fallback.slot.grammarKey,
+          diversityFamily: fallback.slot.diversityFamily,
+          compositeScore: fallback.eval.compositeScore,
+          selectionReason: `score=${fallback.eval.compositeScore.toFixed(3)} grammar=${fallback.slot.grammarKey} lane=${laneKey} mode=${fallback.slot.designMode ?? "(none)"} (mode-relaxed)`,
+        });
+        consumedSlotIndices.add(fallback.slotIndex);
+      }
+    }
+
+    // Order selections A,B,C
+    laneAwareSelected.sort(
+      (a, b) => LANE_KEYS.indexOf(a.label as LaneKey) - LANE_KEYS.indexOf(b.label as LaneKey)
+    );
+
+    // Mark remaining unselected as rejected
+    for (const c of candidates) {
+      if (!consumedSlotIndices.has(c.slotIndex)) {
+        remainderForFallback.push(c);
+      }
+    }
+    for (const c of remainderForFallback) {
+      rejected.push({
+        slotIndex: c.slotIndex,
+        slot: c.slot,
+        eval: c.eval,
+        rejectionReason: "not_selected: lane_winner_chosen",
+      });
+    }
+
+    const shortfallCount = Math.max(0, 3 - laneAwareSelected.length);
+    return {
+      selected: laneAwareSelected,
+      rejected,
+      shortfall: shortfallCount > 0,
+      shortfallCount,
+      candidateCount: candidates.length,
+      hardRejectCount: rejected.filter(
+        (r) =>
+          !r.rejectionReason.startsWith("not_selected") &&
+          !r.rejectionReason.startsWith("generation_failed")
+      ).length,
+      distinctFamilyCount: new Set(laneAwareSelected.map((s) => s.diversityFamily)).size,
+    };
+  }
+
+  // ── Legacy (non-lane-aware) path ─────────────────────────────────────────
   const selected: SelectedScout[] = [];
   const usedGrammarKeys = new Set<string>();
   const usedDiversityFamilies = new Set<string>();
