@@ -7,6 +7,8 @@ import {
   ScoutRequest,
   ScoutResult,
 } from "./scout-provider";
+import { withTimeout, ProviderTimeoutError } from "./with-timeout";
+import { ROUND1_V2_CONFIG } from "../config";
 
 const MODEL_ID = "fal-ai/flux/schnell";
 
@@ -31,6 +33,9 @@ async function fetchImageBytes(url: string): Promise<Buffer> {
 }
 
 function classifyFalError(err: unknown): ScoutProviderError {
+  // ProviderTimeoutError from withTimeout — must be checked before string matching.
+  if (err instanceof ProviderTimeoutError)
+    return new ScoutProviderError("TIMEOUT", err.message, err);
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
   if (lower.includes("429") || lower.includes("rate limit") || lower.includes("too many"))
@@ -56,15 +61,19 @@ export const falFluxSchnellProvider: ScoutProvider = {
     const started = Date.now();
     let raw: unknown;
     try {
-      raw = await fal.subscribe(MODEL_ID, {
-        input: {
-          prompt: req.prompt,
-          image_size: { width: req.widthPx, height: req.heightPx },
-          num_inference_steps: 4,
-          seed: req.seed,
-          enable_safety_checker: false,
-        },
-      });
+      raw = await withTimeout(
+        fal.subscribe(MODEL_ID, {
+          input: {
+            prompt: req.prompt,
+            image_size: { width: req.widthPx, height: req.heightPx },
+            num_inference_steps: 4,
+            seed: req.seed,
+            enable_safety_checker: false,
+          },
+        }),
+        ROUND1_V2_CONFIG.scoutProviderTimeoutMs,
+        "fal-flux-schnell"
+      );
     } catch (err) {
       throw classifyFalError(err);
     }

@@ -8,6 +8,12 @@ export const ROUND1_V2_CONFIG = {
   scoutCount: 9,
   scoutConcurrency: 4,
 
+  // Provider timeouts — hard deadline per individual FAL call.
+  // A timed-out scout counts as one failed scout; the batch continues.
+  // A timed-out rebuild fails that lane attempt; backfill continues if candidates remain.
+  scoutProviderTimeoutMs: 45_000,   // 45 s per Flux Schnell scout call
+  rebuildProviderTimeoutMs: 90_000, // 90 s per Nano Banana Pro / Nano Banana rebuild call
+
   // Rebuild stage
   rebuildFallbackBudget: 1, // max extra Nano Banana 2 fallback attempts per lane on Nano Banana Pro failure
 

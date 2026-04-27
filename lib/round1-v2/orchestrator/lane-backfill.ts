@@ -196,14 +196,32 @@ interface GenerateResult {
   usedFallback: boolean;
 }
 
-/** Run one rebuild attempt with primary→fallback provider chain. */
+type AttemptGenerateOutcome =
+  | { ok: true; gen: GenerateResult }
+  | { ok: false; reason: string };
+
+/**
+ * Run one rebuild attempt with primary→fallback provider chain.
+ *
+ * Returns `{ ok: true, gen }` on success or `{ ok: false, reason }` on failure.
+ * The reason string encodes the failure class and provider id for debug logging,
+ * e.g. `"rebuild_timeout:fal.nano-banana-pro"` or
+ *      `"rebuild_fallback_timeout:fal.nano-banana"`.
+ *
+ * TIMEOUT is retryable (falls back to secondary provider if budget allows).
+ * CONTENT_POLICY and UNKNOWN are not retryable — no fallback.
+ */
 async function attemptGenerate(
   prompt: string,
   seed: number,
   primaryProvider: RebuildProvider,
   fallbackProvider: RebuildProvider,
   rebuildFallbackBudget: number
-): Promise<GenerateResult | null> {
+): Promise<AttemptGenerateOutcome> {
+  let lastKind = "UNKNOWN";
+  let lastProviderId = primaryProvider.id;
+  let triedFallback = false;
+
   for (let attempt = 0; attempt <= rebuildFallbackBudget; attempt++) {
     const isFirst = attempt === 0;
     const provider = isFirst ? primaryProvider : fallbackProvider;
@@ -216,17 +234,28 @@ async function attemptGenerate(
         seed: attemptSeed,
       });
       return {
-        imageBytes: res.imageBytes,
-        providerId: provider.id,
-        providerModel: res.providerModel,
-        usedFallback: !isFirst,
+        ok: true,
+        gen: {
+          imageBytes: res.imageBytes,
+          providerId: provider.id,
+          providerModel: res.providerModel,
+          usedFallback: !isFirst,
+        },
       };
     } catch (err) {
+      lastKind = err instanceof RebuildProviderError ? err.kind : "UNKNOWN";
+      lastProviderId = provider.id;
+      triedFallback = !isFirst;
       const isRetryable = err instanceof RebuildProviderError ? err.isRetryable : false;
       if (!isRetryable) break;
     }
   }
-  return null;
+
+  const kindLower = lastKind.toLowerCase();
+  const reason = triedFallback
+    ? `rebuild_fallback_${kindLower}:${lastProviderId}`
+    : `rebuild_${kindLower}:${lastProviderId}`;
+  return { ok: false, reason };
 }
 
 /** Build background evidence from an eval result. */
@@ -339,7 +368,7 @@ export async function runLaneWithBackfill(params: {
       negativeHints,
     });
 
-    const gen = await attemptGenerate(
+    const genOutcome = await attemptGenerate(
       rebuildPrompt,
       attempt.slot.seed,
       primaryProvider,
@@ -347,18 +376,18 @@ export async function runLaneWithBackfill(params: {
       rebuildFallbackBudget
     );
 
-    if (!gen) {
-      const reason = "rebuild_failed";
-      lastFailureReason = reason;
+    if (!genOutcome.ok) {
+      lastFailureReason = genOutcome.reason;
       rejectedCandidates.push({
         slotIndex: attempt.slotIndex,
         grammarKey: attempt.grammarKey,
         diversityFamily: attempt.diversityFamily,
-        failureReason: reason,
+        failureReason: genOutcome.reason,
         textRetryAttempted: false,
       });
       continue;
     }
+    const gen = genOutcome.gen;
 
     // ── 2. Evaluate ───────────────────────────────────────────────────────────
     const rebuildEval = await evalFn({ slot: attempt.slot, imageBytes: gen.imageBytes });
@@ -391,7 +420,7 @@ export async function runLaneWithBackfill(params: {
         negativeHints,
       });
 
-      const retryGen = await attemptGenerate(
+      const retryOutcome = await attemptGenerate(
         retryPrompt,
         textRetryRebuildSeed(attempt.slot.seed),
         primaryProvider,
@@ -399,7 +428,8 @@ export async function runLaneWithBackfill(params: {
         1 // one fallback allowed for text retry too
       );
 
-      if (retryGen) {
+      if (retryOutcome.ok) {
+        const retryGen = retryOutcome.gen;
         const retryEval = await evalFn({ slot: attempt.slot, imageBytes: retryGen.imageBytes });
         const retryEvidence = buildBackgroundEvidence(retryEval);
         const retryAcceptance = acceptanceFn({ evidence: retryEvidence });
@@ -432,7 +462,7 @@ export async function runLaneWithBackfill(params: {
       if (isFirstTextRetry) {
         textRetryMeta = { ...textRetryMeta, retryRejectionReason: "generation_failed", retryBecameAccepted: false };
       }
-      lastFailureReason = "text_retry_generation_failed";
+      lastFailureReason = `text_retry_generation_failed:${retryOutcome.reason}`;
       lastFailureEvidence = evidence;
       rejectedCandidates.push({
         slotIndex: attempt.slotIndex,

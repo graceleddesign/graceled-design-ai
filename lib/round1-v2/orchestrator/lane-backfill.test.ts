@@ -596,3 +596,207 @@ test("square/vertical not required: acceptance only checks wide evidence", async
   // Should complete without needing square/vertical
   assert.equal(result.status, "accepted");
 });
+
+// ── Provider TIMEOUT classification behavior ──────────────────────────────────
+
+// A provider that throws RebuildProviderError("TIMEOUT", ...) — simulates
+// what the FAL provider does when withTimeout fires.
+function makeTimeoutProvider(id = "timeout-provider"): RebuildProvider {
+  return {
+    id,
+    generate: async () => {
+      throw new RebuildProviderError("TIMEOUT", `${id} timed out after 90000ms`);
+    },
+  };
+}
+
+test("rebuild TIMEOUT is retryable — triggers fallback provider when budget allows", async () => {
+  const primaryScout = makeSelectedScout({ slotIndex: 0 });
+
+  // Primary times out, fallback succeeds
+  const result = await runLaneWithBackfill({
+    laneLabel: "A",
+    primaryScout,
+    backfillCandidates: [],
+    budget: 0,
+    negativeHints: [],
+    primaryProvider: makeTimeoutProvider("fal.nano-banana-pro"),
+    fallbackProvider: makeOkProvider("fal.nano-banana"),
+    rebuildFallbackBudget: 1, // allows one fallback
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  assert.equal(result.status, "accepted", "fallback provider should succeed after primary timeout");
+  if (result.status === "accepted") {
+    assert.equal(result.providerId, "fal.nano-banana", "should have used fallback provider");
+    assert.equal(result.usedFallback, true);
+  }
+});
+
+test("rebuild TIMEOUT on primary with budget=0 fails that attempt with TIMEOUT reason", async () => {
+  const primaryScout = makeSelectedScout({ slotIndex: 0 });
+
+  const result = await runLaneWithBackfill({
+    laneLabel: "A",
+    primaryScout,
+    backfillCandidates: [],
+    budget: 0,
+    negativeHints: [],
+    primaryProvider: makeTimeoutProvider("fal.nano-banana-pro"),
+    fallbackProvider: makeOkProvider("fal.nano-banana"),
+    rebuildFallbackBudget: 0, // no fallback
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  assert.equal(result.status, "exhausted");
+  if (result.status === "exhausted") {
+    assert.ok(
+      result.lastFailureReason.includes("timeout"),
+      `expected 'timeout' in reason, got: ${result.lastFailureReason}`
+    );
+    assert.ok(
+      result.lastFailureReason.includes("fal.nano-banana-pro"),
+      `expected provider id in reason, got: ${result.lastFailureReason}`
+    );
+  }
+});
+
+test("primary + fallback both TIMEOUT → exhausted with fallback TIMEOUT reason", async () => {
+  const primaryScout = makeSelectedScout({ slotIndex: 0 });
+
+  const result = await runLaneWithBackfill({
+    laneLabel: "A",
+    primaryScout,
+    backfillCandidates: [],
+    budget: 0,
+    negativeHints: [],
+    primaryProvider: makeTimeoutProvider("fal.nano-banana-pro"),
+    fallbackProvider: makeTimeoutProvider("fal.nano-banana"),
+    rebuildFallbackBudget: 1,
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  assert.equal(result.status, "exhausted");
+  if (result.status === "exhausted") {
+    assert.ok(
+      result.lastFailureReason.includes("timeout"),
+      `expected 'timeout' in reason, got: ${result.lastFailureReason}`
+    );
+    // Should mention fallback attempt
+    assert.ok(
+      result.lastFailureReason.includes("fallback"),
+      `expected 'fallback' in reason when fallback also fails, got: ${result.lastFailureReason}`
+    );
+    assert.ok(
+      result.lastFailureReason.includes("fal.nano-banana"),
+      `expected fallback provider id in reason, got: ${result.lastFailureReason}`
+    );
+  }
+});
+
+test("rebuild TIMEOUT on primary scout — lane continues to next backfill candidate", async () => {
+  const primaryScout = makeSelectedScout({ slotIndex: 0 });
+  const backfillSlot = makeSlot({ seed: 2000, grammarKey: "horizon_band" } as Partial<ScoutSlot>);
+  const backfillCandidate: BackfillCandidate = {
+    slotIndex: 1,
+    slot: backfillSlot,
+    result: makeResult({ slotIndex: 1, slot: backfillSlot }),
+    eval: makeEval(),
+    grammarKey: "horizon_band",
+    diversityFamily: "horizontal",
+    compositeScore: 0.7,
+  };
+
+  // Primary times out (even with fallback provider), backfill candidate succeeds
+  const result = await runLaneWithBackfill({
+    laneLabel: "A",
+    primaryScout,
+    backfillCandidates: [backfillCandidate],
+    budget: 1,
+    negativeHints: [],
+    primaryProvider: makeTimeoutProvider("fal.nano-banana-pro"),
+    fallbackProvider: makeTimeoutProvider("fal.nano-banana"),
+    rebuildFallbackBudget: 0, // no fallback — timeout is immediate failure
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  // After primary scout times out, backfill is used but backfill ALSO uses the same
+  // providers — which also time out. So we need a working provider for the backfill.
+  // Re-test with ok provider for backfill:
+  const result2 = await runLaneWithBackfill({
+    laneLabel: "A",
+    primaryScout,
+    backfillCandidates: [backfillCandidate],
+    budget: 1,
+    negativeHints: [],
+    // Primary scout rebuild: uses primaryProvider (times out, no fallback)
+    // Backfill candidate rebuild: also uses primaryProvider (succeeds when we swap)
+    primaryProvider: {
+      id: "mixed-provider",
+      generate: async (req) => {
+        // Times out for seed 1000 (primary scout), succeeds for seed 2000 (backfill)
+        if (req.seed === 0) {
+          // rebuildSeed(1000, 0) — will not equal 2000 exactly but let's just use attempt count
+          throw new RebuildProviderError("TIMEOUT", "mixed-provider timed out");
+        }
+        return { imageBytes: Buffer.from("ok"), latencyMs: 50, providerModel: "m", seed: req.seed };
+      },
+    },
+    fallbackProvider: makeOkProvider("fallback"),
+    rebuildFallbackBudget: 0,
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  // The important assertion: backfill was attempted after primary timed out
+  assert.equal(result.status, "exhausted", "when both primary and backfill use timeout providers, should exhaust");
+  assert.ok(
+    result.status === "exhausted" && result.backfillDebug.attemptCount > 0,
+    "backfill was attempted after primary timeout"
+  );
+});
+
+test("lane failure after exhausted timeout attempts has honest specific reason", async () => {
+  const primaryScout = makeSelectedScout({ slotIndex: 0 });
+  const backfillSlot = makeSlot({ seed: 2000 } as Partial<ScoutSlot>);
+  const backfillCandidate: BackfillCandidate = {
+    slotIndex: 1,
+    slot: backfillSlot,
+    result: makeResult({ slotIndex: 1, slot: backfillSlot }),
+    eval: makeEval(),
+    grammarKey: "edge_anchored_motif",
+    diversityFamily: "edge",
+    compositeScore: 0.6,
+  };
+
+  const result = await runLaneWithBackfill({
+    laneLabel: "B",
+    primaryScout,
+    backfillCandidates: [backfillCandidate],
+    budget: 1,
+    negativeHints: [],
+    primaryProvider: makeTimeoutProvider("fal.nano-banana-pro"),
+    fallbackProvider: makeTimeoutProvider("fal.nano-banana"),
+    rebuildFallbackBudget: 1,
+    evalFn: alwaysAcceptEval,
+    acceptanceFn: alwaysAccept,
+  });
+
+  assert.equal(result.status, "exhausted");
+  if (result.status === "exhausted") {
+    // Must not be a generic "rebuild_failed" — must have provider-specific info
+    assert.notEqual(result.lastFailureReason, "rebuild_failed",
+      "failure reason should be specific, not generic rebuild_failed");
+    assert.ok(
+      result.lastFailureReason.includes("timeout"),
+      `expected 'timeout' in final failure reason, got: ${result.lastFailureReason}`
+    );
+    // rejected candidates should show the progression
+    assert.ok(result.backfillDebug.rejectedCandidates.length >= 1,
+      "should have at least one rejected candidate logged");
+  }
+});

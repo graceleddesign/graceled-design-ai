@@ -7,6 +7,8 @@ import {
   RebuildRequest,
   RebuildResult,
 } from "./rebuild-provider";
+import { withTimeout, ProviderTimeoutError } from "./with-timeout";
+import { ROUND1_V2_CONFIG } from "../config";
 
 // Primary rebuild provider: Nano Banana Pro via FAL.
 // Input uses aspect_ratio (not image_size) and resolution for quality tier.
@@ -41,6 +43,9 @@ async function fetchImageBytes(url: string): Promise<Buffer> {
 }
 
 function classifyFalError(err: unknown): RebuildProviderError {
+  // ProviderTimeoutError from withTimeout — must be checked before string matching.
+  if (err instanceof ProviderTimeoutError)
+    return new RebuildProviderError("TIMEOUT", err.message, err);
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
   if (lower.includes("429") || lower.includes("rate limit") || lower.includes("too many"))
@@ -66,15 +71,19 @@ export const falNanaBananaPro: RebuildProvider = {
     const started = Date.now();
     let raw: unknown;
     try {
-      raw = await fal.subscribe(MODEL_ID, {
-        input: {
-          prompt: req.prompt,
-          aspect_ratio: deriveAspectRatio(req.widthPx, req.heightPx),
-          resolution: "2K",
-          num_images: 1,
-          output_format: "png",
-        },
-      });
+      raw = await withTimeout(
+        fal.subscribe(MODEL_ID, {
+          input: {
+            prompt: req.prompt,
+            aspect_ratio: deriveAspectRatio(req.widthPx, req.heightPx),
+            resolution: "2K",
+            num_images: 1,
+            output_format: "png",
+          },
+        }),
+        ROUND1_V2_CONFIG.rebuildProviderTimeoutMs,
+        "fal-nano-banana-pro"
+      );
     } catch (err) {
       throw classifyFalError(err);
     }
