@@ -71,6 +71,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { selectScouts } = await import("./select-scouts");
   const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
   const { planDesignModes } = await import("./plan-design-modes");
+  const { getDesignModeLockupRecipe } = await import("./design-mode-lockup-recipes");
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
@@ -351,6 +352,15 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     const scout = selection.selected[i];
     const generationId = generationIds[i];
 
+    // Resolve this lane's planned DesignMode and lockup recipe.
+    const laneDesignMode = designModePlan.lanes[i]?.mode;
+    const lockupRecipe = laneDesignMode ? getDesignModeLockupRecipe(laneDesignMode) : null;
+    console.log(
+      `[v2] lane ${scout.label} mode=${laneDesignMode ?? "(none)"} ` +
+      `promptDirective=${laneDesignMode ? "true" : "false"} ` +
+      `lockupRecipe=${lockupRecipe?.label ?? "(default)"}`
+    );
+
     // Grammar keys used by this lane and by already-completed lanes — for diversity preference.
     const completedGrammarKeys = new Set<string>();
     for (const si of completedSlotIndices) {
@@ -381,6 +391,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
       fallbackProvider: falNanaBanana,
       rebuildFallbackBudget: ROUND1_V2_CONFIG.rebuildFallbackBudget,
       preferNotGrammarKeys,
+      designMode: laneDesignMode,
       evalFn: (args) => evaluateScout(args),
       acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
     });
@@ -466,15 +477,29 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         passage: brief.scripturePassages,
       };
 
-      // Wide lockup composition
-      const wideLayout = computeCleanMinimalLayout({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content });
+      // Wide lockup composition — DesignMode-aware lockup preset, alignment, and integration.
+      const lockupPresetId = lockupRecipe?.lockupPresetId ?? null;
+      const lockupAlign = lockupRecipe?.align ?? "left";
+      const lockupIntegrationMode = lockupRecipe?.integrationMode ?? "clean";
+      const wideLayout = computeCleanMinimalLayout({
+        width: WIDE_WIDTH,
+        height: WIDE_HEIGHT,
+        content,
+        lockupPresetId,
+      });
       const widePalette = await chooseTextPaletteForBackground({
         backgroundPng: acceptedBackgroundPng,
         sampleRegion: wideLayout.textRegion,
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
       });
-      const wideLockupSvg = buildCleanMinimalOverlaySvg({ width: WIDE_WIDTH, height: WIDE_HEIGHT, content, palette: widePalette });
+      const wideLockupSvg = buildCleanMinimalOverlaySvg({
+        width: WIDE_WIDTH,
+        height: WIDE_HEIGHT,
+        content,
+        palette: widePalette,
+        lockupPresetId,
+      });
       const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(wideLockupSvg);
       const wideFinalPng = await composeLockupOnBackground({
         backgroundPng: acceptedBackgroundPng,
@@ -482,8 +507,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         shape: "wide",
         width: WIDE_WIDTH,
         height: WIDE_HEIGHT,
-        align: "left",
-        integrationMode: "clean",
+        align: lockupAlign,
+        integrationMode: lockupIntegrationMode,
       });
 
       // Write wide-only files (3 assets — direction preview contract)
@@ -549,6 +574,15 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
               allDistinct: designModePlan.allDistinct,
               lane: designModePlan.lanes[i] ?? null,
             },
+            lockupRecipe: lockupRecipe
+              ? {
+                  label: lockupRecipe.label,
+                  lockupPresetId: lockupRecipe.lockupPresetId,
+                  align: lockupRecipe.align,
+                  integrationMode: lockupRecipe.integrationMode,
+                  titleDominant: lockupRecipe.titleDominant,
+                }
+              : null,
             aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },

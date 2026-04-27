@@ -2,6 +2,11 @@ import type { ScoutSlot } from "./build-scout-plan";
 import { GRAMMAR_BANK } from "../grammars";
 import type { TonalVariant } from "../grammars";
 import { STRICT_TEXT_PURGE_BLOCK } from "./prompt-constants";
+import type { DesignMode } from "../design-modes";
+import {
+  buildDesignModePromptDirective,
+  buildDesignModeNegativeDirective,
+} from "./design-mode-prompt-directives";
 
 // Short atmospheric descriptions for each tonal variant — Flux-optimized language.
 const TONE_DESCRIPTIONS: Record<TonalVariant, string> = {
@@ -47,7 +52,7 @@ function buildMotifAnchor(motifBinding: string[]): string {
  *   4. Negative hints (if any)
  *   5. STRICT_TEXT_PURGE_BLOCK
  */
-export function buildScoutPrompt(slot: ScoutSlot): string {
+export function buildScoutPrompt(slot: ScoutSlot, designMode?: DesignMode): string {
   const motifPhrase = resolveMotifPhrase(slot.motifBinding);
   const toneDesc = TONE_DESCRIPTIONS[slot.tone];
 
@@ -62,16 +67,25 @@ export function buildScoutPrompt(slot: ScoutSlot): string {
     prompt += " " + motifAnchor;
   }
 
+  // 2b. DesignMode positive directive (mode-specific design intent)
+  if (designMode) {
+    prompt += " " + buildDesignModePromptDirective(designMode);
+  }
+
   // 3. Extra guard for text-prone grammars
   const grammar = GRAMMAR_BANK[slot.grammarKey as keyof typeof GRAMMAR_BANK];
   if (grammar?.avoidTextProne) {
     prompt += " No signage-like composition. No central text panel or flat areas resembling a poster frame.";
   }
 
-  // 4. Negative hints
-  if (slot.promptSpec.negativeHints.length > 0) {
-    const hintsPhrase = slot.promptSpec.negativeHints.join(", ");
-    prompt += ` Avoid: ${hintsPhrase}.`;
+  // 4. Negative hints (combine grammar-level + design-mode-level)
+  const negatives = [...slot.promptSpec.negativeHints];
+  if (designMode) {
+    const modeNeg = buildDesignModeNegativeDirective(designMode);
+    if (modeNeg) negatives.push(modeNeg);
+  }
+  if (negatives.length > 0) {
+    prompt += ` Avoid: ${negatives.join(", ")}.`;
   }
 
   // 5. Strict text-purge block (always last)

@@ -1,12 +1,18 @@
 import { GRAMMAR_BANK, type GrammarKey, type TonalVariant } from "../grammars";
 import { TONE_DESCRIPTIONS } from "./build-scout-prompt";
 import { STRICT_TEXT_PURGE_BLOCK } from "./prompt-constants";
+import type { DesignMode } from "../design-modes";
+import {
+  buildDesignModePromptDirective,
+  buildDesignModeNegativeDirective,
+} from "./design-mode-prompt-directives";
 
 export interface RebuildPromptInput {
   grammarKey: GrammarKey;
   tone: TonalVariant;
   motifBinding: string[];
   negativeHints: string[];
+  designMode?: DesignMode;
 }
 
 // Quality upgrade footer — quality language only; text-purge handled by STRICT_TEXT_PURGE_BLOCK.
@@ -66,6 +72,11 @@ export function buildRebuildPrompt(input: RebuildPromptInput): string {
     prompt += " " + motifClarity;
   }
 
+  // 2b. DesignMode positive directive (mode-specific design intent)
+  if (input.designMode) {
+    prompt += " " + buildDesignModePromptDirective(input.designMode);
+  }
+
   // 3. Quiet space instruction (no mention of text)
   prompt +=
     " Include a calm, low-detail region that remains visually quiet — uncluttered open space in at least one area of the frame.";
@@ -75,9 +86,14 @@ export function buildRebuildPrompt(input: RebuildPromptInput): string {
     prompt += " No signage-like composition. No central text panel or flat surfaces that resemble a poster or sign.";
   }
 
-  // 5. Negative hints
-  if (input.negativeHints.length > 0) {
-    prompt += ` Avoid: ${input.negativeHints.join(", ")}.`;
+  // 5. Negative hints (combine project-level + design-mode-level)
+  const negatives = [...input.negativeHints];
+  if (input.designMode) {
+    const modeNeg = buildDesignModeNegativeDirective(input.designMode);
+    if (modeNeg) negatives.push(modeNeg);
+  }
+  if (negatives.length > 0) {
+    prompt += ` Avoid: ${negatives.join(", ")}.`;
   }
 
   // 6. Strict text-purge block
@@ -111,6 +127,11 @@ export function buildTextPurgedRebuildPrompt(input: RebuildPromptInput): string 
     prompt += " " + motifClarity;
   }
 
+  // DesignMode positive directive
+  if (input.designMode) {
+    prompt += " " + buildDesignModePromptDirective(input.designMode);
+  }
+
   // Quiet space
   prompt +=
     " Include a calm, low-detail region that remains visually quiet — uncluttered open space in at least one area of the frame.";
@@ -120,9 +141,14 @@ export function buildTextPurgedRebuildPrompt(input: RebuildPromptInput): string 
     prompt += " No signage-like composition. No central text panel or flat surfaces that resemble a poster or sign.";
   }
 
-  // Negative hints
-  if (input.negativeHints.length > 0) {
-    prompt += ` Avoid: ${input.negativeHints.join(", ")}.`;
+  // Negative hints (combine project + design-mode negatives)
+  const negatives = [...input.negativeHints];
+  if (input.designMode) {
+    const modeNeg = buildDesignModeNegativeDirective(input.designMode);
+    if (modeNeg) negatives.push(modeNeg);
+  }
+  if (negatives.length > 0) {
+    prompt += ` Avoid: ${negatives.join(", ")}.`;
   }
 
   // Text-purge: STRICT block + explicit correction header

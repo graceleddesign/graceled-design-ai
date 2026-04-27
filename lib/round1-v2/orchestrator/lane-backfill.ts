@@ -24,6 +24,7 @@ import { RebuildProviderError, REBUILD_WIDE_WIDTH_PX, REBUILD_WIDE_HEIGHT_PX } f
 import type { ProductionBackgroundValidationEvidence } from "@/lib/production-valid-option";
 import type { GrammarKey } from "../grammars";
 import { buildRebuildPrompt, buildTextPurgedRebuildPrompt } from "./build-rebuild-prompt";
+import type { DesignMode } from "../design-modes";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -298,6 +299,8 @@ export async function runLaneWithBackfill(params: {
   rebuildFallbackBudget: number;
   /** preferNotGrammarKeys: grammar keys to deprioritise for diversity. */
   preferNotGrammarKeys?: ReadonlySet<string>;
+  /** Optional planned DesignMode for this lane — threaded into rebuild prompts. */
+  designMode?: DesignMode;
   evalFn: (input: { slot: ScoutSlot; imageBytes: Buffer }) => Promise<ScoutEvalResult>;
   acceptanceFn: (params: {
     evidence: ProductionBackgroundValidationEvidence;
@@ -312,6 +315,7 @@ export async function runLaneWithBackfill(params: {
     fallbackProvider,
     rebuildFallbackBudget,
     preferNotGrammarKeys,
+    designMode,
     evalFn,
     acceptanceFn,
   } = params;
@@ -366,6 +370,7 @@ export async function runLaneWithBackfill(params: {
       tone: attempt.slot.tone,
       motifBinding: attempt.slot.motifBinding,
       negativeHints,
+      designMode,
     });
 
     const genOutcome = await attemptGenerate(
@@ -418,6 +423,7 @@ export async function runLaneWithBackfill(params: {
         tone: attempt.slot.tone,
         motifBinding: attempt.slot.motifBinding,
         negativeHints,
+        designMode,
       });
 
       const retryOutcome = await attemptGenerate(
