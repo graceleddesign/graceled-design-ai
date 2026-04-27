@@ -70,6 +70,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { evaluateScout } = await import("../eval/evaluate-scout");
   const { selectScouts } = await import("./select-scouts");
   const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
+  const { planDesignModes } = await import("./plan-design-modes");
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
@@ -135,9 +136,26 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   console.log(`[v2] brief: title="${brief.title}" tone=${brief.toneTarget} motifs=[${brief.motifs.join(",")}]`);
 
+  const runSeed = randomUUID();
+
+  // ── 2b. Plan design modes (A/B/C lane identity) ───────────────────────────
+  // Metadata only in phase 1 — does not change prompt or compositor behavior.
+
+  const designModePlan = planDesignModes({
+    title: project.series_title,
+    subtitle: project.series_subtitle,
+    scripturePassages: project.scripture_passages,
+    description: project.series_description,
+    designNotes: project.designNotes,
+    toneHint: briefSignals.toneHint,
+    motifHints: briefSignals.motifHints,
+    runSeed,
+  });
+
+  console.log(`[v2] design modes: ${designModePlan.summary} distinct=${designModePlan.allDistinct}`);
+
   // ── 3. Build scout plan ────────────────────────────────────────────────────
 
-  const runSeed = randomUUID();
   const plan = buildScoutPlan({
     runSeed,
     tone: brief.toneTarget,
@@ -204,6 +222,12 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             plannedTone: briefSignals.toneHint,
             plannedMotifs: briefSignals.motifHints,
             plannerDebug: briefSignals.debug,
+            designMode: designModePlan.lanes[i]?.mode ?? null,
+            designModePlan: {
+              summary: designModePlan.summary,
+              allDistinct: designModePlan.allDistinct,
+              lane: designModePlan.lanes[i] ?? null,
+            },
           } as unknown as Prisma.InputJsonValue,
         },
       })
@@ -407,6 +431,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             ...(failedOutput as any).meta?.debug,
             textRetry: laneResult.textRetryMeta,
             backfill: laneResult.backfillDebug,
+            designMode: designModePlan.lanes[i]?.mode ?? null,
           },
         },
       };
@@ -518,6 +543,12 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
             planner: briefSignals.debug,
             plannedTone: briefSignals.toneHint,
             plannedMotifs: briefSignals.motifHints,
+            designMode: designModePlan.lanes[i]?.mode ?? null,
+            designModePlan: {
+              summary: designModePlan.summary,
+              allDistinct: designModePlan.allDistinct,
+              lane: designModePlan.lanes[i] ?? null,
+            },
             aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },
