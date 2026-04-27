@@ -76,6 +76,9 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     getDesignModeLockupRecipeOverride,
     shouldSuppressAutoScrim,
   } = await import("./design-mode-lockup-recipes");
+  const { canRenderDesignModeLocally, renderDesignModeDirectionPreview } = await import(
+    "./design-mode-renderer"
+  );
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
@@ -159,103 +162,162 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   console.log(`[v2] design modes: ${designModePlan.summary} distinct=${designModePlan.allDistinct}`);
 
-  // ── 3. Build scout plan (lane-aware) ───────────────────────────────────────
+  // ── 3. Partition lanes into local-render vs AI-generation ─────────────────
+  // Lanes whose designMode supports deterministic SVG rendering bypass FAL
+  // entirely. Only the remaining lanes become scouts.
 
-  const plan = buildScoutPlan({
-    runSeed,
-    tone: brief.toneTarget,
-    motifs: brief.motifs,
-    negativeHints: brief.negativeHints,
-    lanes: designModePlan.lanes.map((l) => ({ laneKey: l.lane, designMode: l.mode })),
-    slotsPerLane: 3,
-  });
-
+  const aiLaneSpecs = designModePlan.lanes
+    .filter((l) => !canRenderDesignModeLocally(l.mode))
+    .map((l) => ({ laneKey: l.lane, designMode: l.mode }));
+  const localLaneCount = designModePlan.lanes.length - aiLaneSpecs.length;
   console.log(
-    `[v2] scout plan: ${plan.slots.length} slots tone=${plan.tone} laneAware=${plan.laneAware}`
+    `[v2] lane routing: aiLanes=${aiLaneSpecs.length} localLanes=${localLaneCount}`
   );
 
-  // ── 4. Generate scouts (Flux Schnell via FAL) ──────────────────────────────
+  // Empty default plan / batch / selection structures for the all-local case.
+  type EmptyPlan = ReturnType<typeof buildScoutPlan>;
+  let plan: EmptyPlan;
+  let scoutBatch: { results: ScoutGenerationResult[]; successCount: number; totalLatencyMs: number };
+  let evals: ScoutEvalResult[];
+  let selection: ReturnType<typeof selectScouts>;
 
-  const { falFluxSchnellProvider } = await import("../providers/fal-flux-schnell");
-  const scoutBatch = await runScoutBatch(plan, falFluxSchnellProvider);
+  if (aiLaneSpecs.length > 0) {
+    plan = buildScoutPlan({
+      runSeed,
+      tone: brief.toneTarget,
+      motifs: brief.motifs,
+      negativeHints: brief.negativeHints,
+      lanes: aiLaneSpecs,
+      slotsPerLane: 3,
+    });
+    console.log(
+      `[v2] scout plan: ${plan.slots.length} slots tone=${plan.tone} laneAware=${plan.laneAware}`
+    );
 
-  console.log(`[v2] scouts: ${scoutBatch.successCount}/${scoutBatch.results.length} succeeded in ${scoutBatch.totalLatencyMs}ms`);
+    // ── 4. Generate scouts (Flux Schnell via FAL) ────────────────────────────
+    const { falFluxSchnellProvider } = await import("../providers/fal-flux-schnell");
+    scoutBatch = await runScoutBatch(plan, falFluxSchnellProvider);
+    console.log(
+      `[v2] scouts: ${scoutBatch.successCount}/${scoutBatch.results.length} succeeded in ${scoutBatch.totalLatencyMs}ms`
+    );
 
-  // ── 5. Evaluate scouts ─────────────────────────────────────────────────────
+    // ── 5. Evaluate scouts ───────────────────────────────────────────────────
+    evals = await Promise.all(
+      scoutBatch.results.map((result: ScoutGenerationResult) => {
+        if (result.status === "failed" || !result.imageBytes) {
+          return Promise.resolve(makeFailedGenerationEval());
+        }
+        return evaluateScout({ slot: result.slot, imageBytes: result.imageBytes });
+      })
+    );
+    const acceptedCount = evals.filter((e) => !e.hardReject).length;
+    console.log(`[v2] eval: ${acceptedCount}/${evals.length} passed`);
 
-  const evals: ScoutEvalResult[] = await Promise.all(
-    scoutBatch.results.map((result: ScoutGenerationResult) => {
-      if (result.status === "failed" || !result.imageBytes) {
-        return Promise.resolve(makeFailedGenerationEval());
+    // ── 6. Select A/B/C from the AI lane scouts ──────────────────────────────
+    selection = selectScouts(plan, scoutBatch.results, evals);
+    console.log(
+      `[v2] selected (AI): [${selection.selected
+        .map((s) => `${s.label}=${s.grammarKey}`)
+        .join(" ")}]` +
+        ` shortfall=${selection.shortfall} rejected=${selection.rejected.length}`
+    );
+
+    // Only fail the whole run if AI lanes existed and none of them produced a
+    // viable scout. Local-render lanes proceed regardless.
+    if (selection.selected.length === 0) {
+      console.warn(`[v2] AI lane shortfall — no viable scouts after evaluation`);
+      // We still try to settle local-render lanes below; only fail the run
+      // entirely if there are also no local lanes.
+      if (localLaneCount === 0) {
+        return { error: "Round 1 V2: all scouts failed evaluation — shortfall=3" };
       }
-      return evaluateScout({ slot: result.slot, imageBytes: result.imageBytes });
-    })
-  );
-
-  const acceptedCount = evals.filter((e) => !e.hardReject).length;
-  console.log(`[v2] eval: ${acceptedCount}/${evals.length} passed`);
-
-  // ── 6. Select A/B/C ────────────────────────────────────────────────────────
-
-  const selection = selectScouts(plan, scoutBatch.results, evals);
-
-  console.log(
-    `[v2] selected: [${selection.selected.map((s) => `${s.label}=${s.grammarKey}`).join(" ")}]` +
-      ` shortfall=${selection.shortfall} rejected=${selection.rejected.length}`
-  );
-
-  if (selection.selected.length === 0) {
-    console.warn(`[v2] shortfall=3 — no viable scouts after evaluation`);
-    return { error: "Round 1 V2: all scouts failed evaluation — shortfall=3" };
+    }
+  } else {
+    // No AI lanes — skip scout generation entirely. Zero FAL calls.
+    plan = {
+      slots: [],
+      runSeed,
+      tone: brief.toneTarget,
+      distinctFamilyCount: 0,
+      laneAware: true,
+    };
+    scoutBatch = { results: [], successCount: 0, totalLatencyMs: 0 };
+    evals = [];
+    selection = {
+      selected: [],
+      rejected: [],
+      shortfall: false,
+      shortfallCount: 0,
+      candidateCount: 0,
+      hardRejectCount: 0,
+      distinctFamilyCount: 0,
+    };
+    console.log(`[v2] no AI lanes — skipping scout generation (FAL calls=0)`);
   }
 
-  // ── 7. Create Generation records (one per selected option) ─────────────────
+  // ── 7. Create one Generation record per planned lane (A/B/C) ──────────────
+  //
+  // Lane records are keyed by lane label — independent of whether the lane
+  // ultimately renders deterministically or via AI rebuild. Local-render
+  // lanes have no associated scout; AI lanes carry the matching scout
+  // metadata when a winner exists.
 
-  const generationIds = selection.selected.map(() => randomUUID());
+  const lanePlanItems = designModePlan.lanes.map((lp) => {
+    const isLocal = canRenderDesignModeLocally(lp.mode);
+    const aiScout = isLocal ? null : selection.selected.find((s) => s.label === lp.lane) ?? null;
+    return {
+      label: lp.lane,
+      mode: lp.mode,
+      isLocal,
+      aiScout,
+      generationId: randomUUID(),
+    };
+  });
 
   await prisma.$transaction(
-    selection.selected.map((scout, i) =>
+    lanePlanItems.map((item) =>
       prisma.generation.create({
         data: {
-          id: generationIds[i],
+          id: item.generationId,
           projectId,
           round: 1,
           status: "RUNNING",
           input: {
             v2: true,
             runSeed,
-            optionLabel: scout.label,
-            grammarKey: scout.grammarKey,
-            diversityFamily: scout.diversityFamily,
-            compositeScore: scout.compositeScore,
+            optionLabel: item.label,
+            grammarKey: item.aiScout?.grammarKey ?? null,
+            diversityFamily: item.aiScout?.diversityFamily ?? null,
+            compositeScore: item.aiScout?.compositeScore ?? null,
             plannedTone: briefSignals.toneHint,
             plannedMotifs: briefSignals.motifHints,
             plannerDebug: briefSignals.debug,
-            designMode: designModePlan.lanes[i]?.mode ?? null,
+            designMode: item.mode,
             designModePlan: {
               summary: designModePlan.summary,
               allDistinct: designModePlan.allDistinct,
-              lane: designModePlan.lanes[i] ?? null,
+              lane: designModePlan.lanes.find((l) => l.lane === item.label) ?? null,
             },
+            renderer: item.isLocal ? "deterministic_design_mode_v1" : "ai_rebuild",
           } as unknown as Prisma.InputJsonValue,
         },
       })
     )
   );
 
-  console.log(`[v2] created ${generationIds.length} generation records`);
+  console.log(`[v2] created ${lanePlanItems.length} generation records (lane-keyed)`);
 
-  // ── 8. Persist scout runs + evals (best-effort; non-blocking) ──────────────
+  // ── 8. Persist scout runs + evals for AI lanes (best-effort; non-blocking) ─
 
   const scoutRunIdBySlotIndex = new Map<number, string>();
 
-  for (let i = 0; i < selection.selected.length; i++) {
-    const scout = selection.selected[i];
-    const generationId = generationIds[i];
+  for (const scout of selection.selected) {
+    const item = lanePlanItems.find((it) => it.label === scout.label);
+    if (!item) continue;
     try {
       const scoutRun = await storage.createScoutRun(
         storage.buildCreateScoutRunInput({
-          generationId,
+          generationId: item.generationId,
           runSeed,
           slotIndex: scout.slotIndex,
           slot: scout.slot,
@@ -356,17 +418,159 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
 
   const laneLog: string[] = [];
 
-  for (let i = 0; i < selection.selected.length; i++) {
-    const scout = selection.selected[i];
-    const generationId = generationIds[i];
+  // Iterate ALL planned lanes (A, B, C). Local-render lanes branch off here.
+  for (let i = 0; i < lanePlanItems.length; i++) {
+    const item = lanePlanItems[i];
+    const generationId = item.generationId;
+    const laneDesignMode = item.mode;
+    const lockupRecipe = getDesignModeLockupRecipe(laneDesignMode);
 
-    // Resolve this lane's planned DesignMode and lockup recipe.
-    const laneDesignMode = designModePlan.lanes[i]?.mode;
-    const lockupRecipe = laneDesignMode ? getDesignModeLockupRecipe(laneDesignMode) : null;
+    // ── Local-render branch (no FAL calls) ───────────────────────────────────
+    if (item.isLocal) {
+      console.log(
+        `[v2] lane ${item.label} mode=${laneDesignMode} renderer=deterministic_design_mode_v1 aiCalls=0`
+      );
+      try {
+        const rendered = await renderDesignModeDirectionPreview({
+          designMode: laneDesignMode,
+          tone: brief.toneTarget,
+          motifs: brief.motifs,
+          content: {
+            title: brief.title,
+            subtitle: brief.subtitle,
+            passage: brief.scripturePassages,
+          },
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          seed: i + 1,
+        });
+
+        const prefix = generationId;
+        const bgPath = await writeV2File(`${prefix}-wide-bg.png`, rendered.backgroundPng);
+        const lockupPath = await writeV2File(`${prefix}-lockup.png`, rendered.lockupPng);
+        const wideFinPath = await writeV2File(`${prefix}-wide.png`, rendered.widePng);
+
+        const wideDesignDoc = buildCleanMinimalDesignDoc({
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          content: { title: brief.title, subtitle: brief.subtitle, passage: brief.scripturePassages },
+          palette: DEFAULT_PALETTE,
+          backgroundImagePath: bgPath,
+        });
+
+        const lockupEvidence = {
+          source: "generated" as const,
+          sourceGenerationId: null,
+          textIntegrity: true,
+          fitPass: true,
+          insideTitleSafeWithMargin: null,
+          notTooSmall: null,
+        };
+
+        const completedOutput = {
+          status: "COMPLETED",
+          designDoc: wideDesignDoc,
+          designDocByShape: { wide: wideDesignDoc },
+          notes: `V2 lane ${item.label} (deterministic ${laneDesignMode})`,
+          preview: { widescreen_main: wideFinPath },
+          meta: {
+            styleRefCount: 0,
+            usedStylePaths: [],
+            productionValidation: {
+              stage: "direction_preview",
+              background: rendered.backgroundEvidence,
+              lockup: lockupEvidence,
+              aspects: { widescreen: { provenance: "rendered" } },
+            },
+            debug: {
+              v2: true,
+              ...rendered.debug,
+              aiCalls: 0,
+              designModePlan: {
+                summary: designModePlan.summary,
+                allDistinct: designModePlan.allDistinct,
+                lane: designModePlan.lanes[i] ?? null,
+              },
+              backgroundSource: "deterministic",
+              lockupSource: "generated",
+              generationLifecycleState: "GENERATION_COMPLETED",
+              backgroundFailureReason: null,
+              planner: briefSignals.debug,
+              plannedTone: briefSignals.toneHint,
+              plannedMotifs: briefSignals.motifHints,
+              aspectAssets: { widescreen: "ok" },
+              squareVerticalNotGenerated: "round1_direction_preview_only",
+            },
+          },
+        };
+
+        await prisma.$transaction(async (tx) => {
+          await tx.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "COMPLETED",
+              output: completedOutput as unknown as Prisma.InputJsonValue,
+            },
+          });
+          await tx.asset.createMany({
+            data: [
+              { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg", file_path: bgPath, mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
+              { projectId, generationId, kind: "LOCKUP", slot: "series_lockup", file_path: lockupPath, mime_type: "image/png", width: null, height: null },
+              { projectId, generationId, kind: "IMAGE", slot: "wide", file_path: wideFinPath, mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
+            ],
+          });
+        });
+
+        laneLog.push(`${item.label}=completed(local:${laneDesignMode})`);
+        console.log(`[v2] lane ${item.label} settled (deterministic): wide=${wideFinPath}`);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`[v2] lane ${item.label} deterministic render failed: ${reason}`);
+        try {
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "FAILED",
+              output: buildV2FailedOutput(
+                `Deterministic render failed: ${reason}`,
+                item.label
+              ) as unknown as Prisma.InputJsonValue,
+            },
+          });
+        } catch (settleErr) {
+          console.error(`[v2] lane ${item.label} failed to settle: ${String(settleErr)}`);
+        }
+        laneLog.push(`${item.label}=failed(local:${reason.slice(0, 40)})`);
+      }
+      continue;
+    }
+
+    // ── AI rebuild branch (existing scout/rebuild/backfill path) ─────────────
+    const scout = item.aiScout;
+    if (!scout) {
+      // AI lane planned but no scout was selectable — settle FAILED honestly.
+      console.warn(`[v2] lane ${item.label} mode=${laneDesignMode} has no selectable scout`);
+      try {
+        await prisma.generation.update({
+          where: { id: generationId },
+          data: {
+            status: "FAILED",
+            output: buildV2FailedOutput(
+              "no_viable_scout_for_lane",
+              item.label
+            ) as unknown as Prisma.InputJsonValue,
+          },
+        });
+      } catch (settleErr) {
+        console.error(`[v2] lane ${item.label} settle error: ${String(settleErr)}`);
+      }
+      laneLog.push(`${item.label}=failed(no_scout)`);
+      continue;
+    }
+
     console.log(
-      `[v2] lane ${scout.label} mode=${laneDesignMode ?? "(none)"} ` +
-      `promptDirective=${laneDesignMode ? "true" : "false"} ` +
-      `lockupRecipe=${lockupRecipe?.label ?? "(default)"}`
+      `[v2] lane ${item.label} mode=${laneDesignMode} renderer=ai_rebuild ` +
+      `promptDirective=true lockupRecipe=${lockupRecipe.label}`
     );
 
     // Grammar keys used by this lane and by already-completed lanes — for diversity preference.
@@ -612,6 +816,8 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
                 }
               : null,
             backfillModeRelaxed: poolModeRelaxed,
+            renderer: "ai_rebuild",
+            aiCalls: 1 + (laneResult.backfillDebug.attemptCount ?? 0),
             aspectAssets: { widescreen: "ok" },
             squareVerticalNotGenerated: "round1_direction_preview_only",
           },
