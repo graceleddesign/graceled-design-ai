@@ -1,3 +1,6 @@
+// Ensure the page always renders fresh data after a generation action completes.
+export const dynamic = "force-dynamic";
+
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { approveFinalDesignAction } from "@/app/app/projects/actions";
