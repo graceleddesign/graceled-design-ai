@@ -1,5 +1,6 @@
 import { GRAMMAR_BANK, type GrammarKey, type TonalVariant } from "../grammars";
 import { TONE_DESCRIPTIONS } from "./build-scout-prompt";
+import { STRICT_TEXT_PURGE_BLOCK } from "./prompt-constants";
 
 export interface RebuildPromptInput {
   grammarKey: GrammarKey;
@@ -8,19 +9,9 @@ export interface RebuildPromptInput {
   negativeHints: string[];
 }
 
-// Upgrade phrases that lift the rebuild above scout quality.
+// Quality upgrade footer — quality language only; text-purge handled by STRICT_TEXT_PURGE_BLOCK.
 const QUALITY_FOOTER =
-  "Ultra-detailed composition, professional studio lighting, rich tonal depth. " +
-  "Completely text-free — no letters, words, numbers, or letterforms anywhere in the image.";
-
-// Stronger text-removal footer used in text-detection retry passes.
-const TEXT_PURGE_FOOTER =
-  "CRITICAL REQUIREMENT: Pure visual background only — absolutely zero text. " +
-  "Do not include any letters, numbers, words, signage, captions, labels, scripture text, " +
-  "title text, watermarks, UI text, poster text, banners, inscriptions, engravings, " +
-  "typographic artifacts, or any symbol that resembles a letterform or glyph. " +
-  "No readable marks of any kind. Only pure artistic composition: shapes, colors, light, " +
-  "texture, depth. Ultra-detailed, professional studio quality.";
+  "Ultra-detailed cinematic quality. Professional lighting and atmospheric depth. Rich tonal range.";
 
 function resolveMotifPhrase(motifBinding: string[]): string {
   if (motifBinding.length === 0) return "an abstract visual theme";
@@ -29,41 +20,118 @@ function resolveMotifPhrase(motifBinding: string[]): string {
   return `${motifBinding.slice(0, -1).join(", ")} and ${last}`;
 }
 
-// Build a text-purge retry prompt for a direction that failed background_text_detected.
-// Uses TEXT_PURGE_FOOTER instead of QUALITY_FOOTER for stronger text-removal enforcement.
-export function buildTextPurgedRebuildPrompt(input: RebuildPromptInput): string {
-  const grammar = GRAMMAR_BANK[input.grammarKey];
-  const motifPhrase = resolveMotifPhrase(input.motifBinding);
-  const toneDesc = TONE_DESCRIPTIONS[input.tone];
-
-  let prompt = grammar.rebuildPromptTemplate
-    .replace(/\{motif\}/g, motifPhrase)
-    .replace(/\{tone\}/g, toneDesc);
-
-  if (input.negativeHints.length > 0) {
-    prompt += ` Avoid: ${input.negativeHints.join(", ")}.`;
+/**
+ * Build motif clarity enforcement for rebuild prompts.
+ *
+ * "Primary subject" language drives the model to commit to a clear, readable form.
+ */
+function buildMotifClarity(motifBinding: string[]): string {
+  if (motifBinding.length === 0) return "";
+  const primary = motifBinding[0];
+  const supporting = motifBinding.slice(1);
+  let clause =
+    `The primary motif is ${primary} — visually dominant and clearly readable as a recognizable form. ` +
+    `Avoid amorphous or muddy shapes. Avoid an empty or low-detail result.`;
+  if (supporting.length > 0) {
+    clause += ` Supporting elements: ${supporting.join(", ")}.`;
   }
-
-  prompt += " " + TEXT_PURGE_FOOTER;
-  return prompt.trim();
+  return clause;
 }
 
-// Build the canonical rebuild prompt for a selected scout direction.
-// Uses the grammar's rebuildPromptTemplate as a structural anchor,
-// then appends quality and text-free enforcement.
+/**
+ * Build the canonical rebuild prompt for a selected scout direction.
+ *
+ * Structured in order:
+ *   1. Composition (grammar template — spatial/depth)
+ *   2. Motif (primary subject clarity + supporting)
+ *   3. Quiet space (low-detail region for the lockup, without mentioning text)
+ *   4. avoidTextProne guard (if applicable)
+ *   5. Negative hints (if any)
+ *   6. STRICT_TEXT_PURGE_BLOCK
+ *   7. Quality footer
+ */
 export function buildRebuildPrompt(input: RebuildPromptInput): string {
   const grammar = GRAMMAR_BANK[input.grammarKey];
   const motifPhrase = resolveMotifPhrase(input.motifBinding);
   const toneDesc = TONE_DESCRIPTIONS[input.tone];
 
+  // 1. Composition (template)
   let prompt = grammar.rebuildPromptTemplate
     .replace(/\{motif\}/g, motifPhrase)
     .replace(/\{tone\}/g, toneDesc);
 
+  // 2. Motif clarity
+  const motifClarity = buildMotifClarity(input.motifBinding);
+  if (motifClarity) {
+    prompt += " " + motifClarity;
+  }
+
+  // 3. Quiet space instruction (no mention of text)
+  prompt +=
+    " Include a calm, low-detail region that remains visually quiet — uncluttered open space in at least one area of the frame.";
+
+  // 4. Extra guard for text-prone grammars
+  if (grammar.avoidTextProne) {
+    prompt += " No signage-like composition. No central text panel or flat surfaces that resemble a poster or sign.";
+  }
+
+  // 5. Negative hints
   if (input.negativeHints.length > 0) {
     prompt += ` Avoid: ${input.negativeHints.join(", ")}.`;
   }
 
+  // 6. Strict text-purge block
+  prompt += " " + STRICT_TEXT_PURGE_BLOCK;
+
+  // 7. Quality footer
+  prompt += " " + QUALITY_FOOTER;
+
+  return prompt.trim();
+}
+
+/**
+ * Build a text-purge retry prompt for a direction that failed background_text_detected.
+ *
+ * Stronger framing — makes clear this is a correction from a failed attempt.
+ * Uses STRICT_TEXT_PURGE_BLOCK as the anchor, plus a correction header.
+ */
+export function buildTextPurgedRebuildPrompt(input: RebuildPromptInput): string {
+  const grammar = GRAMMAR_BANK[input.grammarKey];
+  const motifPhrase = resolveMotifPhrase(input.motifBinding);
+  const toneDesc = TONE_DESCRIPTIONS[input.tone];
+
+  // Composition template
+  let prompt = grammar.rebuildPromptTemplate
+    .replace(/\{motif\}/g, motifPhrase)
+    .replace(/\{tone\}/g, toneDesc);
+
+  // Motif clarity
+  const motifClarity = buildMotifClarity(input.motifBinding);
+  if (motifClarity) {
+    prompt += " " + motifClarity;
+  }
+
+  // Quiet space
+  prompt +=
+    " Include a calm, low-detail region that remains visually quiet — uncluttered open space in at least one area of the frame.";
+
+  // avoidTextProne guard
+  if (grammar.avoidTextProne) {
+    prompt += " No signage-like composition. No central text panel or flat surfaces that resemble a poster or sign.";
+  }
+
+  // Negative hints
+  if (input.negativeHints.length > 0) {
+    prompt += ` Avoid: ${input.negativeHints.join(", ")}.`;
+  }
+
+  // Text-purge: STRICT block + explicit correction header
+  prompt +=
+    " CORRECTION: previous generation contained text artifacts. " +
+    STRICT_TEXT_PURGE_BLOCK +
+    " Do not place any text, letterforms, or symbols anywhere in this image.";
+
+  // Quality footer
   prompt += " " + QUALITY_FOOTER;
 
   return prompt.trim();

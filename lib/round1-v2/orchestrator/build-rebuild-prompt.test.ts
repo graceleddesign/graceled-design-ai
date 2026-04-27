@@ -73,8 +73,10 @@ test("rebuild prompt always ends with text-free enforcement", () => {
     motifBinding: ["mountain"],
     negativeHints: [],
   });
+  const lower = prompt.toLowerCase();
   assert.ok(
-    prompt.toLowerCase().includes("text-free") || prompt.toLowerCase().includes("letterform"),
+    lower.includes("text-free") || lower.includes("letterform") ||
+    lower.includes("no readable text") || lower.includes("background plate"),
     `expected text-free enforcement in: ${prompt}`
   );
 });
@@ -90,6 +92,105 @@ test("rebuild prompt includes quality upgrade language", () => {
     prompt.toLowerCase().includes("ultra") || prompt.toLowerCase().includes("professional") || prompt.toLowerCase().includes("rich"),
     `expected quality language in: ${prompt}`
   );
+});
+
+test("rebuild prompt contains STRICT_TEXT_PURGE_BLOCK content", () => {
+  const prompt = buildRebuildPrompt({
+    grammarKey: "horizon_band",
+    tone: "dark",
+    motifBinding: ["cross"],
+    negativeHints: [],
+  });
+  const lower = prompt.toLowerCase();
+  assert.ok(lower.includes("no readable text"), `expected 'no readable text' in rebuild prompt`);
+  assert.ok(lower.includes("background plate"), `expected 'background plate' in rebuild prompt`);
+  assert.ok(lower.includes("letterform"), `expected 'letterform' in rebuild prompt`);
+});
+
+test("rebuild prompt enforces primary motif clarity", () => {
+  const prompt = buildRebuildPrompt({
+    grammarKey: "edge_anchored_motif",
+    tone: "light",
+    motifBinding: ["dawn light", "horizon"],
+    negativeHints: [],
+  });
+  assert.ok(
+    prompt.includes("primary motif") || prompt.includes("Primary subject") || prompt.includes("primary subject"),
+    `expected primary motif clarity language in: ${prompt.slice(0, 120)}`
+  );
+  assert.ok(
+    prompt.toLowerCase().includes("visually dominant") || prompt.toLowerCase().includes("clearly readable"),
+    `expected motif clarity enforcement in rebuild prompt`
+  );
+});
+
+test("rebuild prompt includes quiet space instruction", () => {
+  const prompt = buildRebuildPrompt({
+    grammarKey: "centered_focal_motif",
+    tone: "neutral",
+    motifBinding: ["stone"],
+    negativeHints: [],
+  });
+  const lower = prompt.toLowerCase();
+  assert.ok(
+    lower.includes("quiet") || lower.includes("calm") || lower.includes("uncluttered"),
+    `expected quiet space instruction in rebuild prompt`
+  );
+  // Must NOT say "for text" — that invites text artifacts
+  assert.ok(
+    !lower.includes("for text placement") && !lower.includes("for text"),
+    `rebuild prompt must not contain 'for text' language`
+  );
+});
+
+test("geometric_block_composition rebuild includes anti-signage guard", () => {
+  const prompt = buildRebuildPrompt({
+    grammarKey: "geometric_block_composition",
+    tone: "neutral",
+    motifBinding: ["cross"],
+    negativeHints: [],
+  });
+  const lower = prompt.toLowerCase();
+  assert.ok(
+    lower.includes("signage") || lower.includes("poster") || lower.includes("text panel"),
+    `expected anti-signage guard in geometric_block_composition rebuild prompt`
+  );
+});
+
+test("rebuild prompt does NOT contain affirmative poster/title framing language", () => {
+  // These are affirmative design-artifact phrases that invite text artifacts.
+  const BANNED = [
+    "sermon series background art",
+    "premium sermon series",
+    "for text placement",
+    "poster text",
+    "title text",
+  ];
+  for (const key of GRAMMAR_KEYS) {
+    const prompt = buildRebuildPrompt({
+      grammarKey: key,
+      tone: "neutral",
+      motifBinding: ["light"],
+      negativeHints: [],
+    });
+    const lower = prompt.toLowerCase();
+    for (const banned of BANNED) {
+      assert.ok(!lower.includes(banned), `${key}: banned phrase '${banned}' found in rebuild prompt`);
+    }
+  }
+});
+
+test("text-purged rebuild prompt includes correction header", () => {
+  const { buildTextPurgedRebuildPrompt } = require("./build-rebuild-prompt");
+  const prompt = buildTextPurgedRebuildPrompt({
+    grammarKey: "centered_focal_motif",
+    tone: "dark",
+    motifBinding: ["shadow"],
+    negativeHints: [],
+  });
+  const lower = prompt.toLowerCase();
+  assert.ok(lower.includes("correction"), `expected correction header in text-purged prompt`);
+  assert.ok(lower.includes("no readable text"), `expected STRICT_TEXT_PURGE_BLOCK in text-purged prompt`);
 });
 
 test("all grammar keys produce non-empty rebuild prompts", () => {

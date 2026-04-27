@@ -51,6 +51,13 @@ export async function runScoutBatch(
   const results: ScoutGenerationResult[] = Array(plan.slots.length);
   const batchStart = Date.now();
 
+  // Log one summary of the prompt parameters for this batch (not the full prompts).
+  const grammarSummary = [...new Set(plan.slots.map((s) => s.grammarKey))].join(",");
+  const primaryMotif = plan.slots[0]?.motifBinding[0] ?? "(none)";
+  console.log(
+    `[v2] prompt summary: grammars=[${grammarSummary}] primaryMotif=${primaryMotif} tone=${plan.tone} textPurge=true`
+  );
+
   await asyncPool(plan.slots, concurrency, async (slot, i) => {
     const prompt = buildScoutPrompt(slot);
     try {

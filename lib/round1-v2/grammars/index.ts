@@ -52,6 +52,11 @@ export interface CompositionGrammar {
   titleSafeZones: readonly Bbox[];
   // Motif type strings that structurally cannot work in this grammar.
   incompatibleMotifTypes: readonly string[];
+  /**
+   * If true, this grammar's flat/geometric composition style may invite poster-like
+   * text artifacts. Prompt builders should add extra "no signage" enforcement.
+   */
+  avoidTextProne?: boolean;
   scoutPromptTemplate: string;
   rebuildPromptTemplate: string;
 }
@@ -71,9 +76,14 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     ],
     incompatibleMotifTypes: ["abstract_texture", "all_over_pattern"],
     scoutPromptTemplate:
-      "Sermon series background art. Single centered {motif} as the focal element, surrounded by wide negative space. {tone} tonal treatment. No text, letters, words, or letterforms anywhere.",
+      "Cinematic background plate. A single {motif} as the sole focal subject, centered in the wide frame. " +
+      "Atmospheric depth: distinct foreground haze, midground subject, and background recession. " +
+      "Surrounding negative space is calm and uncluttered. {tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background artwork. Single {motif} centered in the frame, wide open negative space on all sides, {tone} palette. Completely text-free. No letterforms, no words, no labels.",
+      "Cinematic background plate, centered composition. " +
+      "Primary subject: {motif}, positioned center-frame with clear visual dominance. " +
+      "Foreground, midground, and background depth layers with atmospheric separation. " +
+      "Wide open quiet space surrounds the subject on all sides. {tone} atmosphere and palette.",
   },
 
   edge_anchored_motif: {
@@ -85,9 +95,14 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     titleSafeZones: [{ x: 0.42, y: 0.1, w: 0.54, h: 0.8 }],
     incompatibleMotifTypes: ["abstract_texture", "all_over_pattern"],
     scoutPromptTemplate:
-      "Sermon series background art. {motif} anchored to one side of the wide frame, large open negative space on the opposite side. {tone} tonal treatment. No text, letters, words, or letterforms anywhere.",
+      "Cinematic background plate. A {motif} anchored to one lateral edge of the wide frame. " +
+      "Atmospheric depth with foreground-to-background recession behind the subject. " +
+      "The opposing half of the frame holds expansive open quiet space. {tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background. {motif} anchored to one edge, expansive negative space on the other side, {tone} palette. Completely free of text, labels, or letterforms.",
+      "Cinematic background plate, edge-anchored composition. " +
+      "Primary subject: {motif}, placed at one lateral edge of the wide frame. " +
+      "Clear foreground-to-background atmospheric depth behind the subject. " +
+      "The opposite half of the frame is open, quiet, and uncluttered. {tone} atmosphere and palette.",
   },
 
   horizon_band: {
@@ -102,9 +117,15 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     ],
     incompatibleMotifTypes: ["tall_vertical_form", "detailed_figure"],
     scoutPromptTemplate:
-      "Sermon series background art. A horizontal band or landscape horizon across the middle of the wide frame featuring {motif}, asymmetric weight, open areas above and below. {tone} tonal treatment. No text, letters, or letterforms.",
+      "Cinematic background plate. A horizontal compositional band across the middle third of the frame, " +
+      "featuring {motif} as the dominant horizontal element. " +
+      "Atmospheric sky or open space above; grounded depth below. Multiple depth planes. " +
+      "{tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background. Horizontal compositional band featuring {motif}, clean open zones above and below for text placement, {tone} palette. No text, no letterforms.",
+      "Cinematic background plate, horizon band composition. " +
+      "{motif} as the dominant visual element running through the horizontal mid-band of the frame. " +
+      "Distinct foreground, midground band, and atmospheric background recession. " +
+      "Open quiet zones above and below the band. {tone} atmosphere and palette.",
   },
 
   layered_atmospheric: {
@@ -116,9 +137,15 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     titleSafeZones: [{ x: 0.08, y: 0.18, w: 0.84, h: 0.64 }],
     incompatibleMotifTypes: ["precise_geometric_shape", "photorealistic_person", "literal_object"],
     scoutPromptTemplate:
-      "Sermon series background art. Soft layered atmospheric depth with {motif} as an ambient theme, tonal gradient, no hard focal subject. {tone} mood. No text, words, or letterforms anywhere.",
+      "Cinematic background plate. Soft layered atmospheric depth — " +
+      "{motif} expressed as ambient environmental mood rather than a discrete isolated object. " +
+      "Multiple overlapping depth planes dissolving into each other. No hard focal subject. " +
+      "{tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background. Layered atmospheric depth, {motif} expressed as ambient atmosphere rather than a discrete subject, gentle gradient transitions, {tone} palette. Entirely text-free.",
+      "Cinematic background plate, atmospheric layered composition. " +
+      "{motif} expressed as pervasive environmental character rather than an isolated subject. " +
+      "Soft gradients through foreground, midground, and background atmospheric planes. " +
+      "Immersive atmosphere with no hard focal point. {tone} atmosphere and palette.",
   },
 
   geometric_block_composition: {
@@ -129,10 +156,16 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     focalZones: [{ x: 0.3, y: 0.2, w: 0.4, h: 0.55 }],
     titleSafeZones: [{ x: 0.05, y: 0.05, w: 0.55, h: 0.3 }],
     incompatibleMotifTypes: ["organic_natural_form", "abstract_painterly", "photorealistic_person"],
+    avoidTextProne: true,
     scoutPromptTemplate:
-      "Sermon series background art. Bold geometric block shapes and structured color fields with {motif} as thematic content. Clean negative space zones. {tone} palette. No text, letters, or letterforms.",
+      "Cinematic background plate. Bold geometric structural forms and color volumes with {motif} as the visual theme. " +
+      "Shapes have dimensional depth — planes advance and recede in space. " +
+      "No flat graphic layout. No poster-like arrangements. {tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background. Geometric block composition, bold structured shapes and color fields, {motif} integrated as design element, structured negative space, {tone} palette. No text.",
+      "Cinematic background plate, geometric volumetric composition. " +
+      "{motif} integrated within bold geometric structural forms with architectural depth. " +
+      "Foreground planes, midground forms, atmospheric background. " +
+      "No flat 2D graphic arrangements. No signage-like geometry. {tone} atmosphere and palette.",
   },
 
   textural_field: {
@@ -144,8 +177,13 @@ export const GRAMMAR_BANK: Readonly<Record<GrammarKey, CompositionGrammar>> = {
     titleSafeZones: [{ x: 0.12, y: 0.22, w: 0.76, h: 0.55 }],
     incompatibleMotifTypes: ["centered_figure", "landscape_horizon", "precise_geometric_shape"],
     scoutPromptTemplate:
-      "Sermon series background art. Full-frame texture or material treatment with {motif} as the textural theme. Rich surface detail, no focal subject. {tone} tonal treatment. No text, letters, or letterforms.",
+      "Cinematic background plate. Rich full-frame material surface with {motif} as the textural character. " +
+      "All-over surface detail with tonal depth variation across the frame. " +
+      "No discrete focal subject. {tone} light and atmosphere.",
     rebuildPromptTemplate:
-      "Premium sermon series background. Richly textured full-frame surface, {motif} expressed as material texture or pattern, no discrete subject or focal point, {tone} palette. Completely text-free.",
+      "Cinematic background plate, full-frame textural composition. " +
+      "{motif} expressed as the surface material and texture across the entire frame. " +
+      "Rich organic or material detail with depth through surface variation. " +
+      "No discrete focal point or isolated subject. {tone} atmosphere and palette.",
   },
 } as const;

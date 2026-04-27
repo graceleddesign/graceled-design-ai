@@ -57,8 +57,96 @@ test("prompt contains text-free enforcement language", () => {
     const prompt = buildScoutPrompt(slot);
     const lower = prompt.toLowerCase();
     assert.ok(
-      lower.includes("no text") || lower.includes("text-free") || lower.includes("no letter"),
+      lower.includes("no text") || lower.includes("text-free") || lower.includes("no letter") ||
+      lower.includes("no readable") || lower.includes("background plate"),
       `${key}: no text-free enforcement language found in prompt`
+    );
+  }
+});
+
+test("prompt contains STRICT_TEXT_PURGE_BLOCK content", () => {
+  const slot = makeSlot("centered_focal_motif");
+  const prompt = buildScoutPrompt(slot);
+  const lower = prompt.toLowerCase();
+  // STRICT_TEXT_PURGE_BLOCK must be present — check for its distinctive phrases
+  assert.ok(lower.includes("no readable text"), `expected 'no readable text' in prompt`);
+  assert.ok(lower.includes("background plate"), `expected 'background plate' in prompt`);
+  assert.ok(lower.includes("letterform"), `expected 'letterform' in prompt`);
+});
+
+test("prompt contains motif anchoring with primary motif language", () => {
+  const slot = makeSlot("centered_focal_motif", {
+    motifBinding: ["cross", "light"],
+    promptSpec: {
+      template: GRAMMAR_BANK["centered_focal_motif"].scoutPromptTemplate,
+      motifBinding: ["cross", "light"],
+      tone: "neutral",
+      negativeHints: [],
+    },
+  });
+  const prompt = buildScoutPrompt(slot);
+  assert.ok(prompt.includes("Primary motif:"), `expected 'Primary motif:' in prompt`);
+  assert.ok(prompt.includes("cross"), `expected primary motif 'cross' in anchoring`);
+  assert.ok(prompt.includes("Supporting elements:"), `expected 'Supporting elements:' for secondary motif`);
+  assert.ok(prompt.includes("light"), `expected supporting motif 'light' in prompt`);
+});
+
+test("single motif: primary anchor present, no Supporting elements line", () => {
+  const slot = makeSlot("horizon_band", {
+    motifBinding: ["water"],
+    promptSpec: {
+      template: GRAMMAR_BANK["horizon_band"].scoutPromptTemplate,
+      motifBinding: ["water"],
+      tone: "neutral",
+      negativeHints: [],
+    },
+  });
+  const prompt = buildScoutPrompt(slot);
+  assert.ok(prompt.includes("Primary motif:"), `expected 'Primary motif:' in prompt`);
+  assert.ok(!prompt.includes("Supporting elements:"), `unexpected 'Supporting elements:' for single motif`);
+});
+
+test("prompt does NOT contain affirmative poster/title/cover design language", () => {
+  // These are phrases that invite the model to produce a poster-style design.
+  // "poster" and "sign" appearing in negations ("no poster", "no signage") are fine.
+  const BANNED_PHRASES = [
+    "sermon series background art",
+    "premium sermon series",
+    "flyer",
+    "title card",
+    "headline",
+    "design with text",
+  ];
+  for (const key of GRAMMAR_KEYS) {
+    const slot = makeSlot(key);
+    const prompt = buildScoutPrompt(slot);
+    const lower = prompt.toLowerCase();
+    for (const banned of BANNED_PHRASES) {
+      assert.ok(
+        !lower.includes(banned),
+        `${key}: banned phrase '${banned}' found in prompt: ${prompt.slice(0, 120)}`
+      );
+    }
+  }
+});
+
+test("geometric_block_composition includes anti-signage guard", () => {
+  const slot = makeSlot("geometric_block_composition");
+  const prompt = buildScoutPrompt(slot);
+  const lower = prompt.toLowerCase();
+  assert.ok(
+    lower.includes("signage") || lower.includes("poster") || lower.includes("text panel"),
+    `expected anti-signage guard in geometric_block_composition prompt`
+  );
+});
+
+test("prompts include cinematic background plate framing", () => {
+  for (const key of GRAMMAR_KEYS) {
+    const slot = makeSlot(key);
+    const prompt = buildScoutPrompt(slot);
+    assert.ok(
+      prompt.toLowerCase().includes("cinematic") || prompt.toLowerCase().includes("background plate"),
+      `${key}: expected cinematic background plate framing`
     );
   }
 });
