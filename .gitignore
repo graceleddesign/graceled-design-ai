@@ -35,3 +35,6 @@ reference_library/normalized/
 public/reference_library/
 public/reference-thumbs/
 reference_assets_v1.zip
+
+# LoRA dataset prep outputs — script is committed, generated files are not
+tmp/
