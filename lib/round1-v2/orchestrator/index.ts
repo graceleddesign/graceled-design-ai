@@ -79,6 +79,16 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { canRenderDesignModeLocally, renderDesignModeDirectionPreview } = await import(
     "./design-mode-renderer"
   );
+  const { runImagen4ModernAbstractLane } = await import(
+    "./run-imagen4-modern-abstract-lane"
+  );
+  // Experimental Imagen 4 modern_abstract path — only active when the flag is on.
+  // When active, modern_abstract lanes bypass the deterministic local renderer
+  // AND the scout/rebuild AI flow and go directly to Imagen 4 + acceptance.
+  const imagen4ModernAbstractEnabled: boolean =
+    ROUND1_V2_CONFIG.enableImagen4ModernAbstractExperiment;
+  const isImagen4ModernAbstractLane = (mode: string) =>
+    imagen4ModernAbstractEnabled && mode === "modern_abstract";
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");
   const {
     computeCleanMinimalLayout,
@@ -167,11 +177,15 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   // entirely. Only the remaining lanes become scouts.
 
   const aiLaneSpecs = designModePlan.lanes
-    .filter((l) => !canRenderDesignModeLocally(l.mode))
+    .filter((l) => !canRenderDesignModeLocally(l.mode) && !isImagen4ModernAbstractLane(l.mode))
     .map((l) => ({ laneKey: l.lane, designMode: l.mode }));
-  const localLaneCount = designModePlan.lanes.length - aiLaneSpecs.length;
+  const imagen4LaneCount = designModePlan.lanes.filter((l) =>
+    isImagen4ModernAbstractLane(l.mode)
+  ).length;
+  const localLaneCount =
+    designModePlan.lanes.length - aiLaneSpecs.length - imagen4LaneCount;
   console.log(
-    `[v2] lane routing: aiLanes=${aiLaneSpecs.length} localLanes=${localLaneCount}`
+    `[v2] lane routing: aiLanes=${aiLaneSpecs.length} localLanes=${localLaneCount} imagen4Lanes=${imagen4LaneCount}`
   );
 
   // Empty default plan / batch / selection structures for the all-local case.
@@ -263,12 +277,15 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   // metadata when a winner exists.
 
   const lanePlanItems = designModePlan.lanes.map((lp) => {
-    const isLocal = canRenderDesignModeLocally(lp.mode);
-    const aiScout = isLocal ? null : selection.selected.find((s) => s.label === lp.lane) ?? null;
+    const isImagen4 = isImagen4ModernAbstractLane(lp.mode);
+    const isLocal = !isImagen4 && canRenderDesignModeLocally(lp.mode);
+    const isAi = !isImagen4 && !isLocal;
+    const aiScout = isAi ? selection.selected.find((s) => s.label === lp.lane) ?? null : null;
     return {
       label: lp.lane,
       mode: lp.mode,
       isLocal,
+      isImagen4,
       aiScout,
       generationId: randomUUID(),
     };
@@ -298,7 +315,11 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
               allDistinct: designModePlan.allDistinct,
               lane: designModePlan.lanes.find((l) => l.lane === item.label) ?? null,
             },
-            renderer: item.isLocal ? "deterministic_design_mode_v1" : "ai_rebuild",
+            renderer: item.isImagen4
+              ? "imagen4_modern_abstract_experiment"
+              : item.isLocal
+              ? "deterministic_design_mode_v1"
+              : "ai_rebuild",
           } as unknown as Prisma.InputJsonValue,
         },
       })
@@ -424,6 +445,213 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     const generationId = item.generationId;
     const laneDesignMode = item.mode;
     const lockupRecipe = getDesignModeLockupRecipe(laneDesignMode);
+
+    // ── Imagen 4 modern_abstract experimental branch ─────────────────────────
+    // Direct text-to-image via Imagen 4 (no scout, no rebuild). Background is
+    // accepted/rejected by the same evaluator+acceptance gates used elsewhere.
+    // Subjective failure families ("corporate wallpaper", "generic worship
+    // gradient") are NOT detectable by the current evaluator — see note in
+    // run-imagen4-modern-abstract-lane.ts. Honest fail on rejection.
+    if (item.isImagen4) {
+      console.log(
+        `[v2] lane ${item.label} mode=${laneDesignMode} renderer=imagen4_modern_abstract_experiment aiCalls=1`
+      );
+      const { falImagen4Provider } = await import("../providers/fal-imagen4");
+      const laneResult = await runImagen4ModernAbstractLane({
+        tone: brief.toneTarget,
+        provider: falImagen4Provider,
+        evalFn: (args) => evaluateScout(args),
+        acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
+      });
+
+      if (laneResult.status === "rejected") {
+        const failed = buildV2FailedOutput(
+          laneResult.failureReason,
+          item.label,
+          laneResult.backgroundEvidence
+        );
+        const failedWithImagen4 = {
+          ...failed,
+          meta: {
+            ...(failed as any).meta,
+            debug: {
+              ...(failed as any).meta?.debug,
+              imagen4ModernAbstract: laneResult.debug,
+              designMode: designModePlan.lanes[i]?.mode ?? null,
+            },
+          },
+        };
+        try {
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "FAILED",
+              output: failedWithImagen4 as unknown as Prisma.InputJsonValue,
+            },
+          });
+        } catch (settleErr) {
+          console.error(`[v2] lane ${item.label} settle error: ${String(settleErr)}`);
+        }
+        laneLog.push(
+          `${item.label}=failed(imagen4:${laneResult.failureReason.slice(0, 40)})`
+        );
+        continue;
+      }
+
+      // Accepted — compose lockup over Imagen 4 background and settle.
+      try {
+        const content = {
+          title: brief.title,
+          subtitle: brief.subtitle,
+          passage: brief.scripturePassages,
+        };
+        const lockupPresetId = lockupRecipe?.lockupPresetId ?? null;
+        const lockupAlign = lockupRecipe?.align ?? "left";
+        const lockupIntegrationMode = lockupRecipe?.integrationMode ?? "clean";
+        const fullRecipeOverride = laneDesignMode
+          ? getDesignModeLockupRecipeOverride(laneDesignMode)
+          : undefined;
+        const suppressScrim = laneDesignMode
+          ? shouldSuppressAutoScrim(laneDesignMode)
+          : false;
+
+        const wideLayout = computeCleanMinimalLayout({
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          content,
+          lockupRecipe: fullRecipeOverride,
+          lockupPresetId,
+        });
+        const sampledPalette = await chooseTextPaletteForBackground({
+          backgroundPng: laneResult.imageBytes,
+          sampleRegion: wideLayout.textRegion,
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+        });
+        const widePalette = suppressScrim
+          ? { ...sampledPalette, autoScrim: false }
+          : sampledPalette;
+        const wideLockupSvg = buildCleanMinimalOverlaySvg({
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          content,
+          palette: widePalette,
+          lockupRecipe: fullRecipeOverride,
+          lockupPresetId,
+        });
+        const { png: lockupPng } = await renderTrimmedLockupPngFromSvg(wideLockupSvg);
+        const wideFinalPng = await composeLockupOnBackground({
+          backgroundPng: laneResult.imageBytes,
+          lockupPng,
+          shape: "wide",
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          align: lockupAlign,
+          integrationMode: lockupIntegrationMode,
+        });
+
+        const prefix = generationId;
+        const bgPath = await writeV2File(`${prefix}-wide-bg.png`, laneResult.imageBytes);
+        const lockupPath = await writeV2File(`${prefix}-lockup.png`, lockupPng);
+        const wideFinPath = await writeV2File(`${prefix}-wide.png`, wideFinalPng);
+
+        const wideDesignDoc = buildCleanMinimalDesignDoc({
+          width: WIDE_WIDTH,
+          height: WIDE_HEIGHT,
+          content,
+          palette: widePalette,
+          backgroundImagePath: bgPath,
+        });
+
+        const lockupEvidence = {
+          source: "generated" as const,
+          sourceGenerationId: null,
+          textIntegrity: true,
+          fitPass: true,
+          insideTitleSafeWithMargin: null,
+          notTooSmall: null,
+        };
+
+        const completedOutput = {
+          status: "COMPLETED",
+          designDoc: wideDesignDoc,
+          designDocByShape: { wide: wideDesignDoc },
+          notes: `V2 lane ${item.label} (imagen4_modern_abstract_experiment)`,
+          preview: { widescreen_main: wideFinPath },
+          meta: {
+            styleRefCount: 0,
+            usedStylePaths: [],
+            productionValidation: {
+              stage: "direction_preview",
+              background: laneResult.backgroundEvidence,
+              lockup: lockupEvidence,
+              aspects: { widescreen: { provenance: "rendered" } },
+            },
+            debug: {
+              v2: true,
+              renderer: "imagen4_modern_abstract_experiment",
+              backgroundSource: "generated",
+              lockupSource: "generated",
+              generationLifecycleState: "GENERATION_COMPLETED",
+              backgroundFailureReason: null,
+              providerModel: laneResult.providerModel,
+              imagen4ModernAbstract: laneResult.debug,
+              designMode: designModePlan.lanes[i]?.mode ?? null,
+              designModePlan: {
+                summary: designModePlan.summary,
+                allDistinct: designModePlan.allDistinct,
+                lane: designModePlan.lanes[i] ?? null,
+              },
+              planner: briefSignals.debug,
+              plannedTone: briefSignals.toneHint,
+              plannedMotifs: briefSignals.motifHints,
+              aiCalls: 1,
+              aspectAssets: { widescreen: "ok" },
+              squareVerticalNotGenerated: "round1_direction_preview_only",
+            },
+          },
+        };
+
+        await prisma.$transaction(async (tx) => {
+          await tx.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "COMPLETED",
+              output: completedOutput as unknown as Prisma.InputJsonValue,
+            },
+          });
+          await tx.asset.createMany({
+            data: [
+              { projectId, generationId, kind: "BACKGROUND", slot: "wide_bg", file_path: bgPath, mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
+              { projectId, generationId, kind: "LOCKUP", slot: "series_lockup", file_path: lockupPath, mime_type: "image/png", width: null, height: null },
+              { projectId, generationId, kind: "IMAGE", slot: "wide", file_path: wideFinPath, mime_type: "image/png", width: WIDE_WIDTH, height: WIDE_HEIGHT },
+            ],
+          });
+        });
+
+        laneLog.push(`${item.label}=completed(imagen4)`);
+        console.log(`[v2] lane ${item.label} settled (imagen4): wide=${wideFinPath}`);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`[v2] lane ${item.label} imagen4 composition failed: ${reason}`);
+        try {
+          await prisma.generation.update({
+            where: { id: generationId },
+            data: {
+              status: "FAILED",
+              output: buildV2FailedOutput(
+                `Composition failed: ${reason}`,
+                item.label
+              ) as unknown as Prisma.InputJsonValue,
+            },
+          });
+        } catch (settleErr) {
+          console.error(`[v2] lane ${item.label} failed to settle: ${String(settleErr)}`);
+        }
+        laneLog.push(`${item.label}=failed(imagen4_composition:${reason.slice(0, 40)})`);
+      }
+      continue;
+    }
 
     // ── Local-render branch (no FAL calls) ───────────────────────────────────
     if (item.isLocal) {

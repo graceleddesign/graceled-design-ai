@@ -26,6 +26,15 @@ export const ROUND1_V2_CONFIG = {
 
   // Aspect constraint
   supportedAspects: ["wide"] as const,
+
+  // Experimental: Imagen 4 modern_abstract path.
+  // When enabled, V2 Round 1 lanes whose designMode is "modern_abstract"
+  // bypass scout/rebuild and generate the wide direction-preview background
+  // plate directly via Imagen 4 using the proven prism/refraction prompt.
+  // OFF by default. Does not affect any other lane or design mode.
+  enableImagen4ModernAbstractExperiment: false,
+  imagen4ModernAbstractProvider: "fal-ai/imagen4/preview",
+  imagen4ModernAbstractTimeoutMs: 90_000,
 } as const;
 
 export type SupportedAspect = (typeof ROUND1_V2_CONFIG.supportedAspects)[number];
