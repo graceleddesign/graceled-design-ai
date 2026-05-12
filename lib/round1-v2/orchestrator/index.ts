@@ -71,6 +71,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { selectScouts } = await import("./select-scouts");
   const { buildBackfillPool, selectEligibleBackfill, runLaneWithBackfill } = await import("./lane-backfill");
   const { planDesignModes } = await import("./plan-design-modes");
+  const { resolveForceDesignModes } = await import("./force-design-modes");
   const {
     getDesignModeLockupRecipe,
     getDesignModeLockupRecipeOverride,
@@ -159,7 +160,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   // ── 2b. Plan design modes (A/B/C lane identity) ───────────────────────────
   // Metadata only in phase 1 — does not change prompt or compositor behavior.
 
-  const designModePlan = planDesignModes({
+  const plannedDesignModePlan = planDesignModes({
     title: project.series_title,
     subtitle: project.series_subtitle,
     scripturePassages: project.scripture_passages,
@@ -169,6 +170,21 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
     motifHints: briefSignals.motifHints,
     runSeed,
   });
+
+  const forceResult = resolveForceDesignModes();
+  let designModePlan = plannedDesignModePlan;
+  if (forceResult !== null) {
+    if (forceResult.ok) {
+      designModePlan = forceResult.plan;
+      console.log(
+        `[v2] forced design modes: ${forceResult.plan.summary} source=ROUND1_V2_FORCE_DESIGN_MODES`
+      );
+    } else {
+      console.warn(
+        `[v2] ROUND1_V2_FORCE_DESIGN_MODES ignored (${forceResult.reason}) — using planner output`
+      );
+    }
+  }
 
   console.log(`[v2] design modes: ${designModePlan.summary} distinct=${designModePlan.allDistinct}`);
 
