@@ -10,7 +10,7 @@ import type { ScoutEvalResult } from "../eval/evaluate-scout";
 import type { Round1Engine, Round1V2Result } from "../types";
 import type { ProductionBackgroundValidationEvidence } from "@/lib/production-valid-option";
 import type { BackfillDebugMeta, TextRetryMeta } from "./lane-backfill";
-import { ROUND1_V2_CONFIG } from "../config";
+import { ROUND1_V2_CONFIG, resolveImagen4ModernAbstractEnabled } from "../config";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -85,8 +85,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   // Experimental Imagen 4 modern_abstract path — only active when the flag is on.
   // When active, modern_abstract lanes bypass the deterministic local renderer
   // AND the scout/rebuild AI flow and go directly to Imagen 4 + acceptance.
-  const imagen4ModernAbstractEnabled: boolean =
-    ROUND1_V2_CONFIG.enableImagen4ModernAbstractExperiment;
+  const imagen4ModernAbstractEnabled: boolean = resolveImagen4ModernAbstractEnabled();
   const isImagen4ModernAbstractLane = (mode: string) =>
     imagen4ModernAbstractEnabled && mode === "modern_abstract";
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");

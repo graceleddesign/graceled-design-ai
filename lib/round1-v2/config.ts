@@ -38,3 +38,16 @@ export const ROUND1_V2_CONFIG = {
 } as const;
 
 export type SupportedAspect = (typeof ROUND1_V2_CONFIG.supportedAspects)[number];
+
+/**
+ * Resolve whether the Imagen 4 modern_abstract experiment is enabled.
+ *
+ * Default is OFF. Set IMAGEN4_MODERN_ABSTRACT_EXPERIMENT=true in .env.local
+ * to enable locally without committing code changes.
+ * Only the string "true" enables it — absent, "false", "0", "no", or any
+ * other value keeps it disabled.
+ */
+export function resolveImagen4ModernAbstractEnabled(): boolean {
+  const raw = process.env.IMAGEN4_MODERN_ABSTRACT_EXPERIMENT?.trim().toLowerCase();
+  return raw === "true";
+}
