@@ -86,6 +86,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   // When active, modern_abstract lanes bypass the deterministic local renderer
   // AND the scout/rebuild AI flow and go directly to Imagen 4 + acceptance.
   const imagen4ModernAbstractEnabled: boolean = resolveImagen4ModernAbstractEnabled();
+  console.log(`[v2] imagen4ModernAbstractEnabled=${imagen4ModernAbstractEnabled}`);
   const isImagen4ModernAbstractLane = (mode: string) =>
     imagen4ModernAbstractEnabled && mode === "modern_abstract";
   const { planBriefSignals } = await import("../briefs/plan-brief-signals");

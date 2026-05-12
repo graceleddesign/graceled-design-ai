@@ -12341,7 +12341,15 @@ export async function generateRoundOneAction(
   };
 
   try {
-    if (resolveRound1Engine(project.round1EngineOverride) === "v2") {
+    const resolvedEngine = resolveRound1Engine(project.round1EngineOverride);
+    console.log(
+      `[round1-dispatch] project=${project.id}` +
+        ` round1EngineOverride=${project.round1EngineOverride ?? "(none)"}` +
+        ` ROUND1_ENGINE=${process.env.ROUND1_ENGINE ?? "(none)"}` +
+        ` IMAGEN4_MODERN_ABSTRACT_EXPERIMENT=${process.env.IMAGEN4_MODERN_ABSTRACT_EXPERIMENT ?? "(none)"}` +
+        ` resolvedEngine=${resolvedEngine}`
+    );
+    if (resolvedEngine === "v2") {
       return await runRoundOneV2(projectId);
     }
 
