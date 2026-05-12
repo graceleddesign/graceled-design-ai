@@ -18,6 +18,7 @@
 import type { Buffer as BufferType } from "buffer";
 import type { TonalVariant } from "../grammars";
 import type { ScoutEvalResult } from "../eval/evaluate-scout";
+import type { ScoutImageStats } from "../eval/image-stats";
 import type { ScoutSlot } from "./build-scout-plan";
 import type {
   ProductionBackgroundValidationEvidence,
@@ -29,6 +30,29 @@ import {
   IMAGEN4_MODERN_ABSTRACT_PROMPT_FAMILY,
 } from "./build-imagen4-modern-abstract-prompt";
 
+/**
+ * Text-detection evidence from the background evaluator.
+ *
+ * IMPORTANT: detectTextArtifact uses a pixel-gradient heuristic only — it
+ * counts dense high-gradient windows that resemble the spatial pattern of
+ * rendered text. There is NO OCR, NO text string extraction, NO per-character
+ * confidence, and NO bounding box. If `detected` is true and `imageStats`
+ * looks plausible, the image likely has rendered letterforms; if imageStats
+ * shows atypically high edgeDensity in a non-text context (busy geometric
+ * art), this is a false positive. Inspect the raw rejected image to decide.
+ */
+export interface TextDetectionEvidence {
+  detected: boolean;
+  rejectReasons: string[];
+  toneScore: number;
+  structureScore: number;
+  marginScore: number;
+  compositeScore: number;
+  imageStats: ScoutImageStats | null;
+  /** The evaluator is a gradient heuristic — no OCR string, confidence, or bbox. */
+  evaluatorNote: "gradient_heuristic_no_ocr";
+}
+
 export interface Imagen4LaneDebug {
   enabled: true;
   attempted: boolean;
@@ -39,6 +63,18 @@ export interface Imagen4LaneDebug {
   providerMetadata?: Imagen4Result["providerMetadata"];
   latencyMs?: number;
   providerErrorKind?: string;
+  /** Exact prompt string sent to Imagen 4. */
+  prompt?: string;
+  /**
+   * Eval evidence captured on rejection-after-evaluation (not on provider errors).
+   * See TextDetectionEvidence for the current evaluator's limitations.
+   */
+  textDetectionEvidence?: TextDetectionEvidence;
+  /**
+   * Dev/test-only: filesystem path to the raw rejected Imagen output.
+   * Never set in production. Not a canonical asset — do not treat as a preview.
+   */
+  rejectedRawPath?: string;
 }
 
 export type Imagen4LaneResult =
@@ -96,6 +132,14 @@ export interface RunImagen4ModernAbstractLaneInput {
   acceptanceFn: (params: {
     evidence: ProductionBackgroundValidationEvidence;
   }) => { accepted: boolean; invalidReasons: string[] };
+  /**
+   * Dev/test-only callback. Called with the raw provider image bytes when the
+   * lane is rejected after evaluation (not on provider errors — no bytes there).
+   * The callback should save the bytes somewhere inspectable and return the
+   * path, or return null if saving was skipped. Failures are swallowed — a
+   * debug-save error must never affect lane settlement.
+   */
+  onRejectedBytes?: (bytes: BufferType) => Promise<string | null>;
 }
 
 export async function runImagen4ModernAbstractLane(
@@ -108,6 +152,7 @@ export async function runImagen4ModernAbstractLane(
     provider: input.provider.id,
     promptFamily: IMAGEN4_MODERN_ABSTRACT_PROMPT_FAMILY,
     accepted: false,
+    prompt,
   };
 
   let genResult: Imagen4Result;
@@ -131,6 +176,29 @@ export async function runImagen4ModernAbstractLane(
 
   if (!acceptance.accepted) {
     const reason = acceptance.invalidReasons[0] ?? "imagen4_acceptance_failed";
+
+    // Dev-only: persist raw bytes for inspection. Failure is non-fatal.
+    let rejectedRawPath: string | undefined;
+    if (input.onRejectedBytes) {
+      try {
+        const saved = await input.onRejectedBytes(genResult.imageBytes);
+        if (saved) rejectedRawPath = saved;
+      } catch {
+        // intentionally swallowed — debug-save must not affect settlement
+      }
+    }
+
+    const textDetectionEvidence: TextDetectionEvidence = {
+      detected: evalRes.textDetected,
+      rejectReasons: evalRes.rejectReasons,
+      toneScore: evalRes.toneScore,
+      structureScore: evalRes.structureScore,
+      marginScore: evalRes.marginScore,
+      compositeScore: evalRes.compositeScore,
+      imageStats: evalRes.imageStats,
+      evaluatorNote: "gradient_heuristic_no_ocr",
+    };
+
     return {
       status: "rejected",
       failureReason: reason,
@@ -140,6 +208,8 @@ export async function runImagen4ModernAbstractLane(
         rejectionReason: reason,
         providerMetadata: genResult.providerMetadata,
         latencyMs: genResult.latencyMs,
+        textDetectionEvidence,
+        ...(rejectedRawPath !== undefined ? { rejectedRawPath } : {}),
       },
       prompt,
     };

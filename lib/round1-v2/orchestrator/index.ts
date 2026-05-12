@@ -83,6 +83,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
   const { runImagen4ModernAbstractLane } = await import(
     "./run-imagen4-modern-abstract-lane"
   );
+  const { saveImagen4RejectedBytes } = await import("./save-imagen4-rejected");
   // Experimental Imagen 4 modern_abstract path — only active when the flag is on.
   // When active, modern_abstract lanes bypass the deterministic local renderer
   // AND the scout/rebuild AI flow and go directly to Imagen 4 + acceptance.
@@ -478,6 +479,7 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         provider: falImagen4Provider,
         evalFn: (args) => evaluateScout(args),
         acceptanceFn: (args) => evaluateBackgroundAcceptance(args),
+        onRejectedBytes: (bytes) => saveImagen4RejectedBytes(generationId, bytes),
       });
 
       if (laneResult.status === "rejected") {
@@ -511,6 +513,9 @@ export async function runRoundOneV2(projectId: string): Promise<Round1V2Result> 
         laneLog.push(
           `${item.label}=failed(imagen4:${laneResult.failureReason.slice(0, 40)})`
         );
+        if (laneResult.debug.rejectedRawPath) {
+          console.log(`[v2] lane ${item.label} imagen4 rejected raw → ${laneResult.debug.rejectedRawPath}`);
+        }
         continue;
       }
 

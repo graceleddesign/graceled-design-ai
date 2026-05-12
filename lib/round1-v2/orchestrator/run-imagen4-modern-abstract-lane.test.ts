@@ -158,3 +158,155 @@ test("provider is never called when caller does not invoke the lane runner", asy
   // the config defaults remain off.
   assert.equal(ROUND1_V2_CONFIG.enableImagen4ModernAbstractExperiment, false);
 });
+
+// ── New: prompt, evidence, and debug fields ───────────────────────────────────
+
+test("debug.prompt is populated on both accept and reject paths", async () => {
+  const accepted = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn([]),
+    acceptanceFn: makeAcceptanceFn({ accepted: true }),
+  });
+  assert.ok(typeof accepted.debug.prompt === "string" && accepted.debug.prompt.length > 0);
+
+  const rejected = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+  });
+  assert.ok(typeof rejected.debug.prompt === "string" && rejected.debug.prompt.length > 0);
+});
+
+test("debug.prompt matches the prompt field on the result", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn([]),
+    acceptanceFn: makeAcceptanceFn({ accepted: true }),
+  });
+  assert.equal(res.debug.prompt, res.prompt);
+});
+
+test("textDetectionEvidence is populated on eval-rejection with correct fields", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+  });
+  assert.equal(res.status, "rejected");
+  if (res.status !== "rejected") return;
+  const tde = res.debug.textDetectionEvidence;
+  assert.ok(tde, "textDetectionEvidence must be present on eval-rejection");
+  assert.equal(tde.detected, true);
+  assert.ok(tde.rejectReasons.includes("text_artifact_detected"));
+  assert.equal(tde.evaluatorNote, "gradient_heuristic_no_ocr");
+});
+
+test("textDetectionEvidence is NOT set on provider-error rejection (no image produced)", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeFailingProvider("TIMEOUT"),
+    evalFn: makeEvalFn([]),
+    acceptanceFn: makeAcceptanceFn({ accepted: true }),
+  });
+  assert.equal(res.status, "rejected");
+  if (res.status !== "rejected") return;
+  assert.equal(res.debug.textDetectionEvidence, undefined);
+});
+
+test("onRejectedBytes callback is called with image bytes on eval-rejection", async () => {
+  let capturedBytes: Buffer | null = null;
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+    onRejectedBytes: async (bytes) => {
+      capturedBytes = bytes;
+      return "/tmp/test-stub-raw.png";
+    },
+  });
+  assert.equal(res.status, "rejected");
+  assert.ok(capturedBytes !== null, "callback must have been called");
+  assert.ok(Buffer.isBuffer(capturedBytes));
+});
+
+test("onRejectedBytes callback is NOT called on provider-error (no image bytes available)", async () => {
+  let callCount = 0;
+  await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeFailingProvider("TIMEOUT"),
+    evalFn: makeEvalFn([]),
+    acceptanceFn: makeAcceptanceFn({ accepted: true }),
+    onRejectedBytes: async () => { callCount++; return null; },
+  });
+  assert.equal(callCount, 0);
+});
+
+test("onRejectedBytes callback is NOT called on accepted result", async () => {
+  let callCount = 0;
+  await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn([]),
+    acceptanceFn: makeAcceptanceFn({ accepted: true }),
+    onRejectedBytes: async () => { callCount++; return null; },
+  });
+  assert.equal(callCount, 0);
+});
+
+test("rejectedRawPath is set in debug when callback returns a path", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+    onRejectedBytes: async () => "/tmp/gen-abc-raw.png",
+  });
+  assert.equal(res.status, "rejected");
+  if (res.status !== "rejected") return;
+  assert.equal(res.debug.rejectedRawPath, "/tmp/gen-abc-raw.png");
+});
+
+test("rejectedRawPath is absent when callback returns null", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+    onRejectedBytes: async () => null,
+  });
+  assert.equal(res.status, "rejected");
+  if (res.status !== "rejected") return;
+  assert.equal(res.debug.rejectedRawPath, undefined);
+});
+
+test("callback failure is swallowed and does not affect rejection settlement", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+    onRejectedBytes: async () => { throw new Error("disk full"); },
+  });
+  // Must still be rejected (not throw, not succeed)
+  assert.equal(res.status, "rejected");
+  if (res.status !== "rejected") return;
+  assert.equal(res.failureReason, "background_text_detected");
+  assert.equal(res.debug.rejectedRawPath, undefined);
+});
+
+test("rejected output is not marked as accepted regardless of callback", async () => {
+  const res = await runImagen4ModernAbstractLane({
+    tone: "dark",
+    provider: makeOkProvider(),
+    evalFn: makeEvalFn(["text_artifact_detected"]),
+    acceptanceFn: makeAcceptanceFn({ accepted: false, reason: "background_text_detected" }),
+    onRejectedBytes: async () => "/tmp/saved.png",
+  });
+  assert.equal(res.status, "rejected");
+  assert.equal(res.debug.accepted, false);
+});
