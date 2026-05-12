@@ -93,6 +93,22 @@ console.log(`  promptFamily  : ${i4.promptFamily ?? "(not set)"}`);
 console.log(`  rejectionReason: ${i4.rejectionReason ?? "(none)"}`);
 console.log(`  latencyMs     : ${i4.latencyMs ?? "(not recorded)"}`);
 console.log(`  providerErrorKind: ${i4.providerErrorKind ?? "(none)"}`);
+
+const override = i4.acceptanceOverride as Record<string, unknown> | undefined;
+if (override?.applied) {
+  console.log();
+  console.log(`  ⚠  acceptanceOverride APPLIED — tone gate waived`);
+  console.log(`     reason    : ${override.reason}`);
+  console.log(`     original  : ${JSON.stringify(override.originalRejectReasons)}`);
+  const actual = override.actual as Record<string, unknown> | undefined;
+  if (actual) {
+    console.log(`     actual    : toneScore=${actual.toneScore} structureScore=${actual.structureScore} marginScore=${actual.marginScore} edgeDensity=${actual.edgeDensity}`);
+  }
+  const thresh = override.thresholds as Record<string, unknown> | undefined;
+  if (thresh) {
+    console.log(`     thresholds: structureScoreMin=${thresh.structureScoreMin} marginScoreMin=${thresh.marginScoreMin} edgeDensityMax=${thresh.edgeDensityMax}`);
+  }
+}
 console.log();
 
 // ── Exact prompt ─────────────────────────────────────────────────────────────
